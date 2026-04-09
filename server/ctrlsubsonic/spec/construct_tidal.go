@@ -39,8 +39,16 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 		Size:        t.Duration * 176400, // approximate FLAC size
 		IsDir:       false,
 		Type:        "music",
-		Path:        fmt.Sprintf("tidal/%d/%s.flac", t.Album.ID, t.Title),
+		Path:        fmt.Sprintf("tidal/%d/%d.flac", t.Album.ID, t.ID),
 		Year:        parseYear(t.Album.ReleaseDate),
+	}
+
+	// Adjust for standard high quality if we can detect it (TODO)
+	// For now default to FLAC 1411 as we prefer LOSSLESS
+	if t.AudioQuality == "HIGH" || t.AudioQuality == "LOW" {
+		tc.Bitrate = 320
+		tc.ContentType = "audio/mp4"
+		tc.Suffix = "m4a"
 	}
 
 	// multi-artist

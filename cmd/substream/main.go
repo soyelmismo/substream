@@ -22,6 +22,8 @@ func main() {
 	confCachePath := flag.String("cache-path", "./cache", "cache directory (covers)")
 	confProxyURLs := flag.String("proxy-urls", "http://localhost:8000", "comma-separated hifi-api URLs")
 	confProxyPrefix := flag.String("proxy-prefix", "", "URL path prefix if behind reverse proxy")
+	confCertPath := flag.String("cert-path", "", "path to SSL certificate (for HTTPS)")
+	confKeyPath := flag.String("key-path", "", "path to SSL key (for HTTPS)")
 
 	flag.Parse()
 
@@ -139,15 +141,44 @@ func main() {
 	mux.Handle(restPath, http.StripPrefix(strings.TrimRight(restPath, "/"), ctrlSubsonic))
 	mux.Handle(adminPath, http.StripPrefix(strings.TrimRight(adminPath, "/"), ctrlAdmin))
 
+	// CORS & Path Cleaning Middleware
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Range")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Clean extension for Subsonic compatibility (e.g., ping.view -> ping)
+		path := r.URL.Path
+		if strings.HasSuffix(path, ".view") {
+			r.URL.Path = strings.TrimSuffix(path, ".view")
+		} else if strings.HasSuffix(path, ".jsp") {
+			r.URL.Path = strings.TrimSuffix(path, ".jsp")
+		}
+
+		mux.ServeHTTP(w, r)
+	})
+
 	// Serve
 	server := &http.Server{
 		Addr:         *confListenAddr,
-		Handler:      mux,
+		Handler:      corsHandler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server stopped: %v", err)
+	if *confCertPath != "" && *confKeyPath != "" {
+		log.Printf("Starting HTTPS server on %s", *confListenAddr)
+		if err := server.ListenAndServeTLS(*confCertPath, *confKeyPath); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTPS Server stopped: %v", err)
+		}
+	} else {
+		log.Printf("Starting HTTP server on %s", *confListenAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP Server stopped: %v", err)
+		}
 	}
 }

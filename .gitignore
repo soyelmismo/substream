@@ -16,3 +16,4 @@ cache/
 ./substream
 substream
 .fuse*
+*.pem

@@ -11,10 +11,9 @@ import (
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
-func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
+func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 
-	// return starred artists only (we don't have a local index)
 	var stars []db.ArtistStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&stars)
 
@@ -24,12 +23,20 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 	}
 
 	artists := c.batchFetchArtists(r, starIDs)
+	indexes := c.buildArtistIndexes(artists)
+
+	sub := spec.NewResponse()
+	sub.Indexes = &spec.Indexes{
+		Index: indexes,
+	}
+	return sub
+}
+
+func (c *Controller) buildArtistIndexes(artists []*spec.Artist) []*spec.Index {
 	indexMap := make(map[string]*spec.Index)
 	var indexes []*spec.Index
 
-	for i, a := range artists {
-		a.Starred = &stars[i].StarDate // technically batchFetch keeps order, so this matches
-
+	for _, a := range artists {
 		key := "#"
 		if len(a.Name) > 0 {
 			ch := []rune(a.Name)[0]
@@ -39,12 +46,29 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 		}
 
 		if _, ok := indexMap[key]; !ok {
-			idx := &spec.Index{Name: key}
+			idx := &spec.Index{Name: key, Artists: []*spec.Artist{}}
 			indexMap[key] = idx
 			indexes = append(indexes, idx)
 		}
 		indexMap[key].Artists = append(indexMap[key].Artists, a)
 	}
+	// Note: ideally sort indexes here by Name
+	return indexes
+}
+
+func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
+	user := r.Context().Value(CtxUser).(*db.User)
+
+	var stars []db.ArtistStar
+	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&stars)
+
+	starIDs := make([]int, len(stars))
+	for i, s := range stars {
+		starIDs[i] = s.TidalID
+	}
+
+	artists := c.batchFetchArtists(r, starIDs)
+	indexes := c.buildArtistIndexes(artists)
 
 	sub := spec.NewResponse()
 	sub.Artists = &spec.Artists{List: indexes}
@@ -216,6 +240,27 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			albumIDs = append(albumIDs, s.TidalID)
 		}
 
+	case "alphabeticalByName", "alphabeticalByArtist":
+		// for tidal proxy, we treat these as just "all starred" since we don't have a local library
+		var stars []db.AlbumStar
+		c.dbc.Where("user_id=?", user.ID).
+			Order("star_date DESC").
+			Find(&stars)
+
+		// we fetch all and sort later or just return in star order for now
+		// but we must honor offset/limit
+		start := offset
+		if start >= len(stars) {
+			break
+		}
+		end := start + size
+		if end > len(stars) {
+			end = len(stars)
+		}
+		for _, s := range stars[start:end] {
+			albumIDs = append(albumIDs, s.TidalID)
+		}
+
 	case "random":
 		var stars []db.AlbumStar
 		c.dbc.Where("user_id=?", user.ID).
@@ -237,7 +282,15 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		}
 
 	default:
-		// unsupported types return empty
+		// Fallback to starred for anything else like alphabeticalByName if not specifically handled
+		var stars []db.AlbumStar
+		c.dbc.Where("user_id=?", user.ID).
+			Order("star_date DESC").
+			Offset(offset).Limit(size).
+			Find(&stars)
+		for _, s := range stars {
+			albumIDs = append(albumIDs, s.TidalID)
+		}
 	}
 
 	// batch fetch album metadata

@@ -3,6 +3,7 @@ package ctrlsubsonic
 import (
 	"log"
 	"net/http"
+	"strings"
 
 	"go.senan.xyz/gonic/db"
 
@@ -149,13 +150,22 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 	}
 
 	// search artist by name to get ID
-	artists, err := c.proxy.SearchArtists(r.Context(), artistName, 1, 0)
-	if err != nil || len(artists) == 0 {
+	// fetch more candidates to find exact match if Tidal search is fuzzy
+	candidates, err := c.proxy.SearchArtists(r.Context(), artistName, 10, 0)
+	if err != nil || len(candidates) == 0 {
 		return spec.NewResponse()
 	}
 
+	artistID := candidates[0].ID
+	for _, a := range candidates {
+		if strings.EqualFold(a.Name, artistName) {
+			artistID = a.ID
+			break
+		}
+	}
+
 	// get artist page with tracks
-	page, err := c.proxy.GetArtistAlbums(r.Context(), artists[0].ID, false)
+	page, err := c.proxy.GetArtistAlbums(r.Context(), artistID, false)
 	if err != nil {
 		return spec.NewResponse()
 	}

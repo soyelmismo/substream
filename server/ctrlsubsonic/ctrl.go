@@ -83,6 +83,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	// Browse (proxy Tidal)
 	c.Handle("/getArtists", chain(resp(c.ServeGetArtists)))
 	c.Handle("/getArtist", chain(resp(c.ServeGetArtist)))
+	c.Handle("/getIndexes", chain(resp(c.ServeGetIndexes)))
 	c.Handle("/getArtistInfo", chain(resp(c.ServeGetArtistInfoTwo)))
 	c.Handle("/getArtistInfo2", chain(resp(c.ServeGetArtistInfoTwo)))
 	c.Handle("/getAlbum", chain(resp(c.ServeGetAlbum)))

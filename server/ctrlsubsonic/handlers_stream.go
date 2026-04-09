@@ -28,19 +28,21 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	tidalQuality := ""
 	switch {
 	case bitrate == 0:
-		tidalQuality = "HI_RES_LOSSLESS"
+		// Default to LOSSLESS (CD Quality FLAC) instead of HI_RES
+		// because HI_RES often uses DASH containers which break clients.
+		tidalQuality = "LOSSLESS"
 	case bitrate <= 128:
 		tidalQuality = "LOW"
 	case bitrate <= 320:
 		tidalQuality = "HIGH"
-	case bitrate <= 1411:
-		tidalQuality = "LOSSLESS"
-	default:
+	case bitrate >= 900:
 		tidalQuality = "HI_RES_LOSSLESS"
+	default:
+		tidalQuality = "LOSSLESS"
 	}
 
 	// Use a detached context with timeout for upstream API fetching so
-	// we don't spam if client disconnects quickly. 
+	// we don't spam if client disconnects quickly.
 	// The download itself will use r.Context() to stop if client aborts.
 	metaCtx, metaCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer metaCancel()
@@ -63,16 +65,10 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		return spec.NewError(0, "error getting stream URL: %v", err)
 	}
 
-	// For /stream, we use a simple redirect (fastest for playback)
-	if !strings.Contains(r.URL.Path, "download") {
-		log.Printf("[STREAM] track %d → redirect to: %s", id.Value, streamURL)
-		http.Redirect(w, r, streamURL, http.StatusTemporaryRedirect)
-		return nil
-	}
+	// Use a proxy instead of redirect to avoid CORS issues for web clients
+	// and certificate issues for clients using self-signed certs.
 
-	// For /download, we proxy and stitch segments for a complete file
-	log.Printf("[DOWNLOAD] track %d → proxying and stitching from: %s", id.Value, streamURL)
-	
+	// Determine content type and extensions
 	track, err := c.proxy.GetTrackInfo(metaCtx, id.Value)
 	if err != nil {
 		return spec.NewError(0, "error fetching track meta: %v", err)
@@ -91,28 +87,45 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
 	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
 
+	log.Printf("[STREAM] track %d → proxying from tidal (type=%s)", id.Value, contentType)
+
+	w.Header().Set("Content-Type", contentType)
+	if strings.Contains(r.URL.Path, "download") {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	}
+
 	var stitchErr error
 	if isHLS {
-		log.Printf("[DOWNLOAD] Detected HLS manifest, stitching...")
 		stitchErr = c.downloadAndStitchHLS(r.Context(), streamURL, w, clientIP, track)
 	} else if isDASH {
-		log.Printf("[DOWNLOAD] Detected DASH manifest, stitching...")
 		stitchErr = c.downloadAndStitchDASH(r.Context(), streamURL, w, clientIP, track)
 	} else {
-		// Write headers immediately for direct URL fallback
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
-		w.Header().Set("Transfer-Encoding", "chunked")
-
-		log.Printf("[DOWNLOAD] Detected direct URL, proxying...")
+		// Forward Range headers for seeking support in web players
 		req, _ := http.NewRequestWithContext(r.Context(), "GET", streamURL, nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+			req.Header.Set("Range", rangeHdr)
+		}
 		if clientIP != "" {
 			req.Header.Set("X-Forwarded-For", clientIP)
 		}
+
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
+
+			// Forward important headers back to client
+			w.Header().Set("Accept-Ranges", "bytes")
+			if ct := resp.Header.Get("Content-Type"); ct != "" {
+				w.Header().Set("Content-Type", ct)
+			}
+			if cr := resp.Header.Get("Content-Range"); cr != "" {
+				w.Header().Set("Content-Range", cr)
+			}
+			if cl := resp.Header.Get("Content-Length"); cl != "" {
+				w.Header().Set("Content-Length", cl)
+			}
+			w.WriteHeader(resp.StatusCode)
 			_, stitchErr = io.Copy(w, resp.Body)
 		} else {
 			stitchErr = err
@@ -120,7 +133,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	}
 
 	if stitchErr != nil {
-		log.Printf("[DOWNLOAD] Stitch error for track %d: %v", id.Value, stitchErr)
+		log.Printf("[STREAM] error for track %d: %v", id.Value, stitchErr)
 	}
 	return nil
 }
@@ -134,7 +147,6 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		w.WriteHeader(http.StatusNotFound)
 		return nil
 	}
-
 
 	size := p.GetOrInt("size", 600)
 	if id.Type == specid.Artist {
@@ -255,5 +267,3 @@ var transparentPixel = []byte{
 	0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44,
 	0x01, 0x00, 0x3b,
 }
-
-
