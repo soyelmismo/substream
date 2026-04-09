@@ -24,17 +24,19 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
 
-	quality := p.GetOr("maxBitRate", "")
+	bitrate := p.GetOrInt("maxBitRate", 0)
 	tidalQuality := ""
 	switch {
-	case quality == "" || quality == "0":
-		tidalQuality = "" // use pool default (HI_RES_LOSSLESS)
-	case quality <= "128":
+	case bitrate == 0:
+		tidalQuality = "HI_RES_LOSSLESS"
+	case bitrate <= 128:
 		tidalQuality = "LOW"
-	case quality <= "320":
+	case bitrate <= 320:
 		tidalQuality = "HIGH"
-	default:
+	case bitrate <= 1411:
 		tidalQuality = "LOSSLESS"
+	default:
+		tidalQuality = "HI_RES_LOSSLESS"
 	}
 
 	// Use a detached context with timeout so client disconnections
