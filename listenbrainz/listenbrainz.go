@@ -49,7 +49,7 @@ func NewClientCustom(httpClient *http.Client) *Client {
 }
 
 func (c *Client) IsUserAuthenticated(user db.User) bool {
-	return user.ListenBrainzURL != "" && user.ListenBrainzToken != ""
+	return user.ListenbrainzUrl != "" && user.ListenbrainzToken != ""
 }
 
 func (c *Client) Scrobble(user db.User, track scrobble.Track, stamp time.Time, submission bool) error {
@@ -83,8 +83,8 @@ func (c *Client) Scrobble(user db.User, track scrobble.Track, stamp time.Time, s
 		return err
 	}
 
-	submitURL := fmt.Sprintf("%s%s", user.ListenBrainzURL, submitPath)
-	authHeader := fmt.Sprintf("Token %s", user.ListenBrainzToken)
+	submitURL := fmt.Sprintf("%s%s", user.ListenbrainzUrl, submitPath)
+	authHeader := fmt.Sprintf("Token %s", user.ListenbrainzToken)
 
 	req, err := http.NewRequest(http.MethodPost, submitURL, &payloadBuf)
 	if err != nil {

@@ -226,7 +226,7 @@ func (c *Client) StealArtistImage(artistURL string) (string, error) {
 }
 
 func (c *Client) IsUserAuthenticated(user db.User) bool {
-	return user.LastFMSession != ""
+	return user.LastfmSession != ""
 }
 
 func (c *Client) Scrobble(user db.User, track scrobble.Track, stamp time.Time, submission bool) error {
@@ -257,7 +257,7 @@ func (c *Client) Scrobble(user db.User, track scrobble.Track, stamp time.Time, s
 		params.Add("mbid", track.MusicBrainzID)
 	}
 
-	params.Add("sk", user.LastFMSession)
+	params.Add("sk", user.LastfmSession)
 	params.Add("api_key", apiKey)
 	params.Add("api_sig", GetParamSignature(params, secret))
 
@@ -265,7 +265,7 @@ func (c *Client) Scrobble(user db.User, track scrobble.Track, stamp time.Time, s
 	return err
 }
 
-func (c *Client) LoveTrack(user *db.User, track *db.Track) error {
+func (c *Client) LoveTrack(user *db.User, trackId string) error {
 	apiKey, secret, err := c.keySecret()
 	if err != nil {
 		return fmt.Errorf("get key and secret: %w", err)
@@ -276,10 +276,10 @@ func (c *Client) LoveTrack(user *db.User, track *db.Track) error {
 
 	params := url.Values{}
 	params.Add("method", "track.love")
-	params.Add("track", track.TagTitle)
-	params.Add("artist", track.TagTrackArtist)
+	params.Add("track", trackId)
+	params.Add("artist", trackId)
 	params.Add("api_key", apiKey)
-	params.Add("sk", user.LastFMSession)
+	params.Add("sk", user.LastfmSession)
 	params.Add("api_sig", GetParamSignature(params, secret))
 
 	_, err = c.makeRequest(http.MethodPost, params)
@@ -298,7 +298,7 @@ func (c *Client) GetCurrentUser(user *db.User) (User, error) {
 	params := url.Values{}
 	params.Add("method", "user.getInfo")
 	params.Add("api_key", apiKey)
-	params.Add("sk", user.LastFMSession)
+	params.Add("sk", user.LastfmSession)
 	params.Add("api_sig", GetParamSignature(params, secret))
 
 	resp, err := c.makeRequest(http.MethodGet, params)
