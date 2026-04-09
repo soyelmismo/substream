@@ -13,23 +13,26 @@ RUN  \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/ ./cmd/...
 
 FROM alpine:3.22
-LABEL org.opencontainers.image.source=https://github.com/sentriz/gonic
+LABEL org.opencontainers.image.source=https://github.com/soyelmismo/substream
+
+# Substream is native and stateless: No ffmpeg, no mpv required.
 RUN apk add -U --no-cache \
-    ffmpeg \
-    mpv \
     ca-certificates \
     tzdata \
     tini \
     shared-mime-info
+
 COPY --from=builder /out/* /usr/local/bin/
-VOLUME ["/cache", "/data", "/music", "/podcasts"]
-EXPOSE 80
+
+# Only one volume needed for DB and Ephemeral cache
+VOLUME ["/data"]
+
+EXPOSE 4533
+
 ENV TZ=
-ENV GONIC_DB_PATH=/data/gonic.db
-ENV GONIC_LISTEN_ADDR=:80
-ENV GONIC_MUSIC_PATH=/music
-ENV GONIC_PODCAST_PATH=/podcasts
-ENV GONIC_CACHE_PATH=/cache
-ENV GONIC_PLAYLISTS_PATH=/playlists
+ENV SUBSTREAM_DB_PATH=/data/substream.db
+ENV SUBSTREAM_CACHE_PATH=/data/cache
+ENV SUBSTREAM_LISTEN_ADDR=:4533
+
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["gonic"]
+CMD ["substream"]
