@@ -46,14 +46,21 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 
 
 
-	// artists default 3 so that artist searches still return something without huge cascade
-	artistCount := p.GetOrInt("artistCount", 3)
-	albumCount := p.GetOrInt("albumCount", 20)
-	songCount := p.GetOrInt("songCount", 20)
+	// Respect counts from client. If 0 is sent, don't search that type.
+	// We use -1 as a marker for "not provided"
+	artistCount := p.GetOrInt("artistCount", -1)
+	albumCount := p.GetOrInt("albumCount", -1)
+	songCount := p.GetOrInt("songCount", -1)
 
-	if artistCount > 5 { artistCount = 5 }
-	if albumCount > 30 { albumCount = 30 }
-	if songCount > 30 { songCount = 30 }
+	// Set defaults only if not provided (-1)
+	if artistCount == -1 { artistCount = 3 }
+	if albumCount == -1 { albumCount = 20 }
+	if songCount == -1 { songCount = 20 }
+
+	// Still apply caps to prevent performance issues
+	if artistCount > 10 { artistCount = 10 }
+	if albumCount > 50 { albumCount = 50 }
+	if songCount > 50 { songCount = 50 }
 
 	artistOffset := p.GetOrInt("artistOffset", 0)
 	albumOffset := p.GetOrInt("albumOffset", 0)

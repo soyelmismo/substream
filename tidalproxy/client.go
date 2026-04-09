@@ -607,7 +607,6 @@ func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrac
 
 func (p *Pool) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) {
 	// Use a popular artist or a generic search if no direct top-tracks endpoint
-	// Most proxies support /search/ with query if they don't have /top/
 	var result struct {
 		Items []TidalTrack `json:"items"`
 	}
@@ -616,6 +615,22 @@ func (p *Pool) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error
 		"limit": {fmt.Sprint(limit)},
 	}
 	if err := p.apiGet(ctx, "/search/tracks/", q, &result, ""); err != nil {
+		return nil, err
+	}
+	return result.Items, nil
+}
+
+func (p *Pool) GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) {
+	var result struct {
+		Items []TidalTrack `json:"items"`
+	}
+	q := url.Values{
+		"id":    {fmt.Sprint(artistID)},
+		"limit": {fmt.Sprint(limit)},
+	}
+	// Many proxies use /artist/toptracks/ or similar. 
+	// The most common route in hifi-api derivatives for this is /artist/toptracks/
+	if err := p.apiGet(ctx, "/artist/toptracks/", q, &result, ""); err != nil {
 		return nil, err
 	}
 	return result.Items, nil

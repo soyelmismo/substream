@@ -153,3 +153,15 @@ func (c *CachedProxy) GetRecommendations(ctx context.Context, trackID int) ([]Ti
 	}
 	return tracks, err
 }
+
+func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) {
+	tracks, err := c.TidalProxy.GetArtistTopTracks(ctx, artistID, limit)
+	if err == nil {
+		for _, t := range tracks {
+			if t.Album.Cover != "" {
+				c.albumArt.Store(t.Album.ID, t.Album.Cover)
+			}
+		}
+	}
+	return tracks, err
+}

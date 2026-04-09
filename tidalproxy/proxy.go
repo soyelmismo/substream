@@ -25,7 +25,8 @@ type TidalProxy interface {
 
 	// Discovery
 	GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error)
-	GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error)
+	GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) // Global
+	GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) // Specific artist
 	GetSimilarArtists(ctx context.Context, artistID int) ([]TidalArtist, error)
 
 	// Lyrics

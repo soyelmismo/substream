@@ -156,7 +156,7 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 		return spec.NewResponse()
 	}
 
-	artistID := candidates[0].ID
+	artistID := 0
 	for _, a := range candidates {
 		if strings.EqualFold(a.Name, artistName) {
 			artistID = a.ID
@@ -164,15 +164,30 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 		}
 	}
 
-	// get artist page with tracks
-	page, err := c.proxy.GetArtistAlbums(r.Context(), artistID, false)
-	if err != nil {
+	// If no exact match, fallback to first ONLY if it's a very similar name
+	if artistID == 0 {
+		first := candidates[0]
+		if strings.Contains(strings.ToLower(first.Name), strings.ToLower(artistName)) ||
+			strings.Contains(strings.ToLower(artistName), strings.ToLower(first.Name)) {
+			artistID = first.ID
+		}
+	}
+
+	if artistID == 0 {
 		return spec.NewResponse()
 	}
 
-	topTracks := page.Tracks
-	if len(topTracks) > count {
-		topTracks = topTracks[:count]
+	if artistID == 0 {
+		return spec.NewResponse()
+	}
+
+	// get artist top tracks (precise)
+	topTracks, err := c.proxy.GetArtistTopTracks(r.Context(), artistID, count)
+	if err != nil {
+		log.Printf("[DISC] error fetching artist top tracks for %d: %v", artistID, err)
+		// Fallback to searching tracks by artist name if this fails? 
+		// For now just return empty or error.
+		return spec.NewResponse()
 	}
 
 	tracks := make([]*spec.TrackChild, len(topTracks))
