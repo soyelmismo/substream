@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/microcosm-cc/bluemonday"
 	"go.senan.xyz/gonic"
@@ -507,28 +506,7 @@ type OpenSubsonicExtension struct {
 
 type OpenSubsonicExtensions []OpenSubsonicExtension
 
-func formatExt(ext string) string {
-	return strings.TrimPrefix(ext, ".")
-}
 
-func formatReleaseTypes(types string) []string {
-	parts := strings.Split(types, ",")
-	if len(parts) == 0 {
-		return []string{}
-	}
-	for i, part := range parts {
-		part = strings.TrimSpace(part)
-		if len(part) == 0 {
-			continue
-		}
-		part = string(unicode.ToUpper([]rune(part)[0])) + string([]rune(part)[1:])
-		if part == "Ep" {
-			part = "EP"
-		}
-		parts[i] = part
-	}
-	return parts
-}
 
 var doublePuncExpr = regexp.MustCompile(`\.\s+\.\s+`)
 var licenceExpr = regexp.MustCompile(`(?i)\buser-contributed text.*`)

@@ -94,3 +94,14 @@ type Bookmark struct {
 	CreatedAt time.Time `sql:"DEFAULT:current_timestamp"`
 	UpdatedAt time.Time `sql:"DEFAULT:current_timestamp"`
 }
+
+type ProxyInstance struct {
+	ID        int       `gorm:"primary_key"`
+	URL       string    `gorm:"not null; unique_index"`
+	Name      string    `sql:"default: ''"`
+	IsHealthy bool      `sql:"DEFAULT: true"`
+	Source    string    `sql:"DEFAULT: 'manual'"`
+	CreatedAt time.Time `sql:"DEFAULT:current_timestamp"`
+}
+
+

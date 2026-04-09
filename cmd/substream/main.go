@@ -6,27 +6,28 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"os"
 
 	"go.senan.xyz/gonic/db"
-	//"go.senan.xyz/gonic/lastfm"
-	//"go.senan.xyz/gonic/listenbrainz"
-	//"go.senan.xyz/gonic/scrobble"
-	//"go.senan.xyz/gonic/server/ctrladmin"
-	//"go.senan.xyz/gonic/server/ctrlsubsonic"
-	//"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/scrobble"
+	"go.senan.xyz/gonic/server/ctrladmin"
+	"go.senan.xyz/gonic/server/ctrlsubsonic"
+	"go.senan.xyz/gonic/tidalproxy"
+	"github.com/sentriz/gormstore"
 )
 
 func main() {
-	// Flags mínimos (sin music-path, sin scan, sin transcode, sin jukebox, sin podcast)
 	confListenAddr := flag.String("listen-addr", "0.0.0.0:4533", "listen address")
 	confDBPath := flag.String("db-path", "substream.db", "database path")
 	confCachePath := flag.String("cache-path", "./cache", "cache directory (covers)")
 	confProxyURLs := flag.String("proxy-urls", "http://localhost:8000", "comma-separated hifi-api URLs")
-	//confProxyPrefix := flag.String("proxy-prefix", "", "URL path prefix if behind reverse proxy")
+	confProxyPrefix := flag.String("proxy-prefix", "", "URL path prefix if behind reverse proxy")
 
 	flag.Parse()
 
 	log.Printf("Starting SubStream on %s", *confListenAddr)
+
+	os.MkdirAll(*confCachePath, 0755)
 
 	// DB
 	dbc, err := db.New(*confDBPath)
@@ -36,56 +37,116 @@ func main() {
 	if err := dbc.Migrate(); err != nil {
 		log.Fatalf("Error migrating database schema: %v", err)
 	}
-	log.Printf("Database loaded from %s", *confDBPath)
+	log.Printf("Database ready at %s", *confDBPath)
 
-	// Tidal Proxy Pool (TODO: Uncomment when tidalproxy is implemented)
-	_ = strings.Split(*confProxyURLs, ",")
-	_ = confCachePath
-	/*
-		proxy := tidalproxy.NewPool(urls, tidalproxy.PoolConfig{
-			HealthInterval: 30 * time.Second,
-			Timeout:        10 * time.Second,
-		})
-
-		// Scrobblers
-		lastfmClient := lastfm.NewClient(...)
-		lbClient := listenbrainz.NewClient()
-		scrobblers := []scrobble.Scrobbler{lastfmClient, lbClient}
-
-		// Controllers
-		ctrlSubsonic := ctrlsubsonic.New(dbc, proxy, scrobblers, *confCachePath)
-		ctrlAdmin := ctrladmin.New(dbc, proxy)
-
-		// Routes
-		mux := http.NewServeMux()
-		mux.Handle("/rest/", http.StripPrefix("/rest", ctrlSubsonic))
-		mux.Handle("/admin/", http.StripPrefix("/admin", ctrlAdmin))
-
-		// Serve
-		server := &http.Server{
-			Addr: *confListenAddr,
-			Handler: mux,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 10 * time.Second,
+	if dbc.UserCount() == 0 {
+		log.Printf("No users found. Creating default 'admin' user with password 'admin'")
+		admin := db.User{
+			Name:    "admin",
+			Password: "admin",
+			IsAdmin: true,
 		}
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Server stopped: %v", err)
+		if err := dbc.Create(&admin).Error; err != nil {
+			log.Fatalf("Error creating default admin user: %v", err)
 		}
-	*/
+	}
 
-	// Temporary mock server until controllers are updated
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("pong"))
+
+	// Tidal Proxy Pool
+	urls := strings.Split(*confProxyURLs, ",")
+	proxy := tidalproxy.NewPool(urls, tidalproxy.PoolConfig{
+		HealthInterval: 30 * time.Second,
+		Timeout:        10 * time.Second,
 	})
 
+	// Load proxies from DB if any
+	dbProxies, _ := dbc.GetProxies()
+	if len(dbProxies) == 0 {
+		log.Printf("No proxies in database. Seeding with community defaults")
+		seeds := []string{
+			"https://monochrome-api.samidy.com",
+			"https://api.monochrome.tf",
+			"https://hifi.geeked.wtf",
+			"https://wolf.qqdl.site",
+			"https://maus.qqdl.site",
+			"https://vogel.qqdl.site",
+			"https://katze.qqdl.site",
+		}
+		for _, u := range seeds {
+			 dbc.AddProxy(u, "Community", "auto-seed")
+		}
+		// also add CLI defaults if not already present
+		for _, u := range urls {
+			dbc.AddProxy(u, "CLI Default", "cli")
+		}
+
+		dbProxies, _ = dbc.GetProxies()
+	}
+
+
+	if len(dbProxies) > 0 {
+		var dbURLs []string
+		for _, p := range dbProxies {
+			dbURLs = append(dbURLs, p.URL)
+		}
+		proxy.SetInstances(dbURLs)
+	}
+
+	// Background Auto-Discovery (Trackers)
+	trackers := []string{
+		"https://tidal-uptime.jiffy-puffs-1j.workers.dev",
+		"https://tidal-uptime.props-76styles.workers.dev",
+	}
+	proxy.StartDiscovery(trackers, 30*time.Minute, dbc)
+
+
+
+
+	// Scrobblers (Keep empty for Phase 1 MVP, can add ListenBrainz here)
+	var scrobblers []scrobble.Scrobbler
+
+	// Sessions
+	sessDB := gormstore.New(dbc.DB, []byte("substream-secret-change-me"))
+	go sessDB.PeriodicCleanup(1*time.Hour, make(chan struct{}))
+
+	// Controllers
+	ctrlSubsonic := ctrlsubsonic.New(dbc, proxy, scrobblers, *confCachePath)
+	resolveProxyPath := func(in string) string {
+		if *confProxyPrefix == "" {
+			return in
+		}
+		return *confProxyPrefix + in
+	}
+	ctrlAdmin, err := ctrladmin.New(dbc, sessDB, proxy, resolveProxyPath)
+
+	if err != nil {
+		log.Fatalf("Error initializing admin controller: %v", err)
+	}
+
+
+	// Routes
+	mux := http.NewServeMux()
+	
+	// Add prefix if given
+	restPath := "/rest/"
+	adminPath := "/admin/"
+	if *confProxyPrefix != "" {
+		restPath = *confProxyPrefix + restPath
+		adminPath = *confProxyPrefix + adminPath
+	}
+	
+	mux.Handle(restPath, http.StripPrefix(strings.TrimRight(restPath, "/"), ctrlSubsonic))
+	mux.Handle(adminPath, http.StripPrefix(strings.TrimRight(adminPath, "/"), ctrlAdmin))
+
+	// Serve
 	server := &http.Server{
 		Addr:         *confListenAddr,
 		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
 	}
-	if err := server.ListenAndServe(); err != nil {
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server stopped: %v", err)
 	}
 }

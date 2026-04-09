@@ -1,7 +1,411 @@
 package ctrladmin
 
-import "net/http"
+import (
+	"bytes"
+	"context"
+	"embed"
+	"encoding/base64"
+	"encoding/gob"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
 
-func New(dbc any, proxy any) http.Handler {
-	return http.NewServeMux()
+	"github.com/Masterminds/sprig"
+	"github.com/dustin/go-humanize"
+	"github.com/fatih/structs"
+	"github.com/gorilla/sessions"
+	"github.com/philippta/go-template/html/template"
+	"github.com/sentriz/gormstore"
+
+	"go.senan.xyz/gonic"
+	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/handlerutil"
+	"go.senan.xyz/gonic/server/ctrladmin/adminui"
+	"go.senan.xyz/gonic/tidalproxy"
+)
+
+
+type CtxKey int
+
+const (
+	CtxUser CtxKey = iota
+	CtxSession
+)
+
+type Controller struct {
+	*http.ServeMux
+
+	dbc              *db.DB
+	sessDB           *gormstore.Store
+	proxy            tidalproxy.TidalProxy
+	resolveProxyPath ProxyPathResolver
+}
+
+
+type ProxyPathResolver func(in string) string
+
+func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resolveProxyPath ProxyPathResolver) (*Controller, error) {
+	c := Controller{
+		ServeMux: http.NewServeMux(),
+
+		dbc:              dbc,
+		sessDB:           sessDB,
+		proxy:            proxy,
+		resolveProxyPath: resolveProxyPath,
+	}
+
+
+	resp := respHandler(adminui.TemplatesFS, resolveProxyPath)
+
+	baseChain := withSession(sessDB)
+	userChain := handlerutil.Chain(
+		baseChain,
+		withUserSession(dbc, resolveProxyPath),
+	)
+	adminChain := handlerutil.Chain(
+		userChain,
+		withAdminSession,
+	)
+
+	c.Handle("/static/", http.FileServer(http.FS(adminui.StaticFS)))
+
+	// public routes (creates session)
+	c.Handle("/login", baseChain(resp(c.ServeLogin)))
+	c.Handle("/login_do", baseChain(respRaw(c.ServeLoginDo)))
+
+	// user routes (if session is valid)
+	c.Handle("/logout", userChain(respRaw(c.ServeLogout)))
+	c.Handle("/home", userChain(resp(c.ServeHome)))
+	c.Handle("/change_username", userChain(resp(c.ServeChangeUsername)))
+	c.Handle("/change_username_do", userChain(resp(c.ServeChangeUsernameDo)))
+	c.Handle("/change_password", userChain(resp(c.ServeChangePassword)))
+	c.Handle("/change_password_do", userChain(resp(c.ServeChangePasswordDo)))
+	c.Handle("/change_avatar", userChain(resp(c.ServeChangeAvatar)))
+	c.Handle("/change_avatar_do", userChain(resp(c.ServeChangeAvatarDo)))
+	c.Handle("/delete_avatar_do", userChain(resp(c.ServeDeleteAvatarDo)))
+	c.Handle("/delete_user", userChain(resp(c.ServeDeleteUser)))
+	c.Handle("/delete_user_do", userChain(resp(c.ServeDeleteUserDo)))
+	c.Handle("/unlink_lastfm_do", userChain(resp(c.ServeUnlinkLastFMDo)))
+	c.Handle("/link_listenbrainz_do", userChain(resp(c.ServeLinkListenBrainzDo)))
+	c.Handle("/unlink_listenbrainz_do", userChain(resp(c.ServeUnlinkListenBrainzDo)))
+
+	// admin routes (if session is valid, and is admin)
+	c.Handle("/create_user_do", adminChain(resp(c.ServeCreateUserDo)))
+
+	// admin proxies
+	c.Handle("/proxies", adminChain(resp(c.ServeProxies)))
+	c.Handle("/add_proxy_do", adminChain(resp(c.ServeAddProxyDo)))
+	c.Handle("/delete_proxy_do", adminChain(resp(c.ServeDeleteProxyDo)))
+
+	
+	// Unused endpoints removed
+
+	c.Handle("/", baseChain(resp(c.ServeNotFound)))
+
+	return &c, nil
+}
+
+func withSession(sessDB *gormstore.Store) handlerutil.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			session, err := sessDB.Get(r, gonic.Name)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("error getting session: %s", err), 500)
+				return
+			}
+			withSession := context.WithValue(r.Context(), CtxSession, session)
+			next.ServeHTTP(w, r.WithContext(withSession))
+		})
+	}
+}
+
+func withUserSession(dbc *db.DB, resolvePath func(string) string) handlerutil.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// session exists at this point
+			session := r.Context().Value(CtxSession).(*sessions.Session)
+			userID, ok := session.Values["user"].(int)
+			if !ok {
+				sessAddFlashW(session, []string{"you are not authenticated"})
+				sessLogSave(session, w, r)
+				http.Redirect(w, r, resolvePath("/admin/login"), http.StatusSeeOther)
+				return
+			}
+			// take username from sesion and add the user row to the context
+			user := dbc.GetUserByID(userID)
+			if user == nil {
+				// the username in the client's session no longer relates to a
+				// user in the database (maybe the user was deleted)
+				session.Options.MaxAge = -1
+				sessLogSave(session, w, r)
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			}
+			withUser := context.WithValue(r.Context(), CtxUser, user)
+			next.ServeHTTP(w, r.WithContext(withUser))
+		})
+	}
+}
+
+func withAdminSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// session and user exist at this point
+		session := r.Context().Value(CtxSession).(*sessions.Session)
+		user := r.Context().Value(CtxUser).(*db.User)
+		if !user.IsAdmin {
+			sessAddFlashW(session, []string{"you are not an admin"})
+			sessLogSave(session, w, r)
+			http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type StatsData struct {
+	Albums  int64
+	Artists int64
+	Tracks  int64
+}
+
+type Response struct {
+	// code is 200
+	template string
+	data     *templateData
+	// code is 303
+	redirect string
+	flashN   []string // normal
+	flashW   []string // warning
+	// code is >= 400
+	code int
+	err  string
+}
+
+type (
+	handlerAdmin func(r *http.Request) *Response
+)
+
+func respHandler(templateFS embed.FS, resolvePath func(string) string) func(next handlerAdmin) http.Handler {
+	tmpl := template.Must(template.
+		New("layout").
+		Funcs(template.FuncMap(sprig.FuncMap())).
+		Funcs(funcMap()).
+		Funcs(template.FuncMap{"path": resolvePath}).
+		ParseFS(templateFS, "*.tmpl", "**/*.tmpl"),
+	)
+	buffPool := sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+	return func(next handlerAdmin) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			resp := next(r)
+			session, ok := r.Context().Value(CtxSession).(*sessions.Session)
+			if ok {
+				sessAddFlashN(session, resp.flashN)
+				sessAddFlashW(session, resp.flashW)
+				if err := session.Save(r, w); err != nil {
+					http.Error(w, fmt.Sprintf("error saving session: %v", err), 500)
+					return
+				}
+			}
+			if resp.redirect != "" {
+				http.Redirect(w, r, resolvePath(resp.redirect), http.StatusSeeOther)
+				return
+			}
+			if resp.err != "" {
+				http.Error(w, resp.err, resp.code)
+				return
+			}
+			if resp.template == "" {
+				http.Error(w, "useless handler return", 500)
+				return
+			}
+
+			if resp.data == nil {
+				resp.data = &templateData{}
+			}
+			resp.data.Version = gonic.Version
+			if session != nil {
+				resp.data.Flashes = session.Flashes()
+				if err := session.Save(r, w); err != nil {
+					http.Error(w, fmt.Sprintf("error saving session: %v", err), 500)
+					return
+				}
+			}
+			if user, ok := r.Context().Value(CtxUser).(*db.User); ok {
+				resp.data.User = user
+			}
+
+			buff := buffPool.Get().(*bytes.Buffer)
+			defer buffPool.Put(buff)
+			buff.Reset()
+
+			if err := tmpl.ExecuteTemplate(buff, resp.template, resp.data); err != nil {
+				http.Error(w, fmt.Sprintf("executing template: %v", err), 500)
+				return
+			}
+
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			if resp.code != 0 {
+				w.WriteHeader(resp.code)
+			}
+			if _, err := buff.WriteTo(w); err != nil {
+				log.Printf("error writing to response buffer: %v\n", err)
+			}
+		})
+	}
+}
+
+func respRaw(h http.HandlerFunc) http.Handler {
+	return h // stub
+}
+
+type templateData struct {
+	// common
+	Flashes []any
+	User    *db.User
+	Version string
+
+	// home
+	Stats                StatsData
+	RequestRoot          string
+	
+	AllUsers             []*db.User
+
+	CurrentLastFMAPIKey    string
+	CurrentLastFMAPISecret string
+	DefaultListenBrainzURL string
+	SelectedUser           *db.User
+
+	// avatar
+	Avatar []byte
+
+	// proxies
+	Proxies []*db.ProxyInstance
+}
+
+
+func funcMap() template.FuncMap {
+	return template.FuncMap{
+		"str": func(in any) string {
+			v, _ := json.Marshal(in)
+			return string(v)
+		},
+		"noCache": func(in string) string {
+			parsed, _ := url.Parse(in)
+			params := parsed.Query()
+			params.Set("v", gonic.Version)
+			parsed.RawQuery = params.Encode()
+			return parsed.String()
+		},
+		"date": func(in time.Time) string {
+			return strings.ToLower(in.Format("Jan 02, 2006"))
+		},
+		"dateHuman": humanize.Time,
+		"base64":    base64.StdEncoding.EncodeToString,
+		"props": func(parent any, values ...any) map[string]any {
+			if len(values)%2 != 0 {
+				panic("uneven number of key/value pairs")
+			}
+			props := map[string]any{}
+			for i := 0; i < len(values); i += 2 {
+				k, v := fmt.Sprint(values[i]), values[i+1]
+				props[k] = v
+			}
+			merged := map[string]any{}
+			if structs.IsStruct(parent) {
+				merged = structs.Map(parent)
+			}
+			merged["Props"] = props
+			return merged
+		},
+	}
+}
+
+//  utilities
+
+type FlashType string
+
+const (
+	FlashNormal  = FlashType("normal")
+	FlashWarning = FlashType("warning")
+)
+
+type Flash struct {
+	Message string
+	Type    FlashType
+}
+
+// gob registrations are next to each other, in case there's more added later)
+//
+//nolint:gochecknoinits // for now I think it's nice that our types and their
+func init() {
+	gob.Register(&Flash{})
+}
+
+func sessAddFlashN(s *sessions.Session, messages []string) {
+	sessAddFlash(s, messages, FlashNormal)
+}
+
+func sessAddFlashW(s *sessions.Session, messages []string) {
+	sessAddFlash(s, messages, FlashWarning)
+}
+
+func sessAddFlash(s *sessions.Session, messages []string, flashT FlashType) {
+	if len(messages) == 0 {
+		return
+	}
+	for i, message := range messages {
+		if i > 6 {
+			break
+		}
+		s.AddFlash(Flash{
+			Message: message,
+			Type:    flashT,
+		})
+	}
+}
+
+func sessLogSave(s *sessions.Session, w http.ResponseWriter, r *http.Request) {
+	if err := s.Save(r, w); err != nil {
+		log.Printf("error saving session: %v\n", err)
+	}
+}
+
+// validation
+
+var (
+	errValiNoUsername        = errors.New("please enter a username")
+	errValiPasswordAllFields = errors.New("please enter the password twice")
+	errValiPasswordsNotSame  = errors.New("passwords entered were not the same")
+	errValiKeysAllFields     = errors.New("please enter the api key and secret")
+)
+
+func validateUsername(username string) error {
+	if username == "" {
+		return errValiNoUsername
+	}
+	return nil
+}
+
+func validatePasswords(pOne, pTwo string) error {
+	if pOne == "" || pTwo == "" {
+		return errValiPasswordAllFields
+	}
+	if !(pOne == pTwo) {
+		return errValiPasswordsNotSame
+	}
+	return nil
+}
+
+func validateAPIKey(apiKey, secret string) error {
+	if apiKey == "" || secret == "" {
+		return errValiKeysAllFields
+	}
+	return nil
 }

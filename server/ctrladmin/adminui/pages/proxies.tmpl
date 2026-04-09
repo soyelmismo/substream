@@ -1,0 +1,64 @@
+{{ component "layout" . }}
+{{ component "layout_user" . }}
+
+<div class="flex flex-col gap-8">
+    <div class="flex flex-col gap-4 text-right">
+        <h1 class="text-3xl font-bold text-gray-900">proxies</h1>
+        <p class="text-gray-500">manage tidal proxy instances for the pool</p>
+    </div>
+
+    {{ component "block" (props .
+        "Icon" "globe"
+        "Name" "active instances"
+        "Desc" "currently configured hifi-api proxies"
+    ) }}
+        <div class="flex flex-col divide-y divide-gray-200">
+            {{ range .Proxies }}
+            <div class="flex items-center justify-between py-3">
+                <form action="{{ path "/admin/delete_proxy_do" }}" method="POST" onsubmit="return confirm('remove this instance?')">
+                    <input type="hidden" name="id" value="{{ .ID }}">
+                    <input type="submit" value="delete" class="text-rose-600 hover:text-rose-700 cursor-pointer text-sm font-bold">
+                </form>
+                <div class="flex items-center gap-4">
+                    {{ if .IsHealthy }}
+                        <span class="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded">healthy</span>
+                    {{ else }}
+                        <span class="text-xs font-bold text-rose-600 bg-rose-50 px-2 py-0.5 rounded">unhealthy</span>
+                    {{ end }}
+                    <div class="flex flex-col items-end">
+                        <span class="font-bold text-gray-900">{{ .URL }}</span>
+                        <span class="text-[10px] text-gray-400 capitalize">{{ .Name }} • added {{ dateHuman .CreatedAt }}</span>
+                    </div>
+                </div>
+            </div>
+            {{ else }}
+            <div class="py-12 text-center text-gray-400 font-medium italic">
+                no proxies configured. using CLI defaults.
+            </div>
+            {{ end }}
+        </div>
+    {{ end }}
+
+    {{ component "block" (props .
+        "Icon" "plus"
+        "Name" "add instance"
+        "Desc" "add a new hifi-api instance to the pool"
+    ) }}
+        <form action="{{ path "/admin/add_proxy_do" }}" method="POST" class="grid grid-cols-[1fr_auto] gap-2 items-center justify-items-end">
+            <input type="url" name="url" placeholder="https://example.com/hifi" required
+                class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors">
+            <label class="text-[10px] uppercase font-bold text-gray-400">instance url</label>
+            
+            <input type="text" name="name" placeholder="my-proxy"
+                class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors">
+            <label class="text-[10px] uppercase font-bold text-gray-400">friendly name</label>
+
+            <div class="col-span-full mt-2">
+                <input type="submit" value="add instance" class="bg-blue-600 text-white font-bold px-4 py-2 rounded cursor-pointer hover:bg-blue-700 transition-colors">
+            </div>
+        </form>
+    {{ end }}
+</div>
+
+{{ end }}
+{{ end }}

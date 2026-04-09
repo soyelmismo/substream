@@ -37,3 +37,40 @@ func (db *DB) GetUserByName(username string) *User {
 	}
 	return &user
 }
+
+func (db *DB) GetUserByID(id int) *User {
+	var user User
+	err := db.Where("id=?", id).First(&user).Error
+	if err != nil {
+		return nil
+	}
+	return &user
+}
+
+func (db *DB) UserCount() int64 {
+	var count int64
+	db.Model(&User{}).Count(&count)
+	return count
+}
+
+func (db *DB) GetProxies() ([]*ProxyInstance, error) {
+	var proxies []*ProxyInstance
+	err := db.Order("created_at DESC").Find(&proxies).Error
+	return proxies, err
+}
+
+func (db *DB) AddProxy(url string, name string, source string) error {
+	return db.Create(&ProxyInstance{URL: url, Name: name, Source: source}).Error
+}
+
+
+func (db *DB) DeleteProxy(id int) error {
+	return db.Where("id=?", id).Delete(&ProxyInstance{}).Error
+}
+
+func (db *DB) UpdateProxyHealth(id int, healthy bool) error {
+	return db.Model(&ProxyInstance{}).Where("id=?", id).Update("is_healthy", healthy).Error
+}
+
+
+

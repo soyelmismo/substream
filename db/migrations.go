@@ -14,5 +14,7 @@ func (db *DB) Migrate() error {
 		&PlayQueue{},
 		&Setting{},
 		&Bookmark{},
+		&ProxyInstance{},
 	).Error
 }
+

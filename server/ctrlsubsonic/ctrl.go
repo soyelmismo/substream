@@ -10,13 +10,15 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
+	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
-	"go.senan.xyz/gonic/scrobble"
+	"go.senan.xyz/gonic/tidalproxy"
 )
 
 type CtxKey int
@@ -27,39 +29,27 @@ const (
 	CtxParams
 )
 
-type MusicPath struct {
-	Alias, Path string
-}
-
-func MusicPaths(paths []MusicPath) []string {
-	var r []string
-	for _, p := range paths {
-		r = append(r, p.Path)
-	}
-	return r
-}
-
-type ProxyPathResolver func(in string) string
-
 type Controller struct {
 	*http.ServeMux
 
-	dbc             *db.DB
-	musicPaths      []MusicPath
-	cacheCoverPath  string
-	scrobblers      []scrobble.Scrobbler
+	dbc        *db.DB
+	proxy      tidalproxy.TidalProxy
+	scrobblers []scrobble.Scrobbler
+	cachePath  string
 }
 
-func New(dbc *db.DB, musicPaths []MusicPath, scrobblers []scrobble.Scrobbler, cacheCoverPath string) *Controller {
+func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
 	c := &Controller{
 		ServeMux:   http.NewServeMux(),
 		dbc:        dbc,
-		musicPaths: musicPaths,
+		proxy:      proxy,
 		scrobblers: scrobblers,
-		cacheCoverPath:  cacheCoverPath,
+		cachePath:  cachePath,
 	}
 
 	chain := handlerutil.Chain(
+		withLogging,
+		withRecovery,
 		withParams,
 		withRequiredParams,
 		withUser(dbc),
@@ -69,20 +59,62 @@ func New(dbc *db.DB, musicPaths []MusicPath, scrobblers []scrobble.Scrobbler, ca
 		slow,
 	)
 
-	// Admin and system
+	// Core
 	c.Handle("/ping", chain(resp(c.ServePing)))
 	c.Handle("/getLicense", chain(resp(c.ServeGetLicence)))
+	c.Handle("/getMusicFolders", chain(resp(c.ServeGetMusicFolders)))
 	c.Handle("/getUser", chain(resp(c.ServeGetUser)))
+	c.Handle("/getScanStatus", chain(resp(c.ServeGetScanStatus)))
+	c.Handle("/startScan", chain(resp(c.ServeGetScanStatus)))
+	c.Handle("/getOpenSubsonicExtensions", chain(resp(c.ServeGetOpenSubsonicExtensions)))
 
-	// Stubbed Routes
-	c.Handle("/getPlayQueue", chain(resp(c.ServeGetPlayQueue)))
-	c.Handle("/savePlayQueue", chain(resp(c.ServeSavePlayQueue)))
+	// Search
+	c.Handle("/search3", chain(resp(c.ServeSearchThree)))
 
-	// Raw
-	c.Handle("/getCoverArt", chainRaw(respRaw(c.ServeGetCoverArt)))
+	// Browse (proxy Tidal)
+	c.Handle("/getArtists", chain(resp(c.ServeGetArtists)))
+	c.Handle("/getArtist", chain(resp(c.ServeGetArtist)))
+	c.Handle("/getAlbum", chain(resp(c.ServeGetAlbum)))
+	c.Handle("/getAlbumList2", chain(resp(c.ServeGetAlbumListTwo)))
+	c.Handle("/getSong", chain(resp(c.ServeGetSong)))
+
+	// Streaming
 	c.Handle("/stream", chainRaw(respRaw(c.ServeStream)))
+	c.Handle("/download", chainRaw(respRaw(c.ServeStream)))
+	c.Handle("/getCoverArt", chainRaw(respRaw(c.ServeGetCoverArt)))
+
+	// Stars & Ratings
+	c.Handle("/star", chain(resp(c.ServeStar)))
+	c.Handle("/unstar", chain(resp(c.ServeUnstar)))
+	c.Handle("/setRating", chain(resp(c.ServeSetRating)))
+	c.Handle("/getStarred2", chain(resp(c.ServeGetStarredTwo)))
+	c.Handle("/getStarred", chain(resp(c.ServeGetStarredTwo))) // map v1 to v2
+
+	// Playlists
+	c.Handle("/getPlaylists", chain(resp(c.ServeGetPlaylists)))
+	c.Handle("/getPlaylist", chain(resp(c.ServeGetPlaylist)))
+	c.Handle("/createPlaylist", chain(resp(c.ServeCreatePlaylist)))
+	c.Handle("/updatePlaylist", chain(resp(c.ServeUpdatePlaylist)))
+	c.Handle("/deletePlaylist", chain(resp(c.ServeDeletePlaylist)))
+
+	// Play queue & Scrobble
+	c.Handle("/savePlayQueue", chain(resp(c.ServeSavePlayQueue)))
+	c.Handle("/getPlayQueue", chain(resp(c.ServeGetPlayQueue)))
+	c.Handle("/scrobble", chain(resp(c.ServeScrobble)))
+
+	// Discovery
+	c.Handle("/getRandomSongs", chain(resp(c.ServeGetRandomSongs)))
+	c.Handle("/getSimilarSongs2", chain(resp(c.ServeGetSimilarSongsTwo)))
+	c.Handle("/getSimilarSongs", chain(resp(c.ServeGetSimilarSongs)))
+	c.Handle("/getTopSongs", chain(resp(c.ServeGetTopSongs)))
+
+	// Browsing / Empty placeholders for mobile compatibility
+	c.Handle("/getGenres", chain(resp(c.ServeGetGenres)))
+	c.Handle("/getInternetRadioStations", chain(resp(c.ServeGetInternetRadioStations)))
 
 	c.Handle("/", chain(resp(c.ServeNotFound)))
+
+
 
 	return c
 }
@@ -107,23 +139,41 @@ func respRaw(h handlerSubsonicRaw) http.Handler {
 		}
 	})
 }
+func withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("[SUBS] IN  %s %s", r.Method, r.URL.RequestURI())
+		next.ServeHTTP(w, r)
+		log.Printf("[SUBS] OUT %s %s (%v)", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+func withRecovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[CRITICAL] Panic in handler %s: %v\nStack: %s", r.URL.Path, err, debug.Stack())
+				_ = writeResp(w, r, spec.NewError(0, "internal server error (panic)"))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
 func withParams(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		params := params.New(r)
-		withParams := context.WithValue(r.Context(), CtxParams, params)
-		next.ServeHTTP(w, r.WithContext(withParams))
+		p := params.New(r)
+		withP := context.WithValue(r.Context(), CtxParams, p)
+		next.ServeHTTP(w, r.WithContext(withP))
 	})
 }
 
 func withRequiredParams(next http.Handler) http.Handler {
-	requiredParameters := []string{
-		"u", "c",
-	}
+	required := []string{"u", "c"}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		params := r.Context().Value(CtxParams).(params.Params)
-		for _, req := range requiredParameters {
-			if _, err := params.Get(req); err != nil {
+		p := r.Context().Value(CtxParams).(params.Params)
+		for _, req := range required {
+			if _, err := p.Get(req); err != nil {
 				_ = writeResp(w, r, spec.NewError(10, "please provide a %q parameter", req))
 				return
 			}
@@ -135,11 +185,11 @@ func withRequiredParams(next http.Handler) http.Handler {
 func withUser(dbc *db.DB) handlerutil.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			params := r.Context().Value(CtxParams).(params.Params)
-			username, _ := params.Get("u")
-			password, _ := params.Get("p")
-			token, _ := params.Get("t")
-			salt, _ := params.Get("s")
+			p := r.Context().Value(CtxParams).(params.Params)
+			username, _ := p.Get("u")
+			password, _ := p.Get("p")
+			token, _ := p.Get("t")
+			salt, _ := p.Get("s")
 
 			passwordAuth := token == "" && salt == ""
 			tokenAuth := password == ""
@@ -162,17 +212,17 @@ func withUser(dbc *db.DB) handlerutil.Middleware {
 				_ = writeResp(w, r, spec.NewError(40, "invalid password"))
 				return
 			}
-			withUser := context.WithValue(r.Context(), CtxUser, user)
-			next.ServeHTTP(w, r.WithContext(withUser))
+			withU := context.WithValue(r.Context(), CtxUser, user)
+			next.ServeHTTP(w, r.WithContext(withU))
 		})
 	}
 }
 
 func slow(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rc := http.NewResponseController(w) 
-		_ = rc.SetWriteDeadline(time.Time{}) 
-		_ = rc.SetReadDeadline(time.Time{})  
+		rc := http.NewResponseController(w)
+		_ = rc.SetWriteDeadline(time.Time{})
+		_ = rc.SetReadDeadline(time.Time{})
 		next.ServeHTTP(w, r)
 	})
 }
@@ -186,8 +236,8 @@ func checkCredsToken(password, token, salt string) bool {
 
 func checkCredsBasic(password, given string) bool {
 	if len(given) >= 4 && given[:4] == "enc:" {
-		bytes, _ := hex.DecodeString(given[4:])
-		given = string(bytes)
+		b, _ := hex.DecodeString(given[4:])
+		given = string(b)
 	}
 	return password == given
 }
@@ -206,8 +256,16 @@ func (ew *errWriter) write(buf []byte) {
 
 func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) error {
 	if resp == nil {
+		log.Printf("[SUBS] Writing nil response")
 		return nil
 	}
+
+	status := "ok"
+	if resp.Error != nil {
+		status = fmt.Sprintf("error %d: %s", resp.Error.Code, resp.Error.Message)
+	}
+	log.Printf("[SUBS] Writing response status=%s", status)
+
 
 	var res struct {
 		XMLName        xml.Name `xml:"subsonic-response" json:"-"`
@@ -215,10 +273,10 @@ func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) erro
 	}
 	res.Response = resp
 
-	params := r.Context().Value(CtxParams).(params.Params)
+	p := r.Context().Value(CtxParams).(params.Params)
 
 	ew := &errWriter{w: w}
-	switch v, _ := params.Get("f"); v {
+	switch v, _ := p.Get("f"); v {
 	case "json":
 		w.Header().Set("Content-Type", "application/json")
 		data, err := json.Marshal(res)
@@ -233,7 +291,7 @@ func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) erro
 		if err != nil {
 			return fmt.Errorf("marshal to jsonp: %w", err)
 		}
-		pCall := params.GetOr("callback", "cb")
+		pCall := p.GetOr("callback", "cb")
 		ew.write([]byte(pCall))
 		ew.write([]byte("("))
 		ew.write(data)
@@ -245,7 +303,6 @@ func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) erro
 		if err != nil {
 			return fmt.Errorf("marshal to xml: %w", err)
 		}
-
 		ew.write(data)
 	}
 
