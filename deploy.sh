@@ -32,7 +32,7 @@ echo -e "${GREEN}✅ Build successful!${NC}"
 
 # 2. Prepare Remote Server
 echo -e "\n${BLUE}[2/4] Preparing Remote Server...${NC}"
-ssh -p "${SSH_PORT}" "${REMOTE}" "mkdir -p ${PATH_REMOTE}"
+ssh -p "${SSH_PORT}" "${REMOTE}" "mkdir -p ${PATH_REMOTE} && systemctl stop ${SERVICE_NAME} 2>/dev/null || true"
 
 # 3. Upload Binary & Tools
 echo -e "\n${BLUE}[3/4] Uploading Binary...${NC}"
