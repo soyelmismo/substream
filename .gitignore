@@ -17,3 +17,4 @@ cache/
 substream
 .fuse*
 *.pem
+substream_linux
