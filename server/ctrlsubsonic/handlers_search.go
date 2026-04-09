@@ -3,6 +3,7 @@ package ctrlsubsonic
 import (
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 
@@ -48,6 +49,12 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	artistCount := p.GetOrInt("artistCount", 20)
 	albumCount := p.GetOrInt("albumCount", 20)
 	songCount := p.GetOrInt("songCount", 20)
+
+	// strictly limit for performance
+	if artistCount > 40 { artistCount = 40 }
+	if albumCount > 40 { albumCount = 40 }
+	if songCount > 40 { songCount = 40 }
+
 	artistOffset := p.GetOrInt("artistOffset", 0)
 	albumOffset := p.GetOrInt("albumOffset", 0)
 	songOffset := p.GetOrInt("songOffset", 0)
@@ -151,10 +158,157 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		}()
 	}
 
+	// 2. Parallel Favorites Search
+	favTracksCh := make(chan []spec.TrackChild, 1)
+	favArtistsCh := make(chan []spec.Artist, 1)
+	favAlbumsCh := make(chan []spec.Album, 1)
+
+	user := r.Context().Value(CtxUser).(*db.User)
+	if !fromCache && len(query) >= 3 && (songOffset == 0 || albumOffset == 0 || artistOffset == 0) {
+		queryLower := strings.ToLower(query)
+
+		go func() {
+			if albumOffset != 0 {
+				favAlbumsCh <- nil
+				return
+			}
+			var stars []db.AlbumStar
+			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(20).Find(&stars)
+			starIDs := make([]int, len(stars))
+			for i, s := range stars {
+				starIDs[i] = s.TidalID
+			}
+
+			starredMeta := c.batchFetchAlbums(r, starIDs)
+			var matches []spec.Album
+			for _, a := range starredMeta {
+				if strings.Contains(strings.ToLower(a.Name), queryLower) || strings.Contains(strings.ToLower(a.Artist), queryLower) {
+					matches = append(matches, *a)
+				}
+			}
+			favAlbumsCh <- matches
+		}()
+
+		go func() {
+			if artistOffset != 0 {
+				favArtistsCh <- nil
+				return
+			}
+			var stars []db.ArtistStar
+			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(20).Find(&stars)
+			starIDs := make([]int, len(stars))
+			for i, s := range stars {
+				starIDs[i] = s.TidalID
+			}
+
+			starredMeta := c.batchFetchArtists(r, starIDs)
+			var matches []spec.Artist
+			for _, a := range starredMeta {
+				if strings.Contains(strings.ToLower(a.Name), queryLower) {
+					matches = append(matches, *a)
+				}
+			}
+			favArtistsCh <- matches
+		}()
+
+		go func() {
+			if songOffset != 0 {
+				favTracksCh <- nil
+				return
+			}
+			var stars []db.TrackStar
+			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(20).Find(&stars)
+			starIDs := make([]int, len(stars))
+			for i, s := range stars {
+				starIDs[i] = s.TidalID
+			}
+
+			starredMeta := c.batchFetchTracks(r, starIDs)
+			var matches []spec.TrackChild
+			for _, t := range starredMeta {
+				if strings.Contains(strings.ToLower(t.Title), queryLower) || strings.Contains(strings.ToLower(t.Artist), queryLower) || strings.Contains(strings.ToLower(t.Album), queryLower) {
+					matches = append(matches, *t)
+				}
+			}
+			favTracksCh <- matches
+		}()
+	} else {
+		favTracksCh <- nil
+		favArtistsCh <- nil
+		favAlbumsCh <- nil
+	}
+
 	log.Printf("[SUBS] Awaiting search results for query %q (cache=%v)", query, fromCache)
 	tracks = <-tracksCh
 	artists = <-artistsCh
 	albums = <-albumsCh
+
+	// implement "Favorites First" logic merge with timeout
+	var favTracks []spec.TrackChild
+	var favArtists []spec.Artist
+	var favAlbums []spec.Album
+
+	waitForFavs := time.NewTimer(3 * time.Second)
+	defer waitForFavs.Stop()
+
+favLoop:
+	for i := 0; i < 3; i++ {
+		select {
+		case favTracks = <-favTracksCh:
+		case favArtists = <-favArtistsCh:
+		case favAlbums = <-favAlbumsCh:
+		case <-waitForFavs.C:
+			log.Printf("[SUBS] Favorites search for %q timed out", query)
+			break favLoop
+		case <-r.Context().Done():
+			return nil
+		}
+	}
+
+	if len(favAlbums) > 0 {
+		newAlbums := favAlbums
+		seenIDs := make(map[int]bool)
+		for _, m := range favAlbums {
+			seenIDs[m.ID.Value] = true
+		}
+		for _, a := range albums {
+			if !seenIDs[a.ID.Value] {
+				newAlbums = append(newAlbums, a)
+				seenIDs[a.ID.Value] = true
+			}
+		}
+		albums = newAlbums
+	}
+
+	if len(favArtists) > 0 {
+		newArtists := favArtists
+		seenIDs := make(map[int]bool)
+		for _, m := range favArtists {
+			seenIDs[m.ID.Value] = true
+		}
+		for _, a := range artists {
+			if !seenIDs[a.ID.Value] {
+				newArtists = append(newArtists, a)
+				seenIDs[a.ID.Value] = true
+			}
+		}
+		artists = newArtists
+	}
+
+	if len(favTracks) > 0 {
+		newTracks := favTracks
+		seenIDs := make(map[int]bool)
+		for _, m := range favTracks {
+			seenIDs[m.ID.Value] = true
+		}
+		for _, t := range tracks {
+			if !seenIDs[t.ID.Value] {
+				newTracks = append(newTracks, t)
+				seenIDs[t.ID.Value] = true
+			}
+		}
+		tracks = newTracks
+	}
 
 	if !fromCache && (len(tracks) > 0 || len(artists) > 0 || len(albums) > 0) {
 		c.searchCache.Store(query, cachedSearch{
@@ -167,10 +321,13 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 
 	log.Printf("[SUBS] Search results ready for query %q: tracks=%d artists=%d albums=%d", query, len(tracks), len(artists), len(albums))
 
+	if r.Context().Err() != nil {
+		log.Printf("[SUBS] Search query %q cancelled", query)
+		return nil
+	}
 
 
-	// apply star info from local DB
-	user := r.Context().Value(CtxUser).(*db.User)
+
 
 	for i := range tracks {
 		results.Tracks = append(results.Tracks, &tracks[i])
@@ -346,7 +503,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 
 	// starred tracks
 	var trackStars []db.TrackStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&trackStars)
+	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(50).Find(&trackStars)
 	
 	trackIDs := make([]int, len(trackStars))
 	for i, s := range trackStars {
@@ -360,7 +517,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 
 	// starred albums
 	var albumStars []db.AlbumStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&albumStars)
+	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(50).Find(&albumStars)
 	albumIDs := make([]int, len(albumStars))
 	for i, s := range albumStars {
 		albumIDs[i] = s.TidalID
@@ -369,7 +526,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 
 	// starred artists
 	var artistStars []db.ArtistStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&artistStars)
+	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(50).Find(&artistStars)
 	artistIDs := make([]int, len(artistStars))
 	for i, s := range artistStars {
 		artistIDs[i] = s.TidalID

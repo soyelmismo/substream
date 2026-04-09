@@ -39,6 +39,7 @@ type Controller struct {
 	scrobblers  []scrobble.Scrobbler
 	cachePath   string
 	searchCache sync.Map
+	proxySem    chan struct{}
 }
 
 
@@ -49,6 +50,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 		proxy:      proxy,
 		scrobblers: scrobblers,
 		cachePath:  cachePath,
+		proxySem:   make(chan struct{}, 30), // limit total concurrent proxy calls
 	}
 
 	chain := handlerutil.Chain(
@@ -285,7 +287,6 @@ func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) erro
 	}
 	log.Printf("[SUBS] Writing response status=%s", status)
 
-
 	var res struct {
 		XMLName        xml.Name `xml:"subsonic-response" json:"-"`
 		*spec.Response `json:"subsonic-response"`
@@ -294,36 +295,35 @@ func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) erro
 
 	p := r.Context().Value(CtxParams).(params.Params)
 
-	ew := &errWriter{w: w}
 	switch v, _ := p.Get("f"); v {
 	case "json":
 		w.Header().Set("Content-Type", "application/json")
-		data, err := json.Marshal(res)
-		if err != nil {
-			return fmt.Errorf("marshal to json: %w", err)
-		}
-		ew.write(data)
+		enc := json.NewEncoder(w)
+		return enc.Encode(res)
 
 	case "jsonp":
 		w.Header().Set("Content-Type", "application/javascript")
-		data, err := json.Marshal(res)
-		if err != nil {
-			return fmt.Errorf("marshal to jsonp: %w", err)
-		}
 		pCall := p.GetOr("callback", "cb")
-		ew.write([]byte(pCall))
-		ew.write([]byte("("))
-		ew.write(data)
-		ew.write([]byte(");"))
+		if _, err := fmt.Fprintf(w, "%s(", pCall); err != nil {
+			return err
+		}
+		enc := json.NewEncoder(w)
+		if err := enc.Encode(res); err != nil {
+			return err
+		}
+		_, err := fmt.Fprint(w, ");")
+		return err
 
 	default:
 		w.Header().Set("Content-Type", "application/xml")
-		data, err := xml.MarshalIndent(res, "", "    ")
-		if err != nil {
-			return fmt.Errorf("marshal to xml: %w", err)
+		if _, err := io.WriteString(w, xml.Header); err != nil {
+			return err
 		}
-		ew.write(data)
+		enc := xml.NewEncoder(w)
+		enc.Indent("", "    ")
+		if err := enc.Encode(res); err != nil {
+			return err
+		}
+		return nil
 	}
-
-	return ew.err
 }

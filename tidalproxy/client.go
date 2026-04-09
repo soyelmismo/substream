@@ -346,7 +346,7 @@ func (p *Pool) SearchTracks(ctx context.Context, query string, limit, offset int
 	var result struct {
 		Items []TidalTrack `json:"items"`
 	}
-	if err := p.apiGet(ctx, "/search/tracks/", q, &result, ""); err != nil {
+	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
 		return nil, err
 	}
 	return result.Items, nil
@@ -358,21 +358,20 @@ func (p *Pool) SearchArtists(ctx context.Context, query string, limit, offset in
 		"limit":  {fmt.Sprint(limit)},
 		"offset": {fmt.Sprint(offset)},
 	}
-	body, err := p.apiGetRaw(ctx, "/search/artists/", q, "")
-	if err != nil {
+	var result struct {
+		Artists struct {
+			Items []TidalArtist `json:"items"`
+		} `json:"artists"`
+		// support flat items if proxy doesn't use top-hits
+		Items []TidalArtist `json:"items"`
+	}
+	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
 		return nil, err
 	}
-	var resp struct {
-		Artists []TidalArtist `json:"artists"`
-		Items   []TidalArtist `json:"items"`
+	if len(result.Artists.Items) > 0 {
+		return result.Artists.Items, nil
 	}
-	if err := json.Unmarshal(body, &resp); err == nil {
-		if len(resp.Artists) > 0 {
-			return resp.Artists, nil
-		}
-		return resp.Items, nil
-	}
-	return nil, nil
+	return result.Items, nil
 }
 
 func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int) ([]TidalAlbum, error) {
@@ -381,21 +380,19 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 		"limit":  {fmt.Sprint(limit)},
 		"offset": {fmt.Sprint(offset)},
 	}
-	body, err := p.apiGetRaw(ctx, "/search/albums/", q, "")
-	if err != nil {
+	var result struct {
+		Albums struct {
+			Items []TidalAlbum `json:"items"`
+		} `json:"albums"`
+		Items []TidalAlbum `json:"items"`
+	}
+	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
 		return nil, err
 	}
-	var resp struct {
-		Albums []TidalAlbum `json:"albums"`
-		Items  []TidalAlbum `json:"items"`
+	if len(result.Albums.Items) > 0 {
+		return result.Albums.Items, nil
 	}
-	if err := json.Unmarshal(body, &resp); err == nil {
-		if len(resp.Albums) > 0 {
-			return resp.Albums, nil
-		}
-		return resp.Items, nil
-	}
-	return nil, nil
+	return result.Items, nil
 }
 
 func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, clientIP string) (string, error) {

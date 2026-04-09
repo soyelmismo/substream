@@ -27,15 +27,14 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 	}
 
 	results := make(chan result, len(tidalIDs))
-	semaphore := make(chan struct{}, 20) // max 20 concurrent
 	var wg sync.WaitGroup
 
 	for i, id := range tidalIDs {
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			c.proxySem <- struct{}{}
+			defer func() { <-c.proxySem }()
 
 			track, err := c.proxy.GetTrackInfo(r.Context(), tid)
 			if err != nil {
@@ -82,15 +81,14 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 	}
 
 	results := make(chan result, len(tidalIDs))
-	semaphore := make(chan struct{}, 20)
 	var wg sync.WaitGroup
 
 	for i, id := range tidalIDs {
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			c.proxySem <- struct{}{}
+			defer func() { <-c.proxySem }()
 
 			info, err := c.proxy.GetAlbumInfo(r.Context(), tid)
 			if err != nil {
@@ -136,15 +134,14 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 	}
 
 	results := make(chan result, len(tidalIDs))
-	semaphore := make(chan struct{}, 20)
 	var wg sync.WaitGroup
 
 	for i, id := range tidalIDs {
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			c.proxySem <- struct{}{}
+			defer func() { <-c.proxySem }()
 
 			info, err := c.proxy.GetArtistInfo(r.Context(), tid)
 			if err != nil {

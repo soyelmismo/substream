@@ -17,29 +17,28 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 	var stars []db.ArtistStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&stars)
 
+	starIDs := make([]int, len(stars))
+	for i, s := range stars {
+		starIDs[i] = s.TidalID
+	}
+
+	artists := c.batchFetchArtists(r, starIDs)
 	indexMap := make(map[string]*spec.Index)
 	var indexes []*spec.Index
 
-	for _, s := range stars {
-		info, err := c.proxy.GetArtistInfo(r.Context(), s.TidalID)
-		if err != nil {
-			continue
-		}
-		a := spec.NewArtistFromTidal(&info.Artist)
-		a.Starred = &s.StarDate
+	for i, a := range artists {
+		a.Starred = &stars[i].StarDate // technically batchFetch keeps order, so this matches
 
 		key := "#"
 		if len(a.Name) > 0 {
 			ch := []rune(a.Name)[0]
-			if ch >= 'a' && ch <= 'z' {
-				key = string(ch)
-			} else if ch >= 'A' && ch <= 'Z' {
-				key = string(ch + 32)
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+				key = strings.ToUpper(string(ch))
 			}
 		}
 
 		if _, ok := indexMap[key]; !ok {
-			idx := &spec.Index{Name: key, Artists: []*spec.Artist{}}
+			idx := &spec.Index{Name: key}
 			indexMap[key] = idx
 			indexes = append(indexes, idx)
 		}
