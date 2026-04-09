@@ -11,7 +11,9 @@ import (
 	"log"
 	"net/http"
 	"runtime/debug"
+	"sync"
 	"time"
+
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
@@ -32,11 +34,13 @@ const (
 type Controller struct {
 	*http.ServeMux
 
-	dbc        *db.DB
-	proxy      tidalproxy.TidalProxy
-	scrobblers []scrobble.Scrobbler
-	cachePath  string
+	dbc         *db.DB
+	proxy       tidalproxy.TidalProxy
+	scrobblers  []scrobble.Scrobbler
+	cachePath   string
+	searchCache sync.Map
 }
+
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
 	c := &Controller{

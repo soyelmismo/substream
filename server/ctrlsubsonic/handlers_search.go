@@ -3,12 +3,21 @@ package ctrlsubsonic
 import (
 	"log"
 	"net/http"
+	"time"
+
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
+
+type cachedSearch struct {
+	tracks  []spec.TrackChild
+	artists []spec.Artist
+	albums  []spec.Album
+	expiresAt time.Time
+}
 
 func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
@@ -17,6 +26,24 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	if err != nil {
 		return spec.NewError(10, "please provide a `query` parameter")
 	}
+
+	var tracks []spec.TrackChild
+	var artists []spec.Artist
+	var albums []spec.Album
+	var fromCache bool
+
+	// Check cache
+	if val, ok := c.searchCache.Load(query); ok {
+		cached := val.(cachedSearch)
+		if time.Now().Before(cached.expiresAt) {
+			tracks = cached.tracks
+			artists = cached.artists
+			albums = cached.albums
+			fromCache = true
+		}
+	}
+
+
 
 	artistCount := p.GetOrInt("artistCount", 20)
 	albumCount := p.GetOrInt("albumCount", 20)
@@ -37,92 +64,109 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	artistsCh := make(chan []spec.Artist, 1)
 	albumsCh := make(chan []spec.Album, 1)
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[SUBS] SearchTracks panic: %v", r)
+	if fromCache {
+		tracksCh <- tracks
+		artistsCh <- artists
+		albumsCh <- albums
+	} else {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[SUBS] SearchTracks panic: %v", r)
+					tracksCh <- nil
+				}
+			}()
+			if songCount <= 0 {
 				tracksCh <- nil
+				return
 			}
+			if songCount > 500 {
+				songCount = 500
+			}
+			tData, err := c.proxy.SearchTracks(r.Context(), query, songCount, songOffset)
+			if err != nil {
+				log.Printf("[SUBS] SearchTracks error: %v", err)
+				tracksCh <- nil
+				return
+			}
+			out := make([]spec.TrackChild, len(tData))
+			for i := range tData {
+				out[i] = *spec.NewTrackFromTidal(&tData[i])
+			}
+			tracksCh <- out
 		}()
-		if songCount <= 0 {
-			tracksCh <- nil
-			return
-		}
-		if songCount > 500 {
-			songCount = 500
-		}
-		tracks, err := c.proxy.SearchTracks(r.Context(), query, songCount, songOffset)
-		if err != nil {
-			log.Printf("[SUBS] SearchTracks error: %v", err)
-			tracksCh <- nil
-			return
-		}
-		out := make([]spec.TrackChild, len(tracks))
-		for i := range tracks {
-			out[i] = *spec.NewTrackFromTidal(&tracks[i])
-		}
-		tracksCh <- out
-	}()
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[SUBS] SearchArtists panic: %v", r)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[SUBS] SearchArtists panic: %v", r)
+					artistsCh <- nil
+				}
+			}()
+			if artistCount <= 0 {
 				artistsCh <- nil
+				return
 			}
+			if artistCount > 500 {
+				artistCount = 500
+			}
+			aData, err := c.proxy.SearchArtists(r.Context(), query, artistCount, artistOffset)
+			if err != nil {
+				log.Printf("[SUBS] SearchArtists error: %v", err)
+				artistsCh <- nil
+				return
+			}
+			out := make([]spec.Artist, len(aData))
+			for i := range aData {
+				out[i] = *spec.NewArtistFromTidal(&aData[i])
+			}
+			artistsCh <- out
 		}()
-		if artistCount <= 0 {
-			artistsCh <- nil
-			return
-		}
-		if artistCount > 500 {
-			artistCount = 500
-		}
-		artists, err := c.proxy.SearchArtists(r.Context(), query, artistCount, artistOffset)
-		if err != nil {
-			log.Printf("[SUBS] SearchArtists error: %v", err)
-			artistsCh <- nil
-			return
-		}
-		out := make([]spec.Artist, len(artists))
-		for i := range artists {
-			out[i] = *spec.NewArtistFromTidal(&artists[i])
-		}
-		artistsCh <- out
-	}()
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[SUBS] SearchAlbums panic: %v", r)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[SUBS] SearchAlbums panic: %v", r)
+					albumsCh <- nil
+				}
+			}()
+			if albumCount <= 0 {
 				albumsCh <- nil
+				return
 			}
+			if albumCount > 500 {
+				albumCount = 500
+			}
+			alData, err := c.proxy.SearchAlbums(r.Context(), query, albumCount, albumOffset)
+			if err != nil {
+				log.Printf("[SUBS] SearchAlbums error: %v", err)
+				albumsCh <- nil
+				return
+			}
+			out := make([]spec.Album, len(alData))
+			for i := range alData {
+				out[i] = *spec.NewAlbumFromTidal(&alData[i])
+			}
+			albumsCh <- out
 		}()
-		if albumCount <= 0 {
-			albumsCh <- nil
-			return
-		}
-		if albumCount > 500 {
-			albumCount = 500
-		}
-		albums, err := c.proxy.SearchAlbums(r.Context(), query, albumCount, albumOffset)
-		if err != nil {
-			log.Printf("[SUBS] SearchAlbums error: %v", err)
-			albumsCh <- nil
-			return
-		}
-		out := make([]spec.Album, len(albums))
-		for i := range albums {
-			out[i] = *spec.NewAlbumFromTidal(&albums[i])
-		}
-		albumsCh <- out
-	}()
+	}
 
-	log.Printf("[SUBS] Awaiting search results for query %q", query)
-	tracks := <-tracksCh
-	artists := <-artistsCh
-	albums := <-albumsCh
+	log.Printf("[SUBS] Awaiting search results for query %q (cache=%v)", query, fromCache)
+	tracks = <-tracksCh
+	artists = <-artistsCh
+	albums = <-albumsCh
+
+	if !fromCache && (len(tracks) > 0 || len(artists) > 0 || len(albums) > 0) {
+		c.searchCache.Store(query, cachedSearch{
+			tracks:    tracks,
+			artists:   artists,
+			albums:    albums,
+			expiresAt: time.Now().Add(1 * time.Minute),
+		})
+	}
+
 	log.Printf("[SUBS] Search results ready for query %q: tracks=%d artists=%d albums=%d", query, len(tracks), len(artists), len(albums))
+
 
 
 	// apply star info from local DB

@@ -145,93 +145,106 @@ func (p *Pool) healthLoop(interval time.Duration) {
 }
 
 
-// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field
+// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries
 func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result interface{}) error {
-	base, err := p.pick()
-	if err != nil {
-		return err
-	}
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		base, err := p.pick()
+		if err != nil {
+			return err
+		}
 
-	u := base + path
-	if len(query) > 0 {
-		u += "?" + query.Encode()
-	}
+		u := base + path
+		if len(query) > 0 {
+			u += "?" + query.Encode()
+		}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
 
+		resp, err := p.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
+			continue
+		}
+		defer resp.Body.Close()
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("request %s: %w", path, err)
-	}
-	defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			lastErr = fmt.Errorf("upstream %s (try %d) returned %d: %s", path, i+1, resp.StatusCode, string(body))
+			if resp.StatusCode == 404 { // don't retry on 404
+				return lastErr
+			}
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
-	}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("read body: %w", err)
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read body: %w", err)
-	}
+		var envelope struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if json.Unmarshal(body, &envelope) == nil && len(envelope.Data) > 0 {
+			if err := json.Unmarshal(envelope.Data, result); err != nil {
+				return err
+			}
+			return nil
+		}
 
-	// hifi-api wraps responses in {"version": "...", "data": {...}}
-	// try to extract .data first, fall back to full body
-	var envelope struct {
-		Data json.RawMessage `json:"data"`
-	}
-	if json.Unmarshal(body, &envelope) == nil && len(envelope.Data) > 0 {
-		if err := json.Unmarshal(envelope.Data, result); err != nil {
-			log.Printf("tidalproxy: error decoding .data envelope: %v (raw: %s)", err, string(envelope.Data))
+		if err := json.Unmarshal(body, result); err != nil {
 			return err
 		}
 		return nil
 	}
-
-	if err := json.Unmarshal(body, result); err != nil {
-		log.Printf("tidalproxy: error decoding raw body: %v (raw: %s)", err, string(body))
-		return err
-	}
-	return nil
+	return lastErr
 }
 
-// apiGetRaw returns the raw body as bytes (for responses that don't fit the envelope pattern)
+// apiGetRaw returns the raw body as bytes with retries
 func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values) ([]byte, error) {
-	base, err := p.pick()
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		base, err := p.pick()
+		if err != nil {
+			return nil, err
+		}
+
+		u := base + path
+		if len(query) > 0 {
+			u += "?" + query.Encode()
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+
+		resp, err := p.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			lastErr = fmt.Errorf("upstream %s (try %d) returned %d: %s", path, i+1, resp.StatusCode, string(body))
+			if resp.StatusCode == 404 {
+				return nil, lastErr
+			}
+			continue
+		}
+
+		return io.ReadAll(resp.Body)
 	}
-
-	u := base + path
-	if len(query) > 0 {
-		u += "?" + query.Encode()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request %s: %w", path, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
-	}
-
-	return io.ReadAll(resp.Body)
+	return nil, lastErr
 }
+
 
 // =====================================================================
 // TidalProxy Interface Implementation
@@ -433,18 +446,70 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string) (s
 	if quality == "" {
 		quality = p.quality
 	}
-	q := url.Values{
-		"id":      {fmt.Sprint(trackID)},
-		"quality": {quality},
+
+	// 1. Try V2 OpenAPI Manifests first for Hi-Res (more reliable for some tracks)
+	if quality == "HI_RES_LOSSLESS" {
+		qV2 := url.Values{
+			"id":           {fmt.Sprint(trackID)},
+			"manifestType": {"MPEG_DASH"},
+			"formats":      {"FLAC_HIRES", "FLAC", "HEAACV1", "AACLC"},
+		}
+		var v2Response struct {
+			Data struct {
+				Attributes struct {
+					Manifest         string `json:"manifest"`
+					ManifestMimeType string `json:"manifestMimeType"`
+				} `json:"attributes"`
+			} `json:"data"`
+		}
+		if err := p.apiGet(ctx, "/trackManifests/", qV2, &v2Response); err == nil && v2Response.Data.Attributes.Manifest != "" {
+			u, err := parseManifestURL(v2Response.Data.Attributes.ManifestMimeType, v2Response.Data.Attributes.Manifest)
+			if err == nil {
+				// log.Printf("tidalproxy: stream obtained via V2 OpenAPI for track %d", trackID)
+				return u, nil
+			}
+		}
 	}
 
-	var stream TidalStreamInfo
-	if err := p.apiGet(ctx, "/track/", q, &stream); err != nil {
-		return "", err
+	// 2. Define quality fallback chain for V1
+	qualities := []string{quality}
+	if quality == "HI_RES_LOSSLESS" {
+		qualities = append(qualities, "LOSSLESS", "HIGH")
+	} else if quality == "LOSSLESS" {
+		qualities = append(qualities, "HIGH")
 	}
 
-	return parseManifestURL(stream.ManifestMimeType, stream.Manifest)
+	var lastErr error
+	for _, qStr := range qualities {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+
+		q := url.Values{
+			"id":                {fmt.Sprint(trackID)},
+			"quality":           {qStr},
+			"playbackmode":      {"STREAM"},
+			"assetpresentation": {"FULL"},
+		}
+
+		var stream TidalStreamInfo
+		err := p.apiGet(ctx, "/track/", q, &stream)
+		if err == nil {
+			return parseManifestURL(stream.ManifestMimeType, stream.Manifest)
+		}
+
+		lastErr = err
+		log.Printf("tidalproxy: V1 fetch failed for quality %s: %v (trying next...)", qStr, err)
+
+		if strings.Contains(err.Error(), "context canceled") {
+			return "", err
+		}
+	}
+
+	return "", lastErr
 }
+
+
 
 func (p *Pool) GetCoverURL(coverUUID string, size int) string {
 	if coverUUID == "" {
@@ -558,6 +623,18 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 		}
 	}
 
+	// Fallback for DASH or other XMLs: find first http URL
+	if strings.HasPrefix(content, "<") || strings.Contains(content, "xml") {
+		start := strings.Index(content, "http")
+		if start >= 0 {
+			end := strings.IndexAny(content[start:], " \"'<>")
+			if end > 0 {
+				return content[start : start+end], nil
+			}
+			return content[start:], nil
+		}
+	}
+
 	// M3U8: first line that starts with http
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
@@ -566,5 +643,6 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("could not extract URL from manifest (type: %s)", mimeType)
+	return "", fmt.Errorf("could not extract URL from manifest (type: %s content preview: %.50s)", mimeType, content)
 }
+
