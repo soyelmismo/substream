@@ -52,15 +52,14 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	albumCount := p.GetOrInt("albumCount", -1)
 	songCount := p.GetOrInt("songCount", -1)
 
-	// Set defaults only if not provided (-1)
-	if artistCount == -1 { artistCount = 3 }
-	if albumCount == -1 { albumCount = 20 }
-	if songCount == -1 { songCount = 20 }
+	// Set defaults only if not provided (-1) - optimize for Tidal
+	if artistCount == -1 { artistCount = 5 }
+	if albumCount == -1 { albumCount = 30 }
+	if songCount == -1 { songCount = 30 }
 
-	// Still apply caps to prevent performance issues
-	if artistCount > 10 { artistCount = 10 }
-	if albumCount > 50 { albumCount = 50 }
-	if songCount > 50 { songCount = 50 }
+	if artistCount > 50 { artistCount = 50 }
+	if albumCount > 100 { albumCount = 100 }
+	if songCount > 100 { songCount = 100 }
 
 	artistOffset := p.GetOrInt("artistOffset", 0)
 	albumOffset := p.GetOrInt("albumOffset", 0)
@@ -184,7 +183,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				return
 			}
 			var stars []db.AlbumStar
-			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(20).Find(&stars)
+			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
 			starIDs := make([]int, len(stars))
 			for i, s := range stars {
 				starIDs[i] = s.TidalID
@@ -206,7 +205,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				return
 			}
 			var stars []db.ArtistStar
-			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(20).Find(&stars)
+			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
 			starIDs := make([]int, len(stars))
 			for i, s := range stars {
 				starIDs[i] = s.TidalID
@@ -228,7 +227,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				return
 			}
 			var stars []db.TrackStar
-			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(20).Find(&stars)
+			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
 			starIDs := make([]int, len(stars))
 			for i, s := range stars {
 				starIDs[i] = s.TidalID
@@ -514,7 +513,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 
 	// starred tracks
 	var trackStars []db.TrackStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(50).Find(&trackStars)
+	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&trackStars)
 	
 	trackIDs := make([]int, len(trackStars))
 	for i, s := range trackStars {
@@ -528,7 +527,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 
 	// starred albums
 	var albumStars []db.AlbumStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(50).Find(&albumStars)
+	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&albumStars)
 	albumIDs := make([]int, len(albumStars))
 	for i, s := range albumStars {
 		albumIDs[i] = s.TidalID
@@ -537,7 +536,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 
 	// starred artists
 	var artistStars []db.ArtistStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(50).Find(&artistStars)
+	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&artistStars)
 	artistIDs := make([]int, len(artistStars))
 	for i, s := range artistStars {
 		artistIDs[i] = s.TidalID

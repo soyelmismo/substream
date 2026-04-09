@@ -110,10 +110,6 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 	artist := spec.NewArtistFromTidal(&info.Artist)
 	
 	items := artistPage.Albums.Items
-	if len(items) > 10 {
-		items = items[:10]
-	}
-
 	artist.AlbumCount = len(items)
 	artist.Albums = make([]*spec.Album, len(items))
 	for i := range items {
