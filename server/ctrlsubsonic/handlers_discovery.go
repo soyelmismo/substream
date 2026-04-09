@@ -1,9 +1,11 @@
 package ctrlsubsonic
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.senan.xyz/gonic/db"
 
@@ -96,6 +98,9 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	count := p.GetOrInt("count", 20)
+	if count > 20 {
+		count = 20 // limit for speed
+	}
 
 	id, err := p.GetID("id")
 	if err != nil {
@@ -108,8 +113,10 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 		trackID = id.Value
 	case specid.Artist:
 		// get a representative track for the artist to get recommendations
-		page, err := c.proxy.GetArtistAlbums(r.Context(), id.Value, false)
-		if err != nil || len(page.Tracks) == 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		page, err := c.proxy.GetArtistAlbums(ctx, id.Value, true) // skip tracks for speed
+		cancel()
+		if err != nil || page == nil || len(page.Tracks) == 0 {
 			return spec.NewResponse()
 		}
 		trackID = page.Tracks[0].ID
@@ -117,7 +124,11 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 		return spec.NewResponse()
 	}
 
-	recs, err := c.proxy.GetRecommendations(r.Context(), trackID)
+	// fast timeout for recommendations
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	recs, err := c.proxy.GetRecommendations(ctx, trackID)
+	cancel()
+
 	if err != nil {
 		log.Printf("[DISC] GetRecommendations error: %v", err)
 		return spec.NewResponse()
@@ -125,6 +136,11 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 
 	if len(recs) > count {
 		recs = recs[:count]
+	}
+
+	// quick return if no recs
+	if len(recs) == 0 {
+		return spec.NewResponse()
 	}
 
 	ids := make([]int, len(recs))
