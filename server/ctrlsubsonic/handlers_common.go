@@ -22,11 +22,7 @@ func (c *Controller) ServeGetLicence(_ *http.Request) *spec.Response {
 
 func (c *Controller) ServeGetMusicFolders(_ *http.Request) *spec.Response {
 	sub := spec.NewResponse()
-	sub.MusicFolders = &spec.MusicFolders{
-		List: []*spec.MusicFolder{
-			{ID: 0, Name: "Tidal"},
-		},
-	}
+	sub.MusicFolders = &spec.MusicFolders{}
 	return sub
 }
 

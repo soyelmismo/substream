@@ -8,6 +8,7 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
+	"go.senan.xyz/gonic/tidalproxy"
 )
 
 func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
@@ -58,22 +59,41 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 		return spec.NewError(10, "please provide an artist `id` parameter")
 	}
 
-	// fetch artist info + albums
-	info, err := c.proxy.GetArtistInfo(r.Context(), id.Value)
-	if err != nil {
-		return spec.NewError(0, "error fetching artist: %v", err)
-	}
+	var info *tidalproxy.TidalArtistDetail
+	var artistPage *tidalproxy.TidalArtistPage
+	var errInfo, errPage error
 
-	artistPage, err := c.proxy.GetArtistAlbums(r.Context(), id.Value, true)
-	if err != nil {
-		return spec.NewError(0, "error fetching artist albums: %v", err)
+	done := make(chan struct{}, 2)
+	go func() {
+		info, errInfo = c.proxy.GetArtistInfo(r.Context(), id.Value)
+		done <- struct{}{}
+	}()
+	go func() {
+		artistPage, errPage = c.proxy.GetArtistAlbums(r.Context(), id.Value, true)
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
+
+	if errInfo != nil {
+		return spec.NewError(0, "error fetching artist: %v", errInfo)
+	}
+	if errPage != nil {
+		return spec.NewError(0, "error fetching artist albums: %v", errPage)
 	}
 
 	artist := spec.NewArtistFromTidal(&info.Artist)
-	artist.AlbumCount = len(artistPage.Albums.Items)
-	artist.Albums = make([]*spec.Album, len(artistPage.Albums.Items))
-	for i := range artistPage.Albums.Items {
-		artist.Albums[i] = spec.NewAlbumFromTidal(&artistPage.Albums.Items[i])
+	
+	items := artistPage.Albums.Items
+	if len(items) > 10 {
+		items = items[:10]
+	}
+
+	artist.AlbumCount = len(items)
+	artist.Albums = make([]*spec.Album, len(items))
+	for i := range items {
+		artist.Albums[i] = spec.NewAlbumFromTidal(&items[i])
 	}
 
 	sub := spec.NewResponse()

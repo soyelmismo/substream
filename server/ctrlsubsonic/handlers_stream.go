@@ -204,8 +204,27 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		return spec.NewError(70, "cover art not found")
 	}
 
-	// Redirect straight to Tidal CDN to prevent freezing the server
-	http.Redirect(w, r, coverURL, http.StatusFound)
+	// proxy from CDN with short timeout — no disk cache to keep stateless
+	proxyClient := &http.Client{Timeout: 8 * time.Second}
+	req, _ := http.NewRequestWithContext(r.Context(), "GET", coverURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := proxyClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		w.WriteHeader(http.StatusNotFound)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	io.Copy(w, resp.Body)
 	return nil
 }
 

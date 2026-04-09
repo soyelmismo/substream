@@ -46,14 +46,14 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 
 
 
-	artistCount := p.GetOrInt("artistCount", 20)
+	// artists default 3 so that artist searches still return something without huge cascade
+	artistCount := p.GetOrInt("artistCount", 3)
 	albumCount := p.GetOrInt("albumCount", 20)
 	songCount := p.GetOrInt("songCount", 20)
 
-	// strictly limit for performance
-	if artistCount > 40 { artistCount = 40 }
-	if albumCount > 40 { albumCount = 40 }
-	if songCount > 40 { songCount = 40 }
+	if artistCount > 5 { artistCount = 5 }
+	if albumCount > 30 { albumCount = 30 }
+	if songCount > 30 { songCount = 30 }
 
 	artistOffset := p.GetOrInt("artistOffset", 0)
 	albumOffset := p.GetOrInt("albumOffset", 0)
@@ -87,14 +87,14 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				tracksCh <- nil
 				return
 			}
-			if songCount > 500 {
-				songCount = 500
-			}
 			tData, err := c.proxy.SearchTracks(r.Context(), query, songCount, songOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchTracks error: %v", err)
 				tracksCh <- nil
 				return
+			}
+			if len(tData) > songCount {
+				tData = tData[:songCount]
 			}
 			out := make([]spec.TrackChild, len(tData))
 			for i := range tData {
@@ -114,14 +114,14 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				artistsCh <- nil
 				return
 			}
-			if artistCount > 500 {
-				artistCount = 500
-			}
 			aData, err := c.proxy.SearchArtists(r.Context(), query, artistCount, artistOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchArtists error: %v", err)
 				artistsCh <- nil
 				return
+			}
+			if len(aData) > artistCount {
+				aData = aData[:artistCount]
 			}
 			out := make([]spec.Artist, len(aData))
 			for i := range aData {
@@ -141,14 +141,14 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				albumsCh <- nil
 				return
 			}
-			if albumCount > 500 {
-				albumCount = 500
-			}
 			alData, err := c.proxy.SearchAlbums(r.Context(), query, albumCount, albumOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchAlbums error: %v", err)
 				albumsCh <- nil
 				return
+			}
+			if len(alData) > albumCount {
+				alData = alData[:albumCount]
 			}
 			out := make([]spec.Album, len(alData))
 			for i := range alData {

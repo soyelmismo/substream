@@ -349,6 +349,9 @@ func (p *Pool) SearchTracks(ctx context.Context, query string, limit, offset int
 	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
 		return nil, err
 	}
+	if limit > 0 && len(result.Items) > limit {
+		result.Items = result.Items[:limit]
+	}
 	return result.Items, nil
 }
 
@@ -369,7 +372,14 @@ func (p *Pool) SearchArtists(ctx context.Context, query string, limit, offset in
 		return nil, err
 	}
 	if len(result.Artists.Items) > 0 {
-		return result.Artists.Items, nil
+		items := result.Artists.Items
+		if limit > 0 && len(items) > limit {
+			items = items[:limit]
+		}
+		return items, nil
+	}
+	if limit > 0 && len(result.Items) > limit {
+		result.Items = result.Items[:limit]
 	}
 	return result.Items, nil
 }
@@ -390,7 +400,14 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 		return nil, err
 	}
 	if len(result.Albums.Items) > 0 {
-		return result.Albums.Items, nil
+		items := result.Albums.Items
+		if limit > 0 && len(items) > limit {
+			items = items[:limit]
+		}
+		return items, nil
+	}
+	if limit > 0 && len(result.Items) > limit {
+		result.Items = result.Items[:limit]
 	}
 	return result.Items, nil
 }
