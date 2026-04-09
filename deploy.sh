@@ -55,7 +55,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 echo "📝 Creating systemd service file..."
 cat > "\$SERVICE_FILE" << EOF
 [Unit]
-Description=Substream Tidal Proxy
+Description=Substream
 After=network.target
 
 [Service]
