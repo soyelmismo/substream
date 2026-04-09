@@ -33,12 +33,13 @@ const (
 type Controller struct {
 	*http.ServeMux
 
-	dbc         *db.DB
-	proxy       tidalproxy.TidalProxy
-	scrobblers  []scrobble.Scrobbler
-	cachePath   string
-	searchCache sync.Map
-	proxySem    chan struct{}
+	dbc          *db.DB
+	proxy        tidalproxy.TidalProxy
+	scrobblers   []scrobble.Scrobbler
+	cachePath    string
+	searchCache  sync.Map
+	proxySem     chan struct{}
+	coverLocks   sync.Map // dedup concurrent cover requests
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
@@ -150,7 +151,6 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 
 	size := p.GetOrInt("size", 600)
 	if id.Type == specid.Artist {
-		// Artist profile images use different sizes
 		switch {
 		case size <= 160:
 			size = 160
@@ -164,7 +164,6 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 			size = 1000
 		}
 	} else {
-		// Album/track covers
 		switch {
 		case size <= 80:
 			size = 80
@@ -179,9 +178,10 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		}
 	}
 
-	// check disk cache first
 	cacheKey := fmt.Sprintf("%s-%d-%d", id.Type, id.Value, size)
 	cachePath := filepath.Join(c.cachePath, cacheKey+".jpg")
+
+	// check disk cache first (fast path)
 	if data, err := os.ReadFile(cachePath); err == nil {
 		w.Header().Set("Content-Type", "image/jpeg")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -192,71 +192,123 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	// negative cache: avoid re-fetching covers we know are missing
 	negKey := fmt.Sprintf("neg-%s-%d", id.Type, id.Value)
 	if _, negHit := c.searchCache.Load(negKey); negHit {
-		// serve 1x1 transparent pixel so client stops retrying
 		w.Header().Set("Content-Type", "image/gif")
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.Write(transparentPixel)
 		return nil
 	}
 
+	// deduplication: only one request fetches, others wait
+	type lockPair struct {
+		mu     sync.Mutex
+		done   chan struct{}
+		data   []byte
+		status int // 0=pending, 1=success, 2=error
+	}
+
+	lockVal, loaded := c.coverLocks.LoadOrStore(cacheKey, &lockPair{done: make(chan struct{})})
+	lp := lockVal.(*lockPair)
+
+	if loaded {
+		// another request is in progress, wait for it
+		<-lp.done
+		lp.mu.Lock()
+		if lp.status == 1 {
+			lp.mu.Unlock()
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			w.Write(lp.data)
+		} else {
+			lp.mu.Unlock()
+			w.Header().Set("Content-Type", "image/gif")
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			w.Write(transparentPixel)
+		}
+		return nil
+	}
+
+	// we are the fetcher - do the work
+	coverData, err := c.fetchAndCacheCover(r.Context(), &id, size, cachePath, negKey)
+
+	lp.mu.Lock()
+	if err == nil && coverData != nil {
+		lp.status = 1
+		lp.data = coverData
+	} else {
+		lp.status = 2
+	}
+	close(lp.done)
+	lp.mu.Unlock()
+
+	// cleanup lock after request completes
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		c.coverLocks.Delete(cacheKey)
+	}()
+
+	if err != nil {
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(transparentPixel)
+		return nil
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(coverData)
+	return nil
+}
+
+func (c *Controller) fetchAndCacheCover(ctx context.Context, id *specid.ID, size int, cachePath, negKey string) ([]byte, error) {
 	// resolve cover UUID
 	var coverUUID string
 	switch id.Type {
 	case specid.Album:
-		coverUUID = c.proxy.GetCoverUUIDForAlbum(r.Context(), id.Value)
+		coverUUID = c.proxy.GetCoverUUIDForAlbum(ctx, id.Value)
 	case specid.Artist:
-		info, err := c.proxy.GetArtistInfo(r.Context(), id.Value)
+		info, err := c.proxy.GetArtistInfo(ctx, id.Value)
 		if err == nil {
 			coverUUID = info.Artist.Picture
 		}
 	case specid.Track:
-		track, err := c.proxy.GetTrackInfo(r.Context(), id.Value)
+		track, err := c.proxy.GetTrackInfo(ctx, id.Value)
 		if err == nil {
 			coverUUID = track.Album.Cover
 		}
 	}
 
 	if coverUUID == "" {
-		c.searchCache.Store(negKey, true) // mark as missing
-		w.Header().Set("Content-Type", "image/gif")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
-		w.Write(transparentPixel)
-		return nil
+		c.searchCache.Store(negKey, true)
+		return nil, fmt.Errorf("no cover found")
 	}
 
-	// build CDN URL and proxy
 	coverURL := c.proxy.GetCoverURL(coverUUID, size)
 	if coverURL == "" {
-		w.Header().Set("Content-Type", "image/gif")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
-		w.Write(transparentPixel)
-		return nil
+		return nil, fmt.Errorf("no cover URL")
 	}
 
-	// proxy from CDN with short timeout — no disk cache to keep stateless
 	proxyClient := &http.Client{Timeout: 8 * time.Second}
-	req, _ := http.NewRequestWithContext(r.Context(), "GET", coverURL, nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", coverURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := proxyClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			resp.Body.Close()
 		}
-		w.Header().Set("Content-Type", "image/gif")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
-		w.Write(transparentPixel)
-		return nil
+		return nil, fmt.Errorf("fetch failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = "image/jpeg"
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
-	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	io.Copy(w, resp.Body)
-	return nil
+
+	// write to disk cache
+	os.MkdirAll(filepath.Dir(cachePath), 0755)
+	os.WriteFile(cachePath, data, 0644)
+
+	return data, nil
 }
 
 // 1x1 transparent GIF — returned when cover art is unavailable so clients stop retrying
