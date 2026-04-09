@@ -16,14 +16,21 @@ import (
 	"github.com/sentriz/gormstore"
 )
 
+func getEnv(key, defaultVal string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return defaultVal
+}
+
 func main() {
-	confListenAddr := flag.String("listen-addr", "0.0.0.0:4533", "listen address")
-	confDBPath := flag.String("db-path", "substream.db", "database path")
-	confCachePath := flag.String("cache-path", "./cache", "cache directory (covers)")
-	confProxyURLs := flag.String("proxy-urls", "http://localhost:8000", "comma-separated hifi-api URLs")
-	confProxyPrefix := flag.String("proxy-prefix", "", "URL path prefix if behind reverse proxy")
-	confCertPath := flag.String("cert-path", "", "path to SSL certificate (for HTTPS)")
-	confKeyPath := flag.String("key-path", "", "path to SSL key (for HTTPS)")
+	confListenAddr := flag.String("listen-addr", getEnv("SUBSTREAM_LISTEN_ADDR", "0.0.0.0:4533"), "listen address")
+	confDBPath := flag.String("db-path", getEnv("SUBSTREAM_DB_PATH", "substream.db"), "database path")
+	confCachePath := flag.String("cache-path", getEnv("SUBSTREAM_CACHE_PATH", "./cache"), "cache directory")
+	confProxyURLs := flag.String("proxy-urls", getEnv("SUBSTREAM_PROXY_URLS", "http://localhost:8000"), "comma-separated hifi-api URLs")
+	confProxyPrefix := flag.String("proxy-prefix", getEnv("SUBSTREAM_PROXY_PREFIX", ""), "URL path prefix")
+	confCertPath := flag.String("cert-path", getEnv("SUBSTREAM_CERT_PATH", ""), "path to SSL certificate")
+	confKeyPath := flag.String("key-path", getEnv("SUBSTREAM_KEY_PATH", ""), "path to SSL key")
 
 	flag.Parse()
 
