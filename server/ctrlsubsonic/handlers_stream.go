@@ -177,6 +177,16 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		return nil
 	}
 
+	// negative cache: avoid re-fetching covers we know are missing
+	negKey := fmt.Sprintf("neg-%s-%d", id.Type, id.Value)
+	if _, negHit := c.searchCache.Load(negKey); negHit {
+		// serve 1x1 transparent pixel so client stops retrying
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(transparentPixel)
+		return nil
+	}
+
 	// resolve cover UUID
 	var coverUUID string
 	switch id.Type {
@@ -195,13 +205,20 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	}
 
 	if coverUUID == "" {
-		return spec.NewError(70, "cover art not found")
+		c.searchCache.Store(negKey, true) // mark as missing
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(transparentPixel)
+		return nil
 	}
 
 	// build CDN URL and proxy
 	coverURL := c.proxy.GetCoverURL(coverUUID, size)
 	if coverURL == "" {
-		return spec.NewError(70, "cover art not found")
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(transparentPixel)
+		return nil
 	}
 
 	// proxy from CDN with short timeout — no disk cache to keep stateless
@@ -213,7 +230,9 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		if resp != nil {
 			resp.Body.Close()
 		}
-		w.WriteHeader(http.StatusNotFound)
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(transparentPixel)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -226,6 +245,15 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	io.Copy(w, resp.Body)
 	return nil
+}
+
+// 1x1 transparent GIF — returned when cover art is unavailable so clients stop retrying
+var transparentPixel = []byte{
+	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
+	0x80, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x21,
+	0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44,
+	0x01, 0x00, 0x3b,
 }
 
 

@@ -59,7 +59,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	albumOffset := p.GetOrInt("albumOffset", 0)
 	songOffset := p.GetOrInt("songOffset", 0)
 
-	results := &spec.SearchResultThree{}
+	results := &spec.SearchResultThree{
+		Artists: []*spec.Artist{},
+		Albums:  []*spec.Album{},
+		Tracks:  []*spec.TrackChild{},
+	}
 
 	type tracksResult struct {
 		tracks []spec.TrackChild
