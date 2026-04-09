@@ -142,6 +142,7 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 
 func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
+	user := r.Context().Value(CtxUser).(*db.User)
 	count := p.GetOrInt("count", 10)
 
 	artistName, err := p.Get("artist")
@@ -193,6 +194,8 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 	tracks := make([]*spec.TrackChild, len(topTracks))
 	for i := range topTracks {
 		tracks[i] = spec.NewTrackFromTidal(&topTracks[i])
+		c.applyTrackStar(user.ID, tracks[i])
+		c.applyTrackPlayCount(user.ID, tracks[i])
 	}
 
 	sub := spec.NewResponse()

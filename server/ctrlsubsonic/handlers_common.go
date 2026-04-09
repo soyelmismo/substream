@@ -1,6 +1,7 @@
 package ctrlsubsonic
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -84,20 +85,29 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 		isSubmission = false
 	}
 
+	log.Printf("[SCROBBLE] track=%d user=%s submission=%s isSubmission=%v", id.Value, user.Name, submissionStr, isSubmission)
+
 	if isSubmission {
 		// record play in local DB
 		var play db.Play
 		c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).First(&play)
+		oldCount := play.Count
 		if play.ID == 0 {
 			play.UserID = user.ID
 			play.TidalID = id.Value
 			play.PlayedAt = time.Now()
 			play.Count = 1
+			log.Printf("[SCROBBLE] NEW play record for track=%d user=%s count=1", id.Value, user.Name)
 		} else {
 			play.Count++
 			play.PlayedAt = time.Now()
+			log.Printf("[SCROBBLE] UPDATED play record for track=%d user=%s count=%d (was %d)", id.Value, user.Name, play.Count, oldCount)
 		}
-		c.dbc.Save(&play)
+		if err := c.dbc.Save(&play).Error; err != nil {
+			log.Printf("[SCROBBLE] ERROR saving play record: %v", err)
+		} else {
+			log.Printf("[SCROBBLE] SAVED play record for track=%d count=%d", id.Value, play.Count)
+		}
 	}
 
 	// fetch track info for scrobbling (fire and forget if fails)

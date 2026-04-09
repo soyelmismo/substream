@@ -636,6 +636,16 @@ func (p *Pool) GetArtistTopTracks(ctx context.Context, artistID int, limit int) 
 	return result.Items, nil
 }
 
+// GetArtistAlbumCount returns the number of albums for an artist
+// This is used by CachedProxy to cache the count
+func (p *Pool) GetArtistAlbumCount(ctx context.Context, artistID int) int {
+	page, err := p.GetArtistAlbums(ctx, artistID, true)
+	if err != nil || page == nil {
+		return 0
+	}
+	return len(page.Albums.Items)
+}
+
 func (p *Pool) GetSimilarArtists(ctx context.Context, artistID int) ([]TidalArtist, error) {
 	var result struct {
 		Artists []TidalArtist `json:"artists"`

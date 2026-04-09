@@ -14,11 +14,12 @@ type cacheItem struct {
 // CachedProxy wraps TidalProxy with an in-memory TTL cache
 type CachedProxy struct {
 	TidalProxy
-	tracks   sync.Map
-	albums   sync.Map
-	artists  sync.Map
-	albumArt sync.Map // int -> string UUID
-	ttl      time.Duration
+	tracks     sync.Map
+	albums     sync.Map
+	artists    sync.Map
+	albumArt   sync.Map // int -> string UUID
+	albumCount sync.Map // artistID -> int (album count)
+	ttl        time.Duration
 }
 
 func NewCachedProxy(base TidalProxy, ttl time.Duration) *CachedProxy {
@@ -164,4 +165,26 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 		}
 	}
 	return tracks, err
+}
+
+// GetArtistAlbumCount returns cached album count for an artist, fetching if needed
+func (c *CachedProxy) GetArtistAlbumCount(ctx context.Context, artistID int) int {
+	// Check cache first
+	if v, ok := c.albumCount.Load(artistID); ok {
+		item := v.(cacheItem)
+		if time.Now().Before(item.exp) {
+			return item.data.(int)
+		}
+	}
+
+	// Fetch from API
+	page, err := c.GetArtistAlbums(ctx, artistID, true)
+	count := 0
+	if err == nil && page != nil {
+		count = len(page.Albums.Items)
+	}
+
+	// Store in cache
+	c.albumCount.Store(artistID, cacheItem{data: count, exp: time.Now().Add(c.ttl)})
+	return count
 }

@@ -368,6 +368,17 @@ func (c *Controller) applyTrackStar(userID int, tc *spec.TrackChild) {
 	}
 }
 
+// applyTrackPlayCount applies the local play count from DB to track
+func (c *Controller) applyTrackPlayCount(userID int, tc *spec.TrackChild) {
+	if tc.ID == nil {
+		return
+	}
+	var play db.Play
+	if c.dbc.Where("user_id=? AND tidal_id=?", userID, tc.ID.Value).First(&play).Error == nil {
+		tc.PlayCount = play.Count
+	}
+}
+
 // applyAlbumStar checks if user has starred this album and decorates it
 func (c *Controller) applyAlbumStar(userID int, a *spec.Album) {
 	if a.ID == nil {

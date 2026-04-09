@@ -224,10 +224,11 @@ type TrackChild struct {
 
 	MusicBrainzID string `xml:"musicBrainzId,attr"        json:"musicBrainzId"`
 
-	// star / rating
+	// star / rating / stats
 	Starred       *time.Time `xml:"starred,attr,omitempty"         json:"starred,omitempty"`
 	UserRating    int        `xml:"userRating,attr,omitempty"      json:"userRating,omitempty"`
 	AverageRating float64    `xml:"averageRating,attr,omitempty"   json:"averageRating,omitempty"`
+	PlayCount     int        `xml:"playCount,attr,omitempty"       json:"playCount,omitempty"`
 
 	ReplayGain *ReplayGain `xml:"replayGain" json:"replayGain"`
 

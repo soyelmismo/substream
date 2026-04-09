@@ -61,6 +61,7 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 		if t != nil {
 			tid := tidalIDs[i]
 			c.applyTrackStar(user.ID, t)
+			c.applyTrackPlayCount(user.ID, t)
 			t.UserRating = c.getTrackRating(user.ID, tid)
 			tracks = append(tracks, t)
 		}
@@ -121,7 +122,17 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 	return albums
 }
 
+// getTrackPlayCount returns the play count for a track from local DB
+func (c *Controller) getTrackPlayCount(userID, tidalID int) int {
+	var play db.Play
+	if c.dbc.Where("user_id=? AND tidal_id=?", userID, tidalID).First(&play).Error == nil {
+		return play.Count
+	}
+	return 0
+}
+
 // batchFetchArtists fetches metadata for multiple tidal artist IDs concurrently
+// includes album count for each artist
 func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.Artist {
 	user := r.Context().Value(CtxUser).(*db.User)
 	if len(tidalIDs) == 0 {
@@ -143,11 +154,16 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 			c.proxySem <- struct{}{}
 			defer func() { <-c.proxySem }()
 
+			// Get artist info
 			info, err := c.proxy.GetArtistInfo(r.Context(), tid)
 			if err != nil {
 				return
 			}
 			a := spec.NewArtistFromTidal(&info.Artist)
+
+			// Get album count from cache (avoids extra API call)
+			a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
+
 			results <- result{idx: idx, artist: a}
 		}(i, id)
 	}

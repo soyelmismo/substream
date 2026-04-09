@@ -9,6 +9,7 @@ type TidalProxy interface {
 	GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error)
 	GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error)
 	GetArtistAlbums(ctx context.Context, artistID int, skipTracks bool) (*TidalArtistPage, error)
+	GetArtistAlbumCount(ctx context.Context, artistID int) int
 
 	// Search
 	SearchTracks(ctx context.Context, query string, limit, offset int) ([]TidalTrack, error)

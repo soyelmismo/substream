@@ -77,6 +77,7 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 
 func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
+	user := r.Context().Value(CtxUser).(*db.User)
 
 	id, err := p.GetID("id")
 	if err != nil || id.Type != specid.Artist {
@@ -108,12 +109,14 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 	}
 
 	artist := spec.NewArtistFromTidal(&info.Artist)
-	
+	c.applyArtistStar(user.ID, artist)
+
 	items := artistPage.Albums.Items
 	artist.AlbumCount = len(items)
 	artist.Albums = make([]*spec.Album, len(items))
 	for i := range items {
 		artist.Albums[i] = spec.NewAlbumFromTidal(&items[i])
+		c.applyAlbumStar(user.ID, artist.Albums[i])
 	}
 
 	sub := spec.NewResponse()
@@ -151,6 +154,7 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 		}
 		c.applyTrackStar(user.ID, tc)
 		tc.UserRating = c.getTrackRating(user.ID, album.Items[i].ID)
+		c.applyTrackPlayCount(user.ID, tc)
 		a.Tracks[i] = tc
 		totalDuration += tc.Duration
 	}
