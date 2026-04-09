@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/scrobble"
@@ -41,7 +40,6 @@ type Controller struct {
 	searchCache sync.Map
 	proxySem    chan struct{}
 }
-
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
 	c := &Controller{
@@ -134,8 +132,6 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	c.Handle("/getLyricsBySongId", chain(resp(c.ServeGetLyricsBySongID)))
 
 	c.Handle("/", chain(resp(c.ServeNotFound)))
-
-
 
 	return c
 }
@@ -261,18 +257,6 @@ func checkCredsBasic(password, given string) bool {
 		given = string(b)
 	}
 	return password == given
-}
-
-type errWriter struct {
-	w   io.Writer
-	err error
-}
-
-func (ew *errWriter) write(buf []byte) {
-	if ew.err != nil {
-		return
-	}
-	_, ew.err = ew.w.Write(buf)
 }
 
 func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) error {

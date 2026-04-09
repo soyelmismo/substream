@@ -16,16 +16,28 @@ func (c *Controller) ServeGetRandomSongs(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	size := p.GetOrInt("size", 10)
 
-	// random tracks from user's starred tracks
+	// 1. Get some from starred (50%)
+	favSize := size / 2
+	if favSize < 1 { favSize = 1 }
+	
 	var stars []db.TrackStar
-	c.dbc.Where("user_id=?", user.ID).
-		Order("RANDOM()").
-		Limit(size).
-		Find(&stars)
+	c.dbc.Where("user_id=?", user.ID).Order("RANDOM()").Limit(favSize).Find(&stars)
 
-	tidalIDs := make([]int, len(stars))
-	for i, s := range stars {
-		tidalIDs[i] = s.TidalID
+	var tidalIDs []int
+	for _, s := range stars {
+		tidalIDs = appendUnique(tidalIDs, s.TidalID)
+	}
+
+	// 2. Get some from Discovery (Tidal Top Tracks)
+	discoverySize := size - len(tidalIDs)
+	if discoverySize > 0 {
+		top, err := c.proxy.GetTopTracks(r.Context(), discoverySize+10) // fetch extra to shuffle
+		if err == nil {
+			for _, t := range top {
+				if len(tidalIDs) >= size { break }
+				tidalIDs = appendUnique(tidalIDs, t.ID)
+			}
+		}
 	}
 
 	tracks := c.batchFetchTracks(r, tidalIDs)

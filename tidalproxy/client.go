@@ -418,10 +418,26 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 
 			// 1. Try V2 OpenAPI Manifests first (HLS)
 			v2Ctx, v2Cancel := context.WithTimeout(ctx, 3*time.Second)
+			var formats []string
+			switch qStr {
+			case "HI_RES_LOSSLESS":
+				formats = []string{"FLAC_HIRES", "MQA"}
+			case "LOSSLESS":
+				formats = []string{"FLAC"}
+			case "HIGH":
+				formats = []string{"AACLC"}
+			case "LOW":
+				formats = []string{"HEAACV1"}
+			default:
+				formats = []string{"FLAC_HIRES", "FLAC", "AACLC"}
+			}
+
 			qV2 := url.Values{
 				"id":           {fmt.Sprint(trackID)},
 				"manifestType": {"HLS"},
-				"formats":      {"FLAC_HIRES", "FLAC", "HEAACV1", "AACLC"},
+			}
+			for _, f := range formats {
+				qV2.Add("formats", f)
 			}
 			var v2Response struct {
 				Data struct {
@@ -513,11 +529,76 @@ func (p *Pool) GetCoverByTrackID(ctx context.Context, trackID int) (*TidalCover,
 }
 
 func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error) {
+	// 1. Obtener información del track para saber su artista
+	track, err := p.GetTrackInfo(ctx, trackID)
+	if err != nil {
+		return nil, err
+	}
+
+	artistID := track.Artist.ID
+	if artistID == 0 && len(track.Artists) > 0 {
+		artistID = track.Artists[0].ID
+	}
+	if artistID == 0 {
+		return nil, fmt.Errorf("no artist found for track %d", trackID)
+	}
+
+	// 2. Obtener artistas similares
+	similarArtists, err := p.GetSimilarArtists(ctx, artistID)
+	if err != nil || len(similarArtists) == 0 {
+		// Fallback: usar el mismo artista
+		similarArtists = []TidalArtist{{ID: artistID}}
+	}
+
+	// 3. Recopilar top tracks de los artistas similares
+	var allTracks []TidalTrack
+	limitPerArtist := 5 // Obtener 5 tracks de unos 5 artistas = 25 tracks
+	
+	maxArtists := 6
+	if len(similarArtists) > maxArtists {
+		similarArtists = similarArtists[:maxArtists]
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Fetch concurrentemente
+	for _, a := range similarArtists {
+		wg.Add(1)
+		go func(aID int) {
+			defer wg.Done()
+			page, err := p.GetArtistAlbums(ctx, aID, false)
+			if err == nil && len(page.Tracks) > 0 {
+				mu.Lock()
+				count := limitPerArtist
+				if len(page.Tracks) < count {
+					count = len(page.Tracks)
+				}
+				allTracks = append(allTracks, page.Tracks[:count]...)
+				mu.Unlock()
+			}
+		}(a.ID)
+	}
+	wg.Wait()
+
+	if len(allTracks) == 0 {
+		return nil, fmt.Errorf("no similar tracks found")
+	}
+
+	return allTracks, nil
+}
+
+func (p *Pool) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) {
+	// Use a popular artist or a generic search if no direct top-tracks endpoint
+	// Most proxies support /search/ with query if they don't have /top/
 	var result struct {
 		Items []TidalTrack `json:"items"`
 	}
-	q := url.Values{"id": {fmt.Sprint(trackID)}}
-	if err := p.apiGet(ctx, "/recommendations/", q, &result, ""); err != nil {
+	q := url.Values{
+		"query": {"top"},
+		"limit": {fmt.Sprint(limit)},
+	}
+	if err := p.apiGet(ctx, "/search/tracks/", q, &result, ""); err != nil {
 		return nil, err
 	}
 	return result.Items, nil

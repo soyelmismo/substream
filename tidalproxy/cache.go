@@ -86,3 +86,70 @@ func (c *CachedProxy) GetCoverUUIDForAlbum(ctx context.Context, albumID int) str
 	}
 	return ""
 }
+
+func (c *CachedProxy) SearchAlbums(ctx context.Context, query string, limit, offset int) ([]TidalAlbum, error) {
+	albums, err := c.TidalProxy.SearchAlbums(ctx, query, limit, offset)
+	if err == nil {
+		for _, a := range albums {
+			if a.Cover != "" {
+				c.albumArt.Store(a.ID, a.Cover)
+			}
+		}
+	}
+	return albums, err
+}
+
+func (c *CachedProxy) SearchTracks(ctx context.Context, query string, limit, offset int) ([]TidalTrack, error) {
+	tracks, err := c.TidalProxy.SearchTracks(ctx, query, limit, offset)
+	if err == nil {
+		for _, t := range tracks {
+			if t.Album.Cover != "" {
+				c.albumArt.Store(t.Album.ID, t.Album.Cover)
+			}
+		}
+	}
+	return tracks, err
+}
+
+func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTracks bool) (*TidalArtistPage, error) {
+	page, err := c.TidalProxy.GetArtistAlbums(ctx, artistID, skipTracks)
+	if err == nil {
+		if len(page.Albums.Items) > 0 {
+			for _, a := range page.Albums.Items {
+				if a.Cover != "" {
+					c.albumArt.Store(a.ID, a.Cover)
+				}
+			}
+		}
+		for _, t := range page.Tracks {
+			if t.Album.Cover != "" {
+				c.albumArt.Store(t.Album.ID, t.Album.Cover)
+			}
+		}
+	}
+	return page, err
+}
+
+func (c *CachedProxy) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) {
+	tracks, err := c.TidalProxy.GetTopTracks(ctx, limit)
+	if err == nil {
+		for _, t := range tracks {
+			if t.Album.Cover != "" {
+				c.albumArt.Store(t.Album.ID, t.Album.Cover)
+			}
+		}
+	}
+	return tracks, err
+}
+
+func (c *CachedProxy) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error) {
+	tracks, err := c.TidalProxy.GetRecommendations(ctx, trackID)
+	if err == nil {
+		for _, t := range tracks {
+			if t.Album.Cover != "" {
+				c.albumArt.Store(t.Album.ID, t.Album.Cover)
+			}
+		}
+	}
+	return tracks, err
+}
