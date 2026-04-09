@@ -53,6 +53,9 @@ func (c *Controller) ServeGetRandomSongs(r *http.Request) *spec.Response {
 func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	count := p.GetOrInt("count", 10)
+	if count > 10 {
+		count = 10 // limit to reduce cover loading time
+	}
 
 	id, err := p.GetID("id")
 	if err != nil {
@@ -64,19 +67,26 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 	case specid.Track:
 		trackID = id.Value
 	case specid.Artist:
-		// get first track from artist
-		page, err := c.proxy.GetArtistAlbums(r.Context(), id.Value, false)
-		if err != nil || len(page.Tracks) == 0 {
-			return spec.NewResponse()
+		// fast timeout for artist
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		page, err := c.proxy.GetArtistAlbums(ctx, id.Value, false)
+		cancel()
+		if err != nil || page == nil || len(page.Tracks) == 0 {
+			return c.ServeGetRandomSongs(r)
 		}
 		trackID = page.Tracks[0].ID
 	default:
-		return spec.NewError(10, "provide a track or artist `id`")
+		return c.ServeGetRandomSongs(r)
 	}
 
-	recs, err := c.proxy.GetRecommendations(r.Context(), trackID)
-	if err != nil {
-		return spec.NewResponse()
+	// fast timeout for recommendations
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	recs, err := c.proxy.GetRecommendations(ctx, trackID)
+	cancel()
+
+	if err != nil || len(recs) == 0 {
+		log.Printf("[DISC] GetSimilarSongs2 fallback to random (track %d)", trackID)
+		return c.ServeGetRandomSongs(r)
 	}
 
 	if len(recs) > count {
@@ -97,50 +107,34 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 
 func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
-	count := p.GetOrInt("count", 20)
-	if count > 20 {
-		count = 20 // limit for speed
+	count := p.GetOrInt("count", 10)
+	if count > 10 {
+		count = 10 // limit to reduce cover loading time
 	}
 
 	id, err := p.GetID("id")
-	if err != nil {
-		return spec.NewError(10, "provide an `id` parameter")
+	if err != nil || id.Type != specid.Track {
+		// Only works with tracks - fallback to random songs
+		return c.ServeGetRandomSongs(r)
 	}
 
-	var trackID int
-	switch id.Type {
-	case specid.Track:
-		trackID = id.Value
-	case specid.Artist:
-		// get a representative track for the artist to get recommendations
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		page, err := c.proxy.GetArtistAlbums(ctx, id.Value, true) // skip tracks for speed
-		cancel()
-		if err != nil || page == nil || len(page.Tracks) == 0 {
-			return spec.NewResponse()
-		}
-		trackID = page.Tracks[0].ID
-	default:
-		return spec.NewResponse()
-	}
-
-	// fast timeout for recommendations
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	recs, err := c.proxy.GetRecommendations(ctx, trackID)
+	// Try recommendations with short timeout
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	recs, err := c.proxy.GetRecommendations(ctx, id.Value)
 	cancel()
 
+	// If failed or empty, fallback to random songs quickly
 	if err != nil {
-		log.Printf("[DISC] GetRecommendations error: %v", err)
-		return spec.NewResponse()
+		log.Printf("[DISC] GetRecommendations ERROR for track %d: %v", id.Value, err)
+		return c.ServeGetRandomSongs(r)
+	}
+	if len(recs) == 0 {
+		log.Printf("[DISC] GetRecommendations EMPTY for track %d", id.Value)
+		return c.ServeGetRandomSongs(r)
 	}
 
 	if len(recs) > count {
 		recs = recs[:count]
-	}
-
-	// quick return if no recs
-	if len(recs) == 0 {
-		return spec.NewResponse()
 	}
 
 	ids := make([]int, len(recs))

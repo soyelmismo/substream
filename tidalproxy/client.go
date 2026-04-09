@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -546,63 +547,39 @@ func (p *Pool) GetCoverByTrackID(ctx context.Context, trackID int) (*TidalCover,
 }
 
 func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error) {
-	// 1. Obtener información del track para saber su artista
-	track, err := p.GetTrackInfo(ctx, trackID)
+	// Usar endpoint directo /recommendations/ de hifi-api (usa API nativa de Tidal)
+	q := url.Values{
+		"id": {fmt.Sprint(trackID)},
+	}
+	body, err := p.apiGetRaw(ctx, "/recommendations/", q, "")
 	if err != nil {
+		log.Printf("[TIDAL] GetRecommendations ERROR for track %d: %v", trackID, err)
 		return nil, err
 	}
-
-	artistID := track.Artist.ID
-	if artistID == 0 && len(track.Artists) > 0 {
-		artistID = track.Artists[0].ID
-	}
-	if artistID == 0 {
-		return nil, fmt.Errorf("no artist found for track %d", trackID)
-	}
-
-	// 2. Obtener artistas similares
-	similarArtists, err := p.GetSimilarArtists(ctx, artistID)
-	if err != nil || len(similarArtists) == 0 {
-		// Fallback: usar el mismo artista
-		similarArtists = []TidalArtist{{ID: artistID}}
-	}
-
-	// 3. Recopilar top tracks de los artistas similares
-	var allTracks []TidalTrack
-	limitPerArtist := 5 // Obtener 5 tracks de unos 5 artistas = 25 tracks
 	
-	maxArtists := 6
-	if len(similarArtists) > maxArtists {
-		similarArtists = similarArtists[:maxArtists]
+	// Estructura real de Tidal: data.items[].track
+	var result struct {
+		Data struct {
+			Items []struct {
+				Track TidalTrack `json:"track"`
+			} `json:"items"`
+		} `json:"data"`
 	}
-
-	var mu sync.Mutex
-	var wg sync.WaitGroup
+	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("[TIDAL] GetRecommendations PARSE ERROR for track %d: %v", trackID, err)
+		return nil, err
+	}
 	
-	// Fetch concurrentemente
-	for _, a := range similarArtists {
-		wg.Add(1)
-		go func(aID int) {
-			defer wg.Done()
-			page, err := p.GetArtistAlbums(ctx, aID, false)
-			if err == nil && len(page.Tracks) > 0 {
-				mu.Lock()
-				count := limitPerArtist
-				if len(page.Tracks) < count {
-					count = len(page.Tracks)
-				}
-				allTracks = append(allTracks, page.Tracks[:count]...)
-				mu.Unlock()
-			}
-		}(a.ID)
+	// Extraer tracks del wrapper
+	tracks := make([]TidalTrack, 0, len(result.Data.Items))
+	for _, item := range result.Data.Items {
+		if item.Track.ID != 0 {
+			tracks = append(tracks, item.Track)
+		}
 	}
-	wg.Wait()
-
-	if len(allTracks) == 0 {
-		return nil, fmt.Errorf("no similar tracks found")
-	}
-
-	return allTracks, nil
+	
+	log.Printf("[TIDAL] GetRecommendations track %d: got %d recommendations", trackID, len(tracks))
+	return tracks, nil
 }
 
 func (p *Pool) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) {
