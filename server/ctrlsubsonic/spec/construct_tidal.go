@@ -40,6 +40,7 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 		IsDir:       false,
 		Type:        "music",
 		Path:        fmt.Sprintf("tidal/%d/%s.flac", t.Album.ID, t.Title),
+		Year:        parseYear(t.Album.ReleaseDate),
 	}
 
 	// multi-artist

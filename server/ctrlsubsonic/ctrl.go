@@ -68,17 +68,27 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	c.Handle("/getLicense", chain(resp(c.ServeGetLicence)))
 	c.Handle("/getMusicFolders", chain(resp(c.ServeGetMusicFolders)))
 	c.Handle("/getUser", chain(resp(c.ServeGetUser)))
+	c.Handle("/getUsers", chain(resp(c.ServeGetUsers)))
+	c.Handle("/createUser", chain(resp(c.ServeCreateUser)))
+	c.Handle("/deleteUser", chain(resp(c.ServeDeleteUser)))
+	c.Handle("/changePassword", chain(resp(c.ServeChangePassword)))
 	c.Handle("/getScanStatus", chain(resp(c.ServeGetScanStatus)))
 	c.Handle("/startScan", chain(resp(c.ServeGetScanStatus)))
 	c.Handle("/getOpenSubsonicExtensions", chain(resp(c.ServeGetOpenSubsonicExtensions)))
 
 	// Search
 	c.Handle("/search3", chain(resp(c.ServeSearchThree)))
+	c.Handle("/search2", chain(resp(c.ServeSearchThree)))
 
 	// Browse (proxy Tidal)
 	c.Handle("/getArtists", chain(resp(c.ServeGetArtists)))
 	c.Handle("/getArtist", chain(resp(c.ServeGetArtist)))
+	c.Handle("/getArtistInfo", chain(resp(c.ServeGetArtistInfoTwo)))
+	c.Handle("/getArtistInfo2", chain(resp(c.ServeGetArtistInfoTwo)))
 	c.Handle("/getAlbum", chain(resp(c.ServeGetAlbum)))
+	c.Handle("/getAlbumInfo", chain(resp(c.ServeGetAlbumInfoTwo)))
+	c.Handle("/getAlbumInfo2", chain(resp(c.ServeGetAlbumInfoTwo)))
+	c.Handle("/getAlbumList", chain(resp(c.ServeGetAlbumListTwo)))
 	c.Handle("/getAlbumList2", chain(resp(c.ServeGetAlbumListTwo)))
 	c.Handle("/getSong", chain(resp(c.ServeGetSong)))
 
@@ -115,6 +125,11 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	// Browsing / Empty placeholders for mobile compatibility
 	c.Handle("/getGenres", chain(resp(c.ServeGetGenres)))
 	c.Handle("/getInternetRadioStations", chain(resp(c.ServeGetInternetRadioStations)))
+	c.Handle("/getNewestPodcasts", chain(resp(c.ServeGetNewestPodcasts)))
+	c.Handle("/getPodcasts", chain(resp(c.ServeGetPodcasts)))
+
+	// Lyrics
+	c.Handle("/getLyricsBySongId", chain(resp(c.ServeGetLyricsBySongID)))
 
 	c.Handle("/", chain(resp(c.ServeNotFound)))
 

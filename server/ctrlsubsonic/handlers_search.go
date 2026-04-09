@@ -347,11 +347,13 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	// starred tracks
 	var trackStars []db.TrackStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&trackStars)
+	
 	trackIDs := make([]int, len(trackStars))
 	for i, s := range trackStars {
 		trackIDs[i] = s.TidalID
 	}
 	tracks := c.batchFetchTracks(r, trackIDs)
+
 	for _, tc := range tracks {
 		results.Tracks = append(results.Tracks, tc)
 	}
@@ -359,28 +361,20 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	// starred albums
 	var albumStars []db.AlbumStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&albumStars)
-	for _, s := range albumStars {
-		album, err := c.proxy.GetAlbumInfo(r.Context(), s.TidalID)
-		if err != nil {
-			continue
-		}
-		a := spec.NewAlbumFromTidal(album)
-		a.Starred = &s.StarDate
-		results.Albums = append(results.Albums, a)
+	albumIDs := make([]int, len(albumStars))
+	for i, s := range albumStars {
+		albumIDs[i] = s.TidalID
 	}
+	results.Albums = c.batchFetchAlbums(r, albumIDs)
 
 	// starred artists
 	var artistStars []db.ArtistStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&artistStars)
-	for _, s := range artistStars {
-		info, err := c.proxy.GetArtistInfo(r.Context(), s.TidalID)
-		if err != nil {
-			continue
-		}
-		a := spec.NewArtistFromTidal(&info.Artist)
-		a.Starred = &s.StarDate
-		results.Artists = append(results.Artists, a)
+	artistIDs := make([]int, len(artistStars))
+	for i, s := range artistStars {
+		artistIDs[i] = s.TidalID
 	}
+	results.Artists = c.batchFetchArtists(r, artistIDs)
 
 	sub := spec.NewResponse()
 	sub.StarredTwo = results

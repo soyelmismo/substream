@@ -2,6 +2,7 @@ package ctrlsubsonic
 
 import (
 	"net/http"
+	"strings"
 
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -24,15 +25,19 @@ func (c *Controller) ServeGetLyricsBySongID(r *http.Request) *spec.Response {
 		return sub
 	}
 
+	lines := strings.Split(lyrics.Lyrics, "\n")
+	var specLines []spec.Lyric
+	for _, l := range lines {
+		specLines = append(specLines, spec.Lyric{Value: l})
+	}
+
 	sub := spec.NewResponse()
 	sub.LyricsList = &spec.LyricsList{
 		StructuredLyrics: []*spec.StructuredLyrics{
 			{
 				Lang:   "und",
 				Synced: lyrics.Subtitles != "",
-				Lines: []spec.Lyric{
-					{Value: lyrics.Lyrics},
-				},
+				Lines:  specLines,
 			},
 		},
 	}

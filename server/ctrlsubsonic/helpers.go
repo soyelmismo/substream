@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/tidalproxy"
@@ -14,6 +15,8 @@ import (
 // batchFetchTracks fetches metadata for multiple tidal track IDs concurrently
 // with a semaphore to limit parallelism. Failed fetches are silently skipped.
 func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.TrackChild {
+	user := r.Context().Value(CtxUser).(*db.User)
+
 	if len(tidalIDs) == 0 {
 		return nil
 	}
@@ -55,12 +58,121 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 
 	// filter out nils (failed fetches)
 	var tracks []*spec.TrackChild
-	for _, t := range ordered {
+	for i, t := range ordered {
 		if t != nil {
+			tid := tidalIDs[i]
+			c.applyTrackStar(user.ID, t)
+			t.UserRating = c.getTrackRating(user.ID, tid)
 			tracks = append(tracks, t)
 		}
 	}
 	return tracks
+}
+
+// batchFetchAlbums fetches metadata for multiple tidal album IDs concurrently
+func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.Album {
+	user := r.Context().Value(CtxUser).(*db.User)
+	if len(tidalIDs) == 0 {
+		return nil
+	}
+
+	type result struct {
+		idx   int
+		album *spec.Album
+	}
+
+	results := make(chan result, len(tidalIDs))
+	semaphore := make(chan struct{}, 20)
+	var wg sync.WaitGroup
+
+	for i, id := range tidalIDs {
+		wg.Add(1)
+		go func(idx, tid int) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			info, err := c.proxy.GetAlbumInfo(r.Context(), tid)
+			if err != nil {
+				return
+			}
+			a := spec.NewAlbumFromTidal(info)
+			results <- result{idx: idx, album: a}
+		}(i, id)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	ordered := make([]*spec.Album, len(tidalIDs))
+	for r := range results {
+		ordered[r.idx] = r.album
+	}
+
+	var albums []*spec.Album
+	for i, a := range ordered {
+		if a != nil {
+			tid := tidalIDs[i]
+			c.applyAlbumStar(user.ID, a)
+			a.UserRating = c.getAlbumRating(user.ID, tid)
+			albums = append(albums, a)
+		}
+	}
+	return albums
+}
+
+// batchFetchArtists fetches metadata for multiple tidal artist IDs concurrently
+func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.Artist {
+	user := r.Context().Value(CtxUser).(*db.User)
+	if len(tidalIDs) == 0 {
+		return nil
+	}
+
+	type result struct {
+		idx    int
+		artist *spec.Artist
+	}
+
+	results := make(chan result, len(tidalIDs))
+	semaphore := make(chan struct{}, 20)
+	var wg sync.WaitGroup
+
+	for i, id := range tidalIDs {
+		wg.Add(1)
+		go func(idx, tid int) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			info, err := c.proxy.GetArtistInfo(r.Context(), tid)
+			if err != nil {
+				return
+			}
+			a := spec.NewArtistFromTidal(&info.Artist)
+			results <- result{idx: idx, artist: a}
+		}(i, id)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	ordered := make([]*spec.Artist, len(tidalIDs))
+	for r := range results {
+		ordered[r.idx] = r.artist
+	}
+
+	var artists []*spec.Artist
+	for _, a := range ordered {
+		if a != nil {
+			c.applyArtistStar(user.ID, a)
+			artists = append(artists, a)
+		}
+	}
+	return artists
 }
 
 // parseTidalIDs parses a JSON array string of tidal IDs

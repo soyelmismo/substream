@@ -68,10 +68,12 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 		recs = recs[:count]
 	}
 
-	tracks := make([]*spec.TrackChild, len(recs))
+	ids := make([]int, len(recs))
 	for i := range recs {
-		tracks[i] = spec.NewTrackFromTidal(&recs[i])
+		ids[i] = recs[i].ID
 	}
+
+	tracks := c.batchFetchTracks(r, ids)
 
 	sub := spec.NewResponse()
 	sub.SimilarSongsTwo = &spec.SimilarSongsTwo{Tracks: tracks}
@@ -112,10 +114,12 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 		recs = recs[:count]
 	}
 
-	tracks := make([]*spec.TrackChild, len(recs))
+	ids := make([]int, len(recs))
 	for i := range recs {
-		tracks[i] = spec.NewTrackFromTidal(&recs[i])
+		ids[i] = recs[i].ID
 	}
+
+	tracks := c.batchFetchTracks(r, ids)
 
 	sub := spec.NewResponse()
 	sub.SimilarSongs = &spec.SimilarSongs{Tracks: tracks}

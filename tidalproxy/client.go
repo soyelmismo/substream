@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -59,94 +58,68 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 	}
 
 	for _, u := range urls {
-		u = strings.TrimRight(u, "/")
-		inst := &instance{url: u}
-		inst.healthy.Store(true)
-		p.instances = append(p.instances, inst)
+		p.instances = append(p.instances, &instance{url: strings.TrimSuffix(u, "/")})
 	}
 
-	// background health checker
-	if len(p.instances) > 0 {
-		go p.healthLoop(cfg.HealthInterval)
-	}
-
+	go p.healthCheck(cfg.HealthInterval)
 	return p
-}
-
-// pick returns the URL of a healthy instance
-func (p *Pool) pick() (string, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	n := len(p.instances)
-	if n == 0 {
-		return "", fmt.Errorf("no proxy instances configured")
-	}
-	start := int(p.current.Add(1)) % n
-	for i := 0; i < n; i++ {
-		inst := p.instances[(start+i)%n]
-		if inst.healthy.Load() {
-			return inst.url, nil
-		}
-	}
-	// all unhealthy, try first anyway
-	return p.instances[0].url, nil
 }
 
 func (p *Pool) SetInstances(urls []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	var newInstances []*instance
+	p.instances = nil
 	for _, u := range urls {
-		u = strings.TrimRight(u, "/")
-		// keep existing structure if URL matches to preserve health status?
-		// for simplicity, just rebuild
-		inst := &instance{url: u}
-		inst.healthy.Store(true)
-		newInstances = append(newInstances, inst)
+		p.instances = append(p.instances, &instance{url: strings.TrimSuffix(u, "/")})
 	}
-	p.instances = newInstances
-	log.Printf("tidalproxy: updated pool with %d instances", len(p.instances))
 }
 
-func (p *Pool) healthLoop(interval time.Duration) {
+func (p *Pool) healthCheck(interval time.Duration) {
 	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for range ticker.C {
 		p.mu.RLock()
-		instances := make([]*instance, len(p.instances))
-		copy(instances, p.instances)
+		instances := p.instances
 		p.mu.RUnlock()
 
 		for _, inst := range instances {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			req, _ := http.NewRequestWithContext(ctx, "GET", inst.url+"/", nil)
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-			resp, err := p.client.Do(req)
-			cancel()
-			wasHealthy := inst.healthy.Load()
-			if err != nil || resp.StatusCode >= 400 { // 4xx could also mean Cloudflare block
-				inst.healthy.Store(false)
-				if wasHealthy {
-					log.Printf("tidalproxy: instance %s marked unhealthy", inst.url)
+			go func(i *instance) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				req, _ := http.NewRequestWithContext(ctx, "GET", i.url+"/info/?id=123", nil)
+				resp, err := p.client.Do(req)
+				healthy := err == nil && (resp.StatusCode == 200 || resp.StatusCode == 404)
+				if resp != nil {
+					resp.Body.Close()
 				}
-			} else {
-				inst.healthy.Store(true)
-				if !wasHealthy {
-					log.Printf("tidalproxy: instance %s recovered", inst.url)
-				}
-			}
-			if resp != nil {
-				resp.Body.Close()
-			}
+				i.healthy.Store(healthy)
+			}(inst)
 		}
 	}
 }
 
+func (p *Pool) pick() (string, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
-// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries
-func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result interface{}) error {
+	if len(p.instances) == 0 {
+		return "", fmt.Errorf("no proxy instances configured")
+	}
+
+	start := p.current.Add(1) % int32(len(p.instances))
+	for i := 0; i < len(p.instances); i++ {
+		idx := (int(start) + i) % len(p.instances)
+		if p.instances[idx].healthy.Load() || i == len(p.instances)-1 {
+			return p.instances[idx].url, nil
+		}
+	}
+	return p.instances[0].url, nil
+}
+
+// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries.
+// It now accepts an optional clientIP to set X-Forwarded-For for Tidal's IP-locked streaming.
+func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result interface{}, clientIP string) error {
 	var lastErr error
 	for i := 0; i < 3; i++ {
 		base, err := p.pick()
@@ -164,16 +137,20 @@ func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result
 			return fmt.Errorf("build request: %w", err)
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+		if clientIP != "" {
+			req.Header.Set("X-Forwarded-For", clientIP)
+			req.Header.Set("X-Real-IP", clientIP)
+		}
 
 		resp, err := p.client.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s (try %d) returned %d: %s", path, i+1, resp.StatusCode, string(body))
 			if resp.StatusCode == 404 { // don't retry on 404
 				return lastErr
@@ -181,31 +158,34 @@ func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result
 			continue
 		}
 
+		// Envelope handling: many hifi-api endpoints wrap data in a top-level JSON
+		var envelope struct {
+			Data json.RawMessage `json:"data"`
+		}
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			return fmt.Errorf("read body: %w", err)
 		}
 
-		var envelope struct {
-			Data json.RawMessage `json:"data"`
-		}
-		if json.Unmarshal(body, &envelope) == nil && len(envelope.Data) > 0 {
-			if err := json.Unmarshal(envelope.Data, result); err != nil {
-				return err
+		if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+			if err := json.Unmarshal(envelope.Data, result); err == nil {
+				return nil
 			}
-			return nil
 		}
 
+		// Fallback: try unmarshaling directly into result
 		if err := json.Unmarshal(body, result); err != nil {
-			return err
+			return fmt.Errorf("decode result: %w (body: %s)", err, string(body))
 		}
 		return nil
 	}
 	return lastErr
 }
 
-// apiGetRaw returns the raw body as bytes with retries
-func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values) ([]byte, error) {
+// apiGetRaw returns the raw body as bytes with retries.
+// It now accepts an optional clientIP to set X-Forwarded-For.
+func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
 	var lastErr error
 	for i := 0; i < 3; i++ {
 		base, err := p.pick()
@@ -223,16 +203,20 @@ func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values) ([]
 			return nil, fmt.Errorf("build request: %w", err)
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+		if clientIP != "" {
+			req.Header.Set("X-Forwarded-For", clientIP)
+			req.Header.Set("X-Real-IP", clientIP)
+		}
 
 		resp, err := p.client.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s (try %d) returned %d: %s", path, i+1, resp.StatusCode, string(body))
 			if resp.StatusCode == 404 {
 				return nil, lastErr
@@ -240,11 +224,12 @@ func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values) ([]
 			continue
 		}
 
-		return io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return body, err
 	}
 	return nil, lastErr
 }
-
 
 // =====================================================================
 // TidalProxy Interface Implementation
@@ -253,19 +238,25 @@ func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values) ([]
 func (p *Pool) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrack, error) {
 	var track TidalTrack
 	q := url.Values{"id": {fmt.Sprint(trackID)}}
-	if err := p.apiGet(ctx, "/info/", q, &track); err != nil {
+	if err := p.apiGet(ctx, "/info/", q, &track, ""); err != nil {
 		return nil, err
 	}
 	return &track, nil
 }
 
+func (p *Pool) GetCoverUUIDForAlbum(ctx context.Context, albumID int) string {
+	if a, err := p.GetAlbumInfo(ctx, albumID); err == nil && a.Cover != "" {
+		return a.Cover
+	}
+	return ""
+}
+
 func (p *Pool) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error) {
-	body, err := p.apiGetRaw(ctx, "/album/", url.Values{"id": {fmt.Sprint(albumID)}})
+	body, err := p.apiGetRaw(ctx, "/album/", url.Values{"id": {fmt.Sprint(albumID)}}, "")
 	if err != nil {
 		return nil, err
 	}
 
-	// /album/ response has a special structure: {version, data: {album_metadata + items: [...]}}
 	var envelope struct {
 		Data json.RawMessage `json:"data"`
 	}
@@ -275,10 +266,13 @@ func (p *Pool) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, erro
 
 	var album TidalAlbum
 	if err := json.Unmarshal(envelope.Data, &album); err != nil {
-		return nil, fmt.Errorf("decode album data: %w", err)
+		// fallback to direct decode
+		if err2 := json.Unmarshal(body, &album); err2 != nil {
+			return nil, fmt.Errorf("decode album data: %w", err)
+		}
 	}
 
-	// items from /album/ are wrapped: {item: {track data}}
+	// items wrapper
 	var raw struct {
 		Items []struct {
 			Item TidalTrack `json:"item"`
@@ -295,12 +289,11 @@ func (p *Pool) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, erro
 }
 
 func (p *Pool) GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error) {
-	body, err := p.apiGetRaw(ctx, "/artist/", url.Values{"id": {fmt.Sprint(artistID)}})
+	body, err := p.apiGetRaw(ctx, "/artist/", url.Values{"id": {fmt.Sprint(artistID)}}, "")
 	if err != nil {
 		return nil, err
 	}
 
-	// response: {version, artist: {...}, cover: {...}}
 	var resp struct {
 		Artist TidalArtist `json:"artist"`
 		Cover  *struct {
@@ -323,12 +316,11 @@ func (p *Pool) GetArtistAlbums(ctx context.Context, artistID int, skipTracks boo
 		q.Set("skip_tracks", "true")
 	}
 
-	body, err := p.apiGetRaw(ctx, "/artist/", q)
+	body, err := p.apiGetRaw(ctx, "/artist/", q, "")
 	if err != nil {
 		return nil, err
 	}
 
-	// response: {version, albums: {items: [...]}, tracks: [...]}
 	var resp struct {
 		Albums struct {
 			Items []TidalAlbum `json:"items"`
@@ -354,11 +346,9 @@ func (p *Pool) SearchTracks(ctx context.Context, query string, limit, offset int
 	var result struct {
 		Items []TidalTrack `json:"items"`
 	}
-	if err := p.apiGet(ctx, "/search/", q, &result); err != nil {
-		log.Printf("tidalproxy: SearchTracks error: %v", err)
+	if err := p.apiGet(ctx, "/search/tracks/", q, &result, ""); err != nil {
 		return nil, err
 	}
-	log.Printf("tidalproxy: SearchTracks query=%q found %d items", query, len(result.Items))
 	return result.Items, nil
 }
 
@@ -368,38 +358,20 @@ func (p *Pool) SearchArtists(ctx context.Context, query string, limit, offset in
 		"limit":  {fmt.Sprint(limit)},
 		"offset": {fmt.Sprint(offset)},
 	}
-
-	body, err := p.apiGetRaw(ctx, "/search/", q)
+	body, err := p.apiGetRaw(ctx, "/search/artists/", q, "")
 	if err != nil {
 		return nil, err
 	}
-
-	// top-hits response: {data: {tracks: [...], artists: [...]}}
-	var envelope struct {
-		Data json.RawMessage `json:"data"`
-	}
-	var raw json.RawMessage
-	if json.Unmarshal(body, &envelope) == nil && len(envelope.Data) > 0 {
-		raw = envelope.Data
-	} else {
-		raw = body
-	}
-
-	var topHits struct {
+	var resp struct {
 		Artists []TidalArtist `json:"artists"`
+		Items   []TidalArtist `json:"items"`
 	}
-	if json.Unmarshal(raw, &topHits) == nil && len(topHits.Artists) > 0 {
-		return topHits.Artists, nil
+	if err := json.Unmarshal(body, &resp); err == nil {
+		if len(resp.Artists) > 0 {
+			return resp.Artists, nil
+		}
+		return resp.Items, nil
 	}
-
-	// fallback: items array directly
-	var items struct {
-		Items []TidalArtist `json:"items"`
-	}
-	if json.Unmarshal(raw, &items) == nil {
-		return items.Items, nil
-	}
-
 	return nil, nil
 }
 
@@ -409,69 +381,28 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 		"limit":  {fmt.Sprint(limit)},
 		"offset": {fmt.Sprint(offset)},
 	}
-
-	body, err := p.apiGetRaw(ctx, "/search/", q)
+	body, err := p.apiGetRaw(ctx, "/search/albums/", q, "")
 	if err != nil {
 		return nil, err
 	}
-
-	var envelope struct {
-		Data json.RawMessage `json:"data"`
-	}
-	var raw json.RawMessage
-	if json.Unmarshal(body, &envelope) == nil && len(envelope.Data) > 0 {
-		raw = envelope.Data
-	} else {
-		raw = body
-	}
-
-	var topHits struct {
+	var resp struct {
 		Albums []TidalAlbum `json:"albums"`
+		Items  []TidalAlbum `json:"items"`
 	}
-	if json.Unmarshal(raw, &topHits) == nil && len(topHits.Albums) > 0 {
-		return topHits.Albums, nil
+	if err := json.Unmarshal(body, &resp); err == nil {
+		if len(resp.Albums) > 0 {
+			return resp.Albums, nil
+		}
+		return resp.Items, nil
 	}
-
-	var items struct {
-		Items []TidalAlbum `json:"items"`
-	}
-	if json.Unmarshal(raw, &items) == nil {
-		return items.Items, nil
-	}
-
 	return nil, nil
 }
 
-func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string) (string, error) {
+func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, clientIP string) (string, error) {
 	if quality == "" {
 		quality = p.quality
 	}
 
-	// 1. Try V2 OpenAPI Manifests first for Hi-Res (more reliable for some tracks)
-	if quality == "HI_RES_LOSSLESS" {
-		qV2 := url.Values{
-			"id":           {fmt.Sprint(trackID)},
-			"manifestType": {"MPEG_DASH"},
-			"formats":      {"FLAC_HIRES", "FLAC", "HEAACV1", "AACLC"},
-		}
-		var v2Response struct {
-			Data struct {
-				Attributes struct {
-					Manifest         string `json:"manifest"`
-					ManifestMimeType string `json:"manifestMimeType"`
-				} `json:"attributes"`
-			} `json:"data"`
-		}
-		if err := p.apiGet(ctx, "/trackManifests/", qV2, &v2Response); err == nil && v2Response.Data.Attributes.Manifest != "" {
-			u, err := parseManifestURL(v2Response.Data.Attributes.ManifestMimeType, v2Response.Data.Attributes.Manifest)
-			if err == nil {
-				// log.Printf("tidalproxy: stream obtained via V2 OpenAPI for track %d", trackID)
-				return u, nil
-			}
-		}
-	}
-
-	// 2. Define quality fallback chain for V1
 	qualities := []string{quality}
 	if quality == "HI_RES_LOSSLESS" {
 		qualities = append(qualities, "LOSSLESS", "HIGH")
@@ -480,36 +411,76 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string) (s
 	}
 
 	var lastErr error
-	for _, qStr := range qualities {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
+	// Strategy: try up to 3 different proxies until we get a FULL track.
+	// For each proxy, try the requested quality and its fallbacks.
+	for try := 0; try < 3; try++ {
+		for _, qStr := range qualities {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 
-		q := url.Values{
-			"id":                {fmt.Sprint(trackID)},
-			"quality":           {qStr},
-			"playbackmode":      {"STREAM"},
-			"assetpresentation": {"FULL"},
-		}
+			// 1. Try V2 OpenAPI Manifests first (HLS)
+			v2Ctx, v2Cancel := context.WithTimeout(ctx, 3*time.Second)
+			qV2 := url.Values{
+				"id":           {fmt.Sprint(trackID)},
+				"manifestType": {"HLS"},
+				"formats":      {"FLAC_HIRES", "FLAC", "HEAACV1", "AACLC"},
+			}
+			var v2Response struct {
+				Data struct {
+					Attributes struct {
+						Manifest          string   `json:"manifest"`
+						ManifestMimeType  string   `json:"manifestMimeType"`
+						URI               string   `json:"uri"`
+						Formats           []string `json:"formats"`
+						TrackPresentation string   `json:"trackPresentation"`
+					} `json:"attributes"`
+				} `json:"data"`
+			}
+			err := p.apiGet(v2Ctx, "/trackManifests/", qV2, &v2Response, clientIP)
+			v2Cancel()
+			if err == nil {
+				if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
+					lastErr = fmt.Errorf("proxy returned PREVIEW (V2)")
+					break // try next proxy in outer loop
+				}
+				if v2Response.Data.Attributes.URI != "" {
+					return v2Response.Data.Attributes.URI, nil
+				}
+				if v2Response.Data.Attributes.Manifest != "" {
+					u, err := parseManifestURL(v2Response.Data.Attributes.ManifestMimeType, v2Response.Data.Attributes.Manifest)
+					if err == nil {
+						return u, nil
+					}
+				}
+			}
 
-		var stream TidalStreamInfo
-		err := p.apiGet(ctx, "/track/", q, &stream)
-		if err == nil {
-			return parseManifestURL(stream.ManifestMimeType, stream.Manifest)
-		}
-
-		lastErr = err
-		log.Printf("tidalproxy: V1 fetch failed for quality %s: %v (trying next...)", qStr, err)
-
-		if strings.Contains(err.Error(), "context canceled") {
-			return "", err
+			// 2. V1 fallback
+			q := url.Values{
+				"id":                {fmt.Sprint(trackID)},
+				"quality":           {qStr},
+				"playbackmode":      {"STREAM"},
+				"assetpresentation": {"FULL"},
+			}
+			var stream TidalStreamInfo
+			if err := p.apiGet(ctx, "/track/", q, &stream, clientIP); err == nil {
+				if stream.TrackPresentation == "PREVIEW" {
+					lastErr = fmt.Errorf("proxy returned PREVIEW (V1)")
+					break // try next proxy in outer loop
+				}
+				u, err := parseManifestURL(stream.ManifestMimeType, stream.Manifest)
+				if err == nil {
+					return u, nil
+				}
+				lastErr = err
+			} else {
+				lastErr = err
+			}
 		}
 	}
 
-	return "", lastErr
+	return "", fmt.Errorf("could not get full stream after retries: %v", lastErr)
 }
-
-
 
 func (p *Pool) GetCoverURL(coverUUID string, size int) string {
 	if coverUUID == "" {
@@ -520,11 +491,10 @@ func (p *Pool) GetCoverURL(coverUUID string, size int) string {
 }
 
 func (p *Pool) GetCoverByTrackID(ctx context.Context, trackID int) (*TidalCover, error) {
-	body, err := p.apiGetRaw(ctx, "/cover/", url.Values{"id": {fmt.Sprint(trackID)}})
+	body, err := p.apiGetRaw(ctx, "/cover/", url.Values{"id": {fmt.Sprint(trackID)}}, "")
 	if err != nil {
 		return nil, err
 	}
-
 	var resp struct {
 		Covers []struct {
 			URL1280 string `json:"1280"`
@@ -538,7 +508,6 @@ func (p *Pool) GetCoverByTrackID(ctx context.Context, trackID int) (*TidalCover,
 	if len(resp.Covers) == 0 {
 		return nil, fmt.Errorf("no covers found")
 	}
-
 	return &TidalCover{
 		URL1280: resp.Covers[0].URL1280,
 		URL640:  resp.Covers[0].URL640,
@@ -551,87 +520,83 @@ func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrac
 		Items []TidalTrack `json:"items"`
 	}
 	q := url.Values{"id": {fmt.Sprint(trackID)}}
-	if err := p.apiGet(ctx, "/recommendations/", q, &result); err != nil {
+	if err := p.apiGet(ctx, "/recommendations/", q, &result, ""); err != nil {
 		return nil, err
 	}
 	return result.Items, nil
 }
 
 func (p *Pool) GetSimilarArtists(ctx context.Context, artistID int) ([]TidalArtist, error) {
-	body, err := p.apiGetRaw(ctx, "/artist/similar/", url.Values{"id": {fmt.Sprint(artistID)}})
-	if err != nil {
-		return nil, err
-	}
-
-	var resp struct {
+	var result struct {
 		Artists []TidalArtist `json:"artists"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := p.apiGet(ctx, "/artist/similar/", url.Values{"id": {fmt.Sprint(artistID)}}, &result, ""); err != nil {
 		return nil, err
 	}
-	return resp.Artists, nil
+	return result.Artists, nil
 }
 
 func (p *Pool) GetLyrics(ctx context.Context, trackID int) (*TidalLyrics, error) {
-	body, err := p.apiGetRaw(ctx, "/lyrics/", url.Values{"id": {fmt.Sprint(trackID)}})
-	if err != nil {
-		return nil, err
-	}
-
 	var resp struct {
 		Lyrics TidalLyrics `json:"lyrics"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := p.apiGet(ctx, "/lyrics/", url.Values{"id": {fmt.Sprint(trackID)}}, &resp, ""); err != nil {
 		return nil, err
 	}
 	return &resp.Lyrics, nil
 }
 
-// =====================================================================
 // Manifest Parsing
-// =====================================================================
-
-// parseManifestURL extracts the streaming URL from a Tidal manifest
 func parseManifestURL(mimeType, manifest string) (string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(manifest)
 	if err != nil {
-		// try raw base64
 		decoded, err = base64.RawStdEncoding.DecodeString(manifest)
 		if err != nil {
-			return "", fmt.Errorf("decode manifest base64: %w", err)
+			decoded = []byte(manifest)
 		}
 	}
 
 	content := string(decoded)
-
-	// BTS manifest: JSON with "urls" array
-	if strings.Contains(mimeType, "bts") || strings.HasPrefix(content, "{") {
-		var bts struct {
-			URLs []string `json:"urls"`
-		}
-		if err := json.Unmarshal(decoded, &bts); err == nil && len(bts.URLs) > 0 {
-			return bts.URLs[0], nil
-		}
-	}
 
 	// DASH manifest: look for <BaseURL>
 	if strings.Contains(content, "<BaseURL>") {
 		start := strings.Index(content, "<BaseURL>") + len("<BaseURL>")
 		end := strings.Index(content[start:], "</BaseURL>")
 		if end > 0 {
-			return content[start : start+end], nil
+			u := content[start : start+end]
+			return strings.ReplaceAll(u, "&amp;", "&"), nil
 		}
 	}
 
-	// Fallback for DASH or other XMLs: find first http URL
+	// Fallback for DASH or other XMLs: find first http URL that isn't a schema
 	if strings.HasPrefix(content, "<") || strings.Contains(content, "xml") {
-		start := strings.Index(content, "http")
-		if start >= 0 {
-			end := strings.IndexAny(content[start:], " \"'<>")
-			if end > 0 {
-				return content[start : start+end], nil
+		lines := strings.Split(content, ">")
+		for _, line := range lines {
+			if strings.Contains(line, "http") && !strings.Contains(line, "w3.org") && !strings.Contains(line, "mpeg.org") {
+				start := strings.Index(line, "http")
+				end := strings.IndexAny(line[start:], " \"'<>")
+				if end > 0 {
+					u := line[start : start+end]
+					return strings.ReplaceAll(u, "&amp;", "&"), nil
+				}
+				return strings.ReplaceAll(line[start:], "&amp;", "&"), nil
 			}
-			return content[start:], nil
+		}
+	}
+
+	// JSON manifest (BTS): find "url" or "urls" array
+	if strings.HasPrefix(content, "{") {
+		var manifestData struct {
+			URL  string   `json:"url"`
+			URLs []string `json:"urls"`
+		}
+		if err := json.Unmarshal(decoded, &manifestData); err == nil {
+			if manifestData.URL != "" {
+				return manifestData.URL, nil
+			}
+			if len(manifestData.URLs) > 0 {
+				return manifestData.URLs[0], nil
+			}
 		}
 	}
 
@@ -645,4 +610,3 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 
 	return "", fmt.Errorf("could not extract URL from manifest (type: %s content preview: %.50s)", mimeType, content)
 }
-

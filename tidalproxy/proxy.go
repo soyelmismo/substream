@@ -16,11 +16,12 @@ type TidalProxy interface {
 	SearchAlbums(ctx context.Context, query string, limit, offset int) ([]TidalAlbum, error)
 
 	// Streaming
-	GetStreamURL(ctx context.Context, trackID int, quality string) (string, error)
+	GetStreamURL(ctx context.Context, trackID int, quality string, clientIP string) (string, error)
 
 	// Media
 	GetCoverURL(coverUUID string, size int) string
 	GetCoverByTrackID(ctx context.Context, trackID int) (*TidalCover, error)
+	GetCoverUUIDForAlbum(ctx context.Context, albumID int) string
 
 	// Discovery
 	GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error)

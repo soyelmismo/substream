@@ -33,10 +33,10 @@ func (p *Pool) StartDiscovery(trackers []string, interval time.Duration, dbc *db
 				log.Printf("tidalproxy: discovery fetch error (%s): %v", tURL, err)
 				continue
 			}
-			defer resp.Body.Close()
-
 			var data trackerJSON
-			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			err = json.NewDecoder(resp.Body).Decode(&data)
+			resp.Body.Close()
+			if err != nil {
 				log.Printf("tidalproxy: discovery decode error (%s): %v", tURL, err)
 				continue
 			}

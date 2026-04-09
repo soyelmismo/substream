@@ -13,4 +13,4 @@ dist
 .tags*
 *.test
 cache/
-substream
+./substream

@@ -19,7 +19,8 @@ type TidalTrack struct {
 type TidalAlbumRef struct {
 	ID    int    `json:"id"`
 	Title string `json:"title"`
-	Cover string `json:"cover"`
+	Cover       string `json:"cover"`
+	ReleaseDate string `json:"releaseDate"`
 }
 
 // TidalAlbum maps to hifi-api /album/ response
@@ -59,10 +60,11 @@ type TidalArtistDetail struct {
 
 // TidalStreamInfo maps to hifi-api /track/ playbackinfo response
 type TidalStreamInfo struct {
-	TrackID          int    `json:"trackId"`
-	AudioQuality     string `json:"audioQuality"`
-	ManifestMimeType string `json:"manifestMimeType"`
-	Manifest         string `json:"manifest"`
+	TrackID           int    `json:"trackId"`
+	AudioQuality      string `json:"audioQuality"`
+	ManifestMimeType  string `json:"manifestMimeType"`
+	Manifest          string `json:"manifest"`
+	TrackPresentation string `json:"trackPresentation"` // FULL or PREVIEW
 }
 
 // TidalCover maps to hifi-api /cover/ response

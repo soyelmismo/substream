@@ -1,6 +1,7 @@
 package ctrlsubsonic
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -35,12 +37,31 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		tidalQuality = "LOSSLESS"
 	}
 
-	streamURL, err := c.proxy.GetStreamURL(r.Context(), id.Value, tidalQuality)
+	// Use a detached context with timeout so client disconnections
+	// don't cancel the upstream proxy call. Clients like Supersonic
+	// cancel and retry rapidly, killing in-flight requests.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		clientIP = r.Header.Get("X-Real-IP")
+	}
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+		if pos := strings.LastIndex(clientIP, ":"); pos != -1 {
+			clientIP = clientIP[:pos]
+		}
+		clientIP = strings.Trim(clientIP, "[]")
+	}
+
+	streamURL, err := c.proxy.GetStreamURL(ctx, id.Value, tidalQuality, clientIP)
 	if err != nil {
 		log.Printf("stream error for track %d: %v", id.Value, err)
 		return spec.NewError(0, "error getting stream URL: %v", err)
 	}
 
+	log.Printf("[STREAM] track %d → redirect to: %s", id.Value, streamURL)
 	http.Redirect(w, r, streamURL, http.StatusTemporaryRedirect)
 	return nil
 }
@@ -57,18 +78,34 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 
 
 	size := p.GetOrInt("size", 600)
-	// clamp size to tidal-supported values
-	switch {
-	case size <= 80:
-		size = 80
-	case size <= 160:
-		size = 160
-	case size <= 320:
-		size = 320
-	case size <= 640:
-		size = 640
-	default:
-		size = 1280
+	if id.Type == specid.Artist {
+		// Artist profile images use different sizes
+		switch {
+		case size <= 160:
+			size = 160
+		case size <= 320:
+			size = 320
+		case size <= 480:
+			size = 480
+		case size <= 750:
+			size = 750
+		default:
+			size = 1000
+		}
+	} else {
+		// Album/track covers
+		switch {
+		case size <= 80:
+			size = 80
+		case size <= 160:
+			size = 160
+		case size <= 320:
+			size = 320
+		case size <= 640:
+			size = 640
+		default:
+			size = 1280
+		}
 	}
 
 	// check disk cache first
@@ -85,10 +122,7 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	var coverUUID string
 	switch id.Type {
 	case specid.Album:
-		album, err := c.proxy.GetAlbumInfo(r.Context(), id.Value)
-		if err == nil {
-			coverUUID = album.Cover
-		}
+		coverUUID = c.proxy.GetCoverUUIDForAlbum(r.Context(), id.Value)
 	case specid.Artist:
 		info, err := c.proxy.GetArtistInfo(r.Context(), id.Value)
 		if err == nil {
@@ -111,8 +145,16 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		return spec.NewError(70, "cover art not found")
 	}
 
-	resp, err := http.Get(coverURL)
+	req, _ := http.NewRequest("GET", coverURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+			resp.Body.Close()
+		}
+		log.Printf("[SUBS] error fetching cover art from %s: err=%v status=%d", coverURL, err, status)
 		return spec.NewError(0, "error fetching cover art")
 	}
 	defer resp.Body.Close()
@@ -136,7 +178,4 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	return nil
 }
 
-// coverSlug converts a Tidal cover UUID to a URL path slug
-func coverSlug(uuid string) string {
-	return strings.ReplaceAll(uuid, "-", "/")
-}
+

@@ -54,10 +54,11 @@ func main() {
 
 	// Tidal Proxy Pool
 	urls := strings.Split(*confProxyURLs, ",")
-	proxy := tidalproxy.NewPool(urls, tidalproxy.PoolConfig{
+	proxyPool := tidalproxy.NewPool(urls, tidalproxy.PoolConfig{
 		HealthInterval: 30 * time.Second,
 		Timeout:        10 * time.Second,
 	})
+	proxy := tidalproxy.NewCachedProxy(proxyPool, 5*time.Minute)
 
 	// Load proxies from DB if any
 	dbProxies, _ := dbc.GetProxies()
@@ -89,7 +90,7 @@ func main() {
 		for _, p := range dbProxies {
 			dbURLs = append(dbURLs, p.URL)
 		}
-		proxy.SetInstances(dbURLs)
+		proxyPool.SetInstances(dbURLs)
 	}
 
 	// Background Auto-Discovery (Trackers)
@@ -97,7 +98,7 @@ func main() {
 		"https://tidal-uptime.jiffy-puffs-1j.workers.dev",
 		"https://tidal-uptime.props-76styles.workers.dev",
 	}
-	proxy.StartDiscovery(trackers, 30*time.Minute, dbc)
+	proxyPool.StartDiscovery(trackers, 30*time.Minute, dbc)
 
 
 

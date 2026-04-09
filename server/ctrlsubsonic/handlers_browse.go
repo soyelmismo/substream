@@ -2,6 +2,7 @@ package ctrlsubsonic
 
 import (
 	"net/http"
+	"strings"
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
@@ -221,16 +222,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 	}
 
 	// batch fetch album metadata
-	albums := make([]*spec.Album, 0, len(albumIDs))
-	for _, albumID := range albumIDs {
-		album, err := c.proxy.GetAlbumInfo(r.Context(), albumID)
-		if err != nil {
-			continue
-		}
-		a := spec.NewAlbumFromTidal(album)
-		c.applyAlbumStar(user.ID, a)
-		albums = append(albums, a)
-	}
+	albums := c.batchFetchAlbums(r, albumIDs)
 
 	sub := spec.NewResponse()
 	sub.AlbumsTwo = &spec.Albums{List: albums}
@@ -267,4 +259,60 @@ func appendUnique(slice []int, val int) []int {
 		}
 	}
 	return append(slice, val)
+}
+
+func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
+	p := r.Context().Value(CtxParams).(params.Params)
+	id, err := p.GetID("id")
+	if err != nil || id.Type != specid.Artist {
+		return spec.NewError(10, "please provide an artist `id` parameter")
+	}
+
+	info, err := c.proxy.GetArtistInfo(r.Context(), id.Value)
+	if err != nil {
+		return spec.NewError(0, "error fetching artist info")
+	}
+
+	similar, _ := c.proxy.GetSimilarArtists(r.Context(), id.Value)
+
+	artistInfo := &spec.ArtistInfo{
+		Biography:      "",
+		SmallImageURL:  c.proxy.GetCoverURL(info.Artist.Picture, 320),
+		MediumImageURL: c.proxy.GetCoverURL(info.Artist.Picture, 640),
+		LargeImageURL:  c.proxy.GetCoverURL(info.Artist.Picture, 1280),
+		ArtistImageURL: c.proxy.GetCoverURL(info.Artist.Picture, 1280),
+	}
+
+	user := r.Context().Value(CtxUser).(*db.User)
+	for _, a := range similar {
+		sa := spec.NewArtistFromTidal(&a)
+		c.applyArtistStar(user.ID, sa)
+		artistInfo.Similar = append(artistInfo.Similar, sa)
+	}
+
+	sub := spec.NewResponse()
+	if strings.Contains(r.URL.Path, "getArtistInfo2") {
+		sub.ArtistInfoTwo = artistInfo
+	} else {
+		sub.ArtistInfo = artistInfo
+	}
+	return sub
+}
+
+func (c *Controller) ServeGetAlbumInfoTwo(r *http.Request) *spec.Response {
+	p := r.Context().Value(CtxParams).(params.Params)
+	id, err := p.GetID("id")
+	if err != nil || id.Type != specid.Album {
+		return spec.NewError(10, "please provide an album `id` parameter")
+	}
+
+	albumInfo := &spec.AlbumInfo{
+		Notes:         "",
+		MusicBrainzID: "",
+		LastFMURL:     "",
+	}
+
+	sub := spec.NewResponse()
+	sub.AlbumInfo = albumInfo
+	return sub
 }

@@ -60,6 +60,15 @@ func (c *Controller) ServeGetUser(r *http.Request) *spec.Response {
 	return sub
 }
 
+// User management stubs to satisfy clients
+func (c *Controller) ServeGetUsers(r *http.Request) *spec.Response {
+	return spec.NewResponse()
+}
+
+func (c *Controller) ServeCreateUser(r *http.Request) *spec.Response { return spec.NewResponse() }
+func (c *Controller) ServeDeleteUser(r *http.Request) *spec.Response { return spec.NewResponse() }
+func (c *Controller) ServeChangePassword(r *http.Request) *spec.Response { return spec.NewResponse() }
+
 func (c *Controller) ServeNotFound(_ *http.Request) *spec.Response {
 	return spec.NewError(70, "view not found")
 }
@@ -73,26 +82,34 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
 
-	// record play in local DB
-	var play db.Play
-	c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).First(&play)
-	if play.ID == 0 {
-		play.UserID = user.ID
-		play.TidalID = id.Value
-		play.PlayedAt = time.Now()
-		play.Count = 1
-	} else {
-		play.Count++
-		play.PlayedAt = time.Now()
+	submissionStr, _ := p.Get("submission")
+	isSubmission := true
+	if submissionStr == "false" || submissionStr == "0" {
+		isSubmission = false
 	}
-	c.dbc.Save(&play)
+
+	if isSubmission {
+		// record play in local DB
+		var play db.Play
+		c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).First(&play)
+		if play.ID == 0 {
+			play.UserID = user.ID
+			play.TidalID = id.Value
+			play.PlayedAt = time.Now()
+			play.Count = 1
+		} else {
+			play.Count++
+			play.PlayedAt = time.Now()
+		}
+		c.dbc.Save(&play)
+	}
 
 	// fetch track info for scrobbling (fire and forget if fails)
 	track, err := c.proxy.GetTrackInfo(r.Context(), id.Value)
 	if err == nil && track != nil {
 		for _, s := range c.scrobblers {
 			if s.IsUserAuthenticated(*user) {
-				_ = s.Scrobble(*user, scrobbleTrackFromTidal(track), time.Now(), true)
+				_ = s.Scrobble(*user, scrobbleTrackFromTidal(track), time.Now(), isSubmission)
 			}
 		}
 	}
@@ -140,14 +157,19 @@ func (c *Controller) ServeSavePlayQueue(r *http.Request) *spec.Response {
 		}
 	}
 
-	current := p.GetOrID("current", specid.ID{})
+	current, err := p.GetID("current")
+	var currentIDVal int
+	if err == nil && current.Type == specid.Track {
+		currentIDVal = current.Value
+	}
+
 	position := p.GetOrInt("position", 0)
 	client := p.GetOr("c", "")
 
 	var queue db.PlayQueue
 	c.dbc.Where("user_id=?", user.ID).First(&queue)
 	queue.UserID = user.ID
-	queue.Current = current.Value
+	queue.Current = currentIDVal
 	queue.Position = position
 	queue.ChangedBy = client
 	queue.Items = encodeTidalIDs(tidalIDs)
