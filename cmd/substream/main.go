@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
-	"strings"
-	"time"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/scrobble"
@@ -176,6 +179,25 @@ func main() {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
+
+	// Graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		log.Printf("Shutting down server...")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Server shutdown error: %v", err)
+		}
+
+		// Close controller and stop cache cleanup goroutines
+		ctrlSubsonic.Close()
+		log.Printf("Server stopped gracefully")
+	}()
 
 	if *confCertPath != "" && *confKeyPath != "" {
 		log.Printf("Starting HTTPS server on %s", *confListenAddr)

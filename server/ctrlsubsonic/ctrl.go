@@ -185,6 +185,16 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	return c
 }
 
+// Close stops all cache cleanup goroutines and releases resources.
+// Should be called when shutting down the controller.
+func (c *Controller) Close() {
+	c.genreCache.Stop()
+	c.genreAlbumCache.Stop()
+	c.genreCountsCache.Stop()
+	c.searchCache.Stop()
+	c.negCoverCache.Stop()
+}
+
 type (
 	handlerSubsonic    func(r *http.Request) *spec.Response
 	handlerSubsonicRaw func(w http.ResponseWriter, r *http.Request) *spec.Response
