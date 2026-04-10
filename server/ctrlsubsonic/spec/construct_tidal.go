@@ -20,7 +20,13 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 	trackID := &specid.ID{Type: specid.Track, Value: t.ID}
 	albumID := &specid.ID{Type: specid.Album, Value: t.Album.ID}
 	artistID := &specid.ID{Type: specid.Artist, Value: t.Artist.ID}
-	coverID := &specid.ID{Type: specid.Album, Value: t.Album.ID}
+	
+	// Use track ID as fallback for cover if album ID is invalid
+	coverIDValue := t.Album.ID
+	if coverIDValue == 0 {
+		coverIDValue = t.ID
+	}
+	coverID := &specid.ID{Type: specid.Album, Value: coverIDValue}
 
 	tc := &TrackChild{
 		ID:          trackID,

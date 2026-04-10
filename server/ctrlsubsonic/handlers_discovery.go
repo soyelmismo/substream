@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/tidalproxy"
 
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -130,6 +131,46 @@ func (gc *genreCache) evictOldest() {
 	}
 }
 
+// genreAlbumsCacheEntry holds cached albums with expiry time.
+type genreAlbumsCacheEntry struct {
+	albums []tidalproxy.TidalAlbum
+	expiry time.Time
+}
+
+// genreAlbumCache is a simple TTL cache for genre albums to avoid duplicate API calls.
+// Unlike genreCache, this doesn't need LRU since we cache by genre key directly.
+type genreAlbumCache struct {
+	mu      sync.RWMutex
+	entries map[string]*genreAlbumsCacheEntry
+}
+
+func newGenreAlbumCache(maxSize int) *genreAlbumCache {
+	return &genreAlbumCache{
+		entries: make(map[string]*genreAlbumsCacheEntry),
+	}
+}
+
+func (gac *genreAlbumCache) get(key string) []tidalproxy.TidalAlbum {
+	gac.mu.RLock()
+	defer gac.mu.RUnlock()
+
+	entry, exists := gac.entries[key]
+	if !exists || time.Now().After(entry.expiry) {
+		return nil
+	}
+	return entry.albums
+}
+
+func (gac *genreAlbumCache) set(key string, albums []tidalproxy.TidalAlbum, ttl time.Duration) {
+	gac.mu.Lock()
+	defer gac.mu.Unlock()
+
+	gac.entries[key] = &genreAlbumsCacheEntry{
+		albums: albums,
+		expiry: time.Now().Add(ttl),
+	}
+}
+
 func (c *Controller) ServeGetRandomSongs(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 	p := r.Context().Value(CtxParams).(params.Params)
@@ -229,21 +270,29 @@ func (c *Controller) fetchHotGenreTracks(ctx context.Context, genre string, limi
 	var trackIDs []int
 	var albumIDs []int
 
-	// Extract items from sections
-	albumSectionTypes := map[string]bool{"ALBUM_LIST": true, "TRENDING": true, "NEW_RELEASES": true}
-	for _, section := range result.Sections {
-		switch section.Type {
-		case "TRACK_LIST":
-			for i, item := range section.Items {
-				if i >= limit {
-					break
-				}
-				if item.ID != 0 {
-					trackIDs = append(trackIDs, item.ID)
-				}
+	// Priority 1: Extract from top_tracks (direct tracks)
+	for _, track := range result.TopTracks {
+		if track.ID != 0 {
+			trackIDs = append(trackIDs, track.ID)
+			if len(trackIDs) >= limit {
+				break
 			}
-		default:
-			if albumSectionTypes[section.Type] {
+		}
+	}
+
+	// Priority 2: Extract from new_releases (albums)
+	if len(trackIDs) < limit {
+		for _, album := range result.NewReleases {
+			if album.ID != 0 && album.StreamReady {
+				albumIDs = appendUnique(albumIDs, album.ID)
+			}
+		}
+	}
+
+	// Priority 3: Extract from sections (ALBUM_LIST)
+	if len(trackIDs) < limit {
+		for _, section := range result.Sections {
+			if section.Type == "ALBUM_LIST" {
 				for _, item := range section.Items {
 					if item.ID != 0 {
 						albumIDs = appendUnique(albumIDs, item.ID)

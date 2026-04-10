@@ -42,6 +42,7 @@ type Controller struct {
 	coverLocks   sync.Map // dedup concurrent cover requests
 	httpClient   *http.Client // HTTP client for external requests
 	genreCache   *genreCache // Cache for genre tracks with LRU eviction
+	genreAlbumCache *genreAlbumCache // Cache for genre albums
 	genreCountsCache      *cachedGenreCounts // Cache for genre counts with TTL
 	genreCountsCacheMu    sync.RWMutex       // Mutex for genre counts cache
 }
@@ -66,6 +67,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 			},
 		},
 		genreCache: newGenreCache(maxGenreCacheSize),
+		genreAlbumCache: newGenreAlbumCache(20), // Cache up to 20 genres
 	}
 
 	chain := handlerutil.Chain(

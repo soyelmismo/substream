@@ -387,25 +387,37 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		if offset+size > maxGenreAlbums {
 			size = maxGenreAlbums - offset
 		}
-		// Try hot.monochrome.tf first for discovery
-		trackIDs := c.fetchHotGenreTracks(r.Context(), genre, maxGenreAlbums*5)
-		if len(trackIDs) > offset {
-			log.Printf("[GENRE] hot.monochrome.tf returned %d track IDs for %s (offset %d, size %d)", len(trackIDs), genre, offset, size)
-			// Fetch tracks to get their album IDs
-			tracks := c.batchFetchTracks(r, trackIDs)
-			seen := make(map[int]bool)
-			for _, tc := range tracks {
-				if tc.AlbumID != nil && !seen[tc.AlbumID.Value] {
-					seen[tc.AlbumID.Value] = true
-					albumIDs = append(albumIDs, tc.AlbumID.Value)
-					if len(albumIDs) >= size {
-						break
+		// Map genre name to hot.monochrome.tf ID
+		genreID := hotGenreMapping[genre]
+		if genreID == "" {
+			genreID = strings.ToLower(strings.ReplaceAll(genre, " ", "_"))
+		}
+		
+		// Try hot.monochrome.tf first for discovery - use cache
+		cacheKey := fmt.Sprintf("genre_albums_%s", genreID)
+		allAlbums := c.genreAlbumCache.get(cacheKey)
+		if allAlbums == nil {
+			allAlbums = c.fetchHotAlbumsWithFilter(r.Context(), maxGenreAlbums, "new", genreID)
+			if len(allAlbums) > 0 {
+				c.genreAlbumCache.set(cacheKey, allAlbums, 10*time.Minute)
+			}
+		}
+		
+		if len(allAlbums) > 0 {
+			log.Printf("[GENRE] hot.monochrome.tf returned %d albums for %s", len(allAlbums), genre)
+			// Apply offset and size locally
+			if offset < len(allAlbums) {
+				end := offset + size
+				if end > len(allAlbums) {
+					end = len(allAlbums)
+				}
+				albums := allAlbums[offset:end]
+				// Convert to album IDs
+				for _, a := range albums {
+					if a.ID != 0 {
+						albumIDs = append(albumIDs, a.ID)
 					}
 				}
-			}
-			// Apply offset
-			if offset > 0 && offset < len(albumIDs) {
-				albumIDs = albumIDs[offset:]
 			}
 		} else {
 			log.Printf("[GENRE] hot.monochrome.tf exhausted for %s at offset %d", genre, offset)
@@ -479,17 +491,36 @@ func (c *Controller) fetchHotFallback(ctx context.Context, albumIDs []int, neede
 		return albumIDs
 	}
 	log.Printf("[BROWSE] %s: only %d local albums, fetching %d %s from hot.monochrome.tf", logType, len(albumIDs), needed, filter)
-	hotAlbums := c.fetchHotAlbumsWithFilter(ctx, needed, filter)
-	for _, album := range hotAlbums {
+	
+	// Use cache key based on filter type
+	cacheKey := fmt.Sprintf("fallback_%s", filter)
+	cachedAlbums := c.genreAlbumCache.get(cacheKey)
+	
+	if cachedAlbums == nil {
+		// Use random genre for non-specific fallback cases
+		genres := []string{"pop", "electronic", "rock", "hip_hop", "rnb"}
+		genre := genres[rand.Intn(len(genres))]
+		
+		cachedAlbums = c.fetchHotAlbumsWithFilter(ctx, 50, filter, genre)
+		if len(cachedAlbums) > 0 {
+			c.genreAlbumCache.set(cacheKey, cachedAlbums, 15*time.Minute)
+		}
+	}
+	
+	// Append unique albums from cache
+	for _, album := range cachedAlbums {
+		if len(albumIDs) >= len(albumIDs)+needed {
+			break
+		}
 		albumIDs = appendUnique(albumIDs, album.ID)
 	}
 	return albumIDs
 }
 
 // fetchHotAlbumsWithFilter fetches albums from hot.monochrome.tf with a specific filter.
-// It selects a random genre for variety, fetches album IDs from the API, then batch fetches
+// It uses the specified genre ID to fetch albums from the API, then batch fetches
 // full album metadata using concurrent goroutines with a semaphore for rate limiting.
-func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, filter string) []tidalproxy.TidalAlbum {
+func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, filter string, genreID string) []tidalproxy.TidalAlbum {
 	// Validate and cap limit to prevent excessive requests
 	const maxFetchLimit = 50
 	if limit <= 0 {
@@ -500,41 +531,44 @@ func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, fi
 		log.Printf("[BROWSE] Limit capped to %d for filter %s", maxFetchLimit, filter)
 	}
 
-	// Try to get popular albums from first genre as fallback
-	genres := []string{"pop", "electronic", "rock", "hip-hop", "r-b"}
+	// Use the specified genre ID
+	url := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, genreID)
 
-	// Pick a random genre for variety
-	genre := genres[rand.Intn(len(genres))]
-	url := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, genre)
-
-	var result struct {
-		Albums []struct {
-			ID int `json:"id"`
-		} `json:"albums"`
-	}
+	var result hotResponse
 
 	if err := fetchJSON(ctx, c.httpClient, url, "BROWSE", &result); err != nil {
 		log.Printf("[BROWSE] Error fetching albums from hot.monochrome.tf: %v", err)
 		return nil
 	}
 
-	if len(result.Albums) == 0 {
-		return nil
+	// Collect album IDs from different sources
+	var albumIDs []int
+
+	// Priority 1: new_releases (most relevant)
+	for _, album := range result.NewReleases {
+		if album.StreamReady {
+			albumIDs = appendUnique(albumIDs, album.ID)
+		}
 	}
 
-	// Fetch full album info
-	albumIDs := make([]int, 0, limit)
-	for i, album := range result.Albums {
-		if i >= limit {
-			break
-		}
-		if album.ID != 0 {
-			albumIDs = append(albumIDs, album.ID)
+	// Priority 2: ALBUM_LIST sections
+	for _, section := range result.Sections {
+		if section.Type == "ALBUM_LIST" {
+			for _, item := range section.Items {
+				if item.ID != 0 {
+					albumIDs = appendUnique(albumIDs, item.ID)
+				}
+			}
 		}
 	}
 
 	if len(albumIDs) == 0 {
 		return nil
+	}
+
+	// Limit to requested amount
+	if len(albumIDs) > limit {
+		albumIDs = albumIDs[:limit]
 	}
 
 	// Batch fetch albums with context awareness

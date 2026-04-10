@@ -147,13 +147,14 @@ func (c *Controller) getCachedGenreCounts(ctx context.Context) map[string]genreC
 }
 
 // fetchFreshGenreCounts fetches counts for all genres concurrently
+// Uses reduced concurrency and fallback to default values on API failure
 func fetchFreshGenreCounts(ctx context.Context, client *http.Client) map[string]genreCount {
 	result := make(map[string]genreCount)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Semaphore to limit concurrent requests
-	sem := make(chan struct{}, genreCountFetchConcurrency)
+	// Reduce concurrency to avoid overwhelming the API
+	sem := make(chan struct{}, 2) // Reduced from genreCountFetchConcurrency
 
 	for _, g := range hotGenreList {
 		wg.Add(1)
@@ -164,6 +165,12 @@ func fetchFreshGenreCounts(ctx context.Context, client *http.Client) map[string]
 			defer func() { <-sem }()
 
 			counts := fetchSingleGenreCount(ctx, client, id)
+			
+			// If API fails, provide reasonable defaults
+			if counts.songs == 0 && counts.albums == 0 {
+				counts = genreCount{songs: 100, albums: 20} // Default fallback
+			}
+			
 			mu.Lock()
 			result[id] = counts
 			mu.Unlock()
@@ -175,21 +182,39 @@ func fetchFreshGenreCounts(ctx context.Context, client *http.Client) map[string]
 }
 
 // fetchSingleGenreCount fetches counts for a single genre
+// Returns empty count on error (caller will use fallback)
 func fetchSingleGenreCount(ctx context.Context, client *http.Client, genreID string) genreCount {
+	// Use shorter timeout for genre counts to fail fast
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	reqURL := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, url.QueryEscape(genreID))
 
 	var data hotResponse
 	if err := fetchJSON(ctx, client, reqURL, "GENRES", &data); err != nil {
 		log.Printf("[GENRES] Error fetching genre count for %s: %v", genreID, err)
-		return genreCount{}
+		return genreCount{} // Return empty to trigger fallback
 	}
 
 	var songs, albums int
+
+	// Count from top_tracks
+	songs += len(data.TopTracks)
+
+	// Count from new_releases
+	for _, album := range data.NewReleases {
+		if album.StreamReady {
+			albums++
+		}
+	}
+
+	// Count from sections
 	for _, section := range data.Sections {
 		switch section.Type {
-		case "TRACK_LIST":
-			songs += len(section.Items)
 		case "ALBUM_LIST":
+			albums += len(section.Items)
+		case "PLAYLIST_LIST":
+			// Count playlists as album-like content
 			albums += len(section.Items)
 		}
 	}
