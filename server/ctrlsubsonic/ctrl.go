@@ -292,8 +292,32 @@ func withUser(dbc *db.DB) handlerutil.Middleware {
 			}
 			user := dbc.GetUserByName(username)
 			if user == nil {
-				_ = writeResp(w, r, spec.NewError(40, "invalid username"))
-				return
+				// Check auto_register setting
+				autoRegister := dbc.GetSetting("auto_register", "false")
+				if autoRegister != "true" {
+					_ = writeResp(w, r, spec.NewError(40, "invalid username"))
+					return
+				}
+				// Auto-register requires password auth (not token auth) to set the initial password
+				if tokenAuth || password == "" {
+					log.Printf("[AUTH] auto-register rejected: user=%s token_auth=%v pass_len=%d (password required for auto-register)", username, tokenAuth, len(password))
+					_ = writeResp(w, r, spec.NewError(40, "invalid username"))
+					return
+				}
+				// Auto-create user with the provided password
+				newUser := &db.User{
+					Name:     username,
+					Password: password, // Stored as plaintext (gonic convention)
+					IsAdmin:  false,
+				}
+				log.Printf("[AUTH] auto-registering user=%s with pass_len=%d", username, len(password))
+				if err := dbc.Create(newUser).Error; err != nil {
+					log.Printf("[AUTH] auto-register failed for %s: %v", username, err)
+					_ = writeResp(w, r, spec.NewError(40, "invalid username"))
+					return
+				}
+				log.Printf("[AUTH] auto-registered new user: %s", username)
+				user = newUser
 			}
 			var credsOk bool
 			if tokenAuth {
@@ -324,7 +348,11 @@ func checkCredsToken(password, token, salt string) bool {
 	toHash := fmt.Sprintf("%s%s", password, salt)
 	hash := md5.Sum([]byte(toHash))
 	expToken := hex.EncodeToString(hash[:])
-	return token == expToken
+	match := token == expToken
+	if !match {
+		log.Printf("[AUTH] token mismatch: expected=%s got=%s salt=%s pass_len=%d", expToken[:16], token[:16], salt, len(password))
+	}
+	return match
 }
 
 func checkCredsBasic(password, given string) bool {

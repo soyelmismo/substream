@@ -392,14 +392,17 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 	}
 
 	var lastErr error
-	// Strategy: try up to 3 different proxies until we get a FULL track.
+	previewCount := 0
+	// Strategy: try up to 5 different proxies until we get a FULL track.
 	// For each proxy, try the requested quality and its fallbacks.
-	for try := 0; try < 3; try++ {
+	// Aggressive retry when PREVIEW is detected - try more proxies.
+	maxRetries := 5
+	for try := 0; try < maxRetries; try++ {
 		for _, qStr := range qualities {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
-			log.Printf("[TIDAL] GetStreamURL track=%d try=%d quality=%s", trackID, try, qStr)
+			log.Printf("[TIDAL] GetStreamURL track=%d try=%d/%d quality=%s", trackID, try, maxRetries-1, qStr)
 
 			// 1. Try V2 OpenAPI Manifests first (HLS)
 			v2Ctx, v2Cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -440,7 +443,8 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 			if err == nil {
 				if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
 					lastErr = fmt.Errorf("proxy returned PREVIEW (V2)")
-					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW returned (V2)", trackID)
+					previewCount++
+					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW #%d from V2 API, trying next proxy...", trackID, previewCount)
 					break // try next proxy in outer loop
 				}
 				// V2 URI is often a manifest URL (manifest.tidal.com), not direct audio.
@@ -473,7 +477,8 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 			if err := p.apiGet(ctx, "/track/", q, &stream, clientIP); err == nil {
 				if stream.TrackPresentation == "PREVIEW" {
 					lastErr = fmt.Errorf("proxy returned PREVIEW (V1)")
-					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW returned (V1)", trackID)
+					previewCount++
+					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW #%d from V1 API, trying next proxy...", trackID, previewCount)
 					break // try next proxy in outer loop
 				}
 				u, err := parseManifestURL(trackID, "V1", stream.ManifestMimeType, stream.Manifest)
@@ -489,7 +494,7 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 		}
 	}
 
-	return "", fmt.Errorf("could not get full stream after retries: %v", lastErr)
+	return "", fmt.Errorf("could not get full stream after %d retries (%d PREVIEWs): %v", maxRetries, previewCount, lastErr)
 }
 
 func min(a, b int) int {
