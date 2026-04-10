@@ -41,11 +41,15 @@ type Controller struct {
 	searchCache  *cache.Cache[cachedSearch]
 	proxySem     chan struct{}
 	coverLocks   sync.Map // dedup concurrent cover requests
+	hotLocks     sync.Map // dedup concurrent hot.monochrome.tf requests
 	httpClient   *http.Client // HTTP client for external requests
 	genreCache   *cache.Cache[[]int] // Cache for genre tracks with LRU eviction
 	genreAlbumCache *cache.Cache[[]tidalproxy.TidalAlbum] // Cache for genre albums
 	genreCountsCache *cache.Cache[map[string]genreCount] // Cache for genre counts with TTL
 	negCoverCache *cache.Cache[bool] // Negative cache for missing covers
+	settingsCache *cache.Cache[string] // Cache for DB settings (proxy_streams, etc)
+	streamURLCache *cache.Cache[string] // Cache for stream URLs (TTL 30s)
+	streamURLLocks sync.Map // dedup concurrent stream URL requests
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
@@ -96,6 +100,18 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 			MaxSize:         1000,
 			DefaultTTL:      time.Hour,
 			CleanupInterval: 10 * time.Minute,
+		}),
+		settingsCache: cache.New[string](cache.Config{
+			Name:            "settings",
+			MaxSize:         50,
+			DefaultTTL:      5 * time.Second, // Short TTL for settings
+			CleanupInterval: 30 * time.Second,
+		}),
+		streamURLCache: cache.New[string](cache.Config{
+			Name:            "stream-urls",
+			MaxSize:         100,
+			DefaultTTL:      30 * time.Second, // URLs expire after 30s
+			CleanupInterval: 1 * time.Minute,
 		}),
 	}
 

@@ -18,12 +18,19 @@ import (
 )
 
 func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.Response {
+	start := time.Now()
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	id, err := p.GetID("id")
 	if err != nil || id.Type != specid.Track {
+		log.Printf("[STREAM] ERROR: invalid track id: %v", err)
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
+
+	// Log raw request details for debugging
+	rawID := p.GetOr("id", "")
+	client := p.GetOr("c", "unknown")
+	log.Printf("[STREAM] REQUEST: client=%s raw_id=%s parsed_track_id=%d", client, rawID, id.Value)
 
 	bitrate := p.GetOrInt("maxBitRate", 0)
 	tidalQuality := ""
@@ -60,21 +67,34 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		clientIP = strings.Trim(clientIP, "[]")
 	}
 
-	streamURL, err := c.proxy.GetStreamURL(metaCtx, id.Value, tidalQuality, clientIP)
+	proxyStart := time.Now()
+	streamURL, err := c.getStreamURLWithCache(metaCtx, id.Value, tidalQuality, clientIP)
+	proxyDuration := time.Since(proxyStart)
 	if err != nil {
-		log.Printf("stream error for track %d: %v", id.Value, err)
+		log.Printf("[STREAM] ERROR: GetStreamURL failed for track %d after %v: %v", id.Value, proxyDuration, err)
 		return spec.NewError(0, "error getting stream URL: %v", err)
 	}
 
-	// Check if we should proxy or redirect based on settings
-	proxyStreams := strings.TrimSpace(c.dbc.GetSetting("proxy_streams", "false"))
+	// Log stream URL hash for debugging (to identify if same URL is returned for different tracks)
+	urlHash := ""
+	if len(streamURL) > 20 {
+		urlHash = streamURL[:20] + "..." + streamURL[len(streamURL)-10:]
+	}
+	log.Printf("[STREAM] URL: track=%d quality=%s url_hash=%s", id.Value, tidalQuality, urlHash)
+
+	// Check if we should proxy or redirect based on settings (cached)
+	settingStart := time.Now()
+	proxyStreams := c.getCachedSetting("proxy_streams", "false")
+	settingDuration := time.Since(settingStart)
 	if proxyStreams != "true" {
 		// Redirect directly to tidal CDN - better performance but may cause CORS issues
 		if streamURL == "" {
 			log.Printf("[STREAM] track %d → error: empty stream URL for redirect", id.Value)
 			return spec.NewError(0, "empty stream URL from tidal")
 		}
-		log.Printf("[STREAM] track %d → 302 redirect to tidal CDN (proxy_streams=%s)", id.Value, proxyStreams)
+		totalDuration := time.Since(start)
+		log.Printf("[STREAM] REDIRECT: track=%d → 302 to CDN (proxy=%s) total=%v proxy=%v setting=%v url=%s",
+			id.Value, proxyStreams, totalDuration, proxyDuration, settingDuration, urlHash)
 		http.Redirect(w, r, streamURL, http.StatusFound) // 302 redirect, no body
 		return nil
 	}
@@ -101,7 +121,13 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
 	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
 
-	log.Printf("[STREAM] track %d → proxying from tidal (type=%s)", id.Value, contentType)
+	streamType := "direct"
+	if isHLS {
+		streamType = "HLS"
+	} else if isDASH {
+		streamType = "DASH"
+	}
+	log.Printf("[STREAM] PROXY: track=%d type=%s format=%s artist=%q title=%q", id.Value, streamType, contentType, track.Artist.Name, track.Title)
 
 	w.Header().Set("Content-Type", contentType)
 	if strings.Contains(r.URL.Path, "download") {
@@ -147,9 +173,73 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	}
 
 	if stitchErr != nil {
-		log.Printf("[STREAM] error for track %d: %v", id.Value, stitchErr)
+		log.Printf("[STREAM] ERROR: proxy failed for track %d: %v", id.Value, stitchErr)
+	} else {
+		log.Printf("[STREAM] COMPLETE: track=%d type=%s", id.Value, streamType)
 	}
 	return nil
+}
+
+// getCachedSetting retrieves a setting from cache or DB if not cached.
+// Uses 5-second TTL to avoid DB pressure during high-traffic streaming.
+func (c *Controller) getCachedSetting(key, defaultVal string) string {
+	if cached := c.settingsCache.Get(key); cached != "" {
+		return cached
+	}
+	val := c.dbc.GetSetting(key, defaultVal)
+	c.settingsCache.Set(key, val, 5*time.Second)
+	return val
+}
+
+// streamURLLockPair is used for deduplicating concurrent stream URL requests
+type streamURLLockPair struct {
+	done chan struct{}
+	url  string
+	err  error
+}
+
+// getStreamURLWithCache retrieves stream URL with caching and deduplication.
+// If multiple requests ask for the same track simultaneously, only one calls Tidal API.
+func (c *Controller) getStreamURLWithCache(ctx context.Context, trackID int, quality, clientIP string) (string, error) {
+	cacheKey := fmt.Sprintf("stream:%d:%s", trackID, quality)
+
+	// Fast path: check cache
+	if cached := c.streamURLCache.Get(cacheKey); cached != "" {
+		return cached, nil
+	}
+
+	// Deduplication: only one request fetches, others wait
+	lockVal, loaded := c.streamURLLocks.LoadOrStore(cacheKey, &streamURLLockPair{done: make(chan struct{})})
+	lp := lockVal.(*streamURLLockPair)
+
+	if loaded {
+		// Another request is in flight, wait for it
+		<-lp.done
+		if lp.err != nil {
+			return "", lp.err
+		}
+		return lp.url, nil
+	}
+
+	// We are the fetcher - do the work
+	url, err := c.proxy.GetStreamURL(ctx, trackID, quality, clientIP)
+
+	lp.url = url
+	lp.err = err
+	close(lp.done)
+
+	// Cache successful result
+	if err == nil && url != "" {
+		c.streamURLCache.Set(cacheKey, url, 30*time.Second)
+	}
+
+	// Cleanup lock after brief delay
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		c.streamURLLocks.Delete(cacheKey)
+	}()
+
+	return url, err
 }
 
 func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *spec.Response {

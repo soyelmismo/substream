@@ -393,13 +393,31 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			genreID = strings.ToLower(strings.ReplaceAll(genre, " ", "_"))
 		}
 		
-		// Try hot.monochrome.tf first for discovery - use cache
+		// Try hot.monochrome.tf first for discovery - use cache with deduplication
 		cacheKey := fmt.Sprintf("genre_albums_%s", genreID)
 		allAlbums := c.genreAlbumCache.Get(cacheKey)
 		if len(allAlbums) == 0 {
-			allAlbums = c.fetchHotAlbumsWithFilter(r.Context(), maxGenreAlbums, "new", genreID)
-			if len(allAlbums) > 0 {
-				c.genreAlbumCache.Set(cacheKey, allAlbums, 10*time.Minute)
+			// Deduplication: only one request fetches, others wait
+			lockVal, loaded := c.hotLocks.LoadOrStore(cacheKey, &hotLockPair{done: make(chan struct{})})
+			lp := lockVal.(*hotLockPair)
+
+			if loaded {
+				// Another request is in flight, wait for it
+				<-lp.done
+				allAlbums = c.genreAlbumCache.Get(cacheKey)
+			} else {
+				// We are the fetcher - do the work
+				allAlbums = c.fetchHotAlbumsWithFilter(r.Context(), maxGenreAlbums, "new", genreID)
+				if len(allAlbums) > 0 {
+					c.genreAlbumCache.Set(cacheKey, allAlbums, 10*time.Minute)
+					log.Printf("[GENRE] fetched and cached %d albums for %s", len(allAlbums), cacheKey)
+				}
+				close(lp.done)
+				// Cleanup lock after brief delay
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					c.hotLocks.Delete(cacheKey)
+				}()
 			}
 		}
 		
@@ -483,38 +501,91 @@ func appendUnique(slice []int, val int) []int {
 	return append(slice, val)
 }
 
+// hotLockPair is used for deduplicating concurrent hot.monochrome.tf requests
+type hotLockPair struct {
+	mu     sync.Mutex
+	done   chan struct{}
+	albums []tidalproxy.TidalAlbum
+	status int // 0=pending, 1=success, 2=error
+}
+
 // fetchHotFallback fetches albums from hot.monochrome.tf and appends them to existing albumIDs
 // when the local library doesn't have enough albums. This provides a seamless fallback
 // to external content for discovery purposes.
+// Uses singleflight pattern to deduplicate concurrent requests.
 func (c *Controller) fetchHotFallback(ctx context.Context, albumIDs []int, needed int, filter string, logType string) []int {
 	if needed <= 0 {
 		return albumIDs
 	}
 	log.Printf("[BROWSE] %s: only %d local albums, fetching %d %s from hot.monochrome.tf", logType, len(albumIDs), needed, filter)
-	
+
 	// Use cache key based on filter type
 	cacheKey := fmt.Sprintf("fallback_%s", filter)
+
+	// Fast path: check cache first
 	cachedAlbums := c.genreAlbumCache.Get(cacheKey)
-	
-	if len(cachedAlbums) == 0 {
-		// Use random genre for non-specific fallback cases
-		genres := []string{"pop", "electronic", "rock", "hip_hop", "rnb"}
-		genre := genres[rand.Intn(len(genres))]
-		
-		cachedAlbums = c.fetchHotAlbumsWithFilter(ctx, 50, filter, genre)
-		if len(cachedAlbums) > 0 {
-			c.genreAlbumCache.Set(cacheKey, cachedAlbums, 15*time.Minute)
-		}
+	if len(cachedAlbums) > 0 {
+		log.Printf("[BROWSE] cache hit for %s", cacheKey)
+		return appendAlbums(albumIDs, cachedAlbums, needed)
 	}
-	
-	// Append unique albums from cache
-	for _, album := range cachedAlbums {
-		if len(albumIDs) >= len(albumIDs)+needed {
+
+	// Deduplication: only one request fetches, others wait
+	lockVal, loaded := c.hotLocks.LoadOrStore(cacheKey, &hotLockPair{done: make(chan struct{})})
+	lp := lockVal.(*hotLockPair)
+
+	if loaded {
+		// Another request is in flight, wait for it
+		<-lp.done
+		lp.mu.Lock()
+		if lp.status == 1 && len(lp.albums) > 0 {
+			// Use fetched results (already cached by the fetcher)
+			cachedAlbums = c.genreAlbumCache.Get(cacheKey)
+		}
+		lp.mu.Unlock()
+		return appendAlbums(albumIDs, cachedAlbums, needed)
+	}
+
+	// We are the fetcher - do the work
+	// Use random genre for non-specific fallback cases
+	genres := []string{"pop", "electronic", "rock", "hip_hop", "rnb"}
+	genre := genres[rand.Intn(len(genres))]
+
+	fetchedAlbums := c.fetchHotAlbumsWithFilter(ctx, 50, filter, genre)
+
+	lp.mu.Lock()
+	if len(fetchedAlbums) > 0 {
+		c.genreAlbumCache.Set(cacheKey, fetchedAlbums, 15*time.Minute)
+		lp.albums = fetchedAlbums
+		lp.status = 1
+		log.Printf("[BROWSE] fetched and cached %d albums for %s", len(fetchedAlbums), cacheKey)
+	} else {
+		lp.status = 2
+	}
+	close(lp.done)
+	lp.mu.Unlock()
+
+	// Cleanup lock after brief delay to allow other waiters to finish
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		c.hotLocks.Delete(cacheKey)
+	}()
+
+	// Get from cache (which now has the data)
+	cachedAlbums = c.genreAlbumCache.Get(cacheKey)
+	return appendAlbums(albumIDs, cachedAlbums, needed)
+}
+
+// appendAlbums appends unique albums from source to dest, up to needed count
+func appendAlbums(dest []int, source []tidalproxy.TidalAlbum, needed int) []int {
+	for _, album := range source {
+		if len(dest) >= needed {
 			break
 		}
-		albumIDs = appendUnique(albumIDs, album.ID)
+		if album.ID != 0 {
+			dest = appendUnique(dest, album.ID)
+		}
 	}
-	return albumIDs
+	return dest
 }
 
 // fetchHotAlbumsWithFilter fetches albums from hot.monochrome.tf with a specific filter.

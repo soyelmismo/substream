@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.senan.xyz/gonic/db"
 
@@ -95,6 +96,28 @@ func (c *Controller) fetchHotGenreTracks(ctx context.Context, genre string, limi
 		return cached
 	}
 
+	// Deduplication: only one request fetches, others wait
+	type hotTrackLock struct {
+		done     chan struct{}
+		trackIDs []int
+	}
+	lockVal, loaded := c.hotLocks.LoadOrStore(cacheKey, &hotTrackLock{done: make(chan struct{})})
+	lp := lockVal.(*hotTrackLock)
+
+	if loaded {
+		// Another request is in flight, wait for it
+		<-lp.done
+		cached := c.genreCache.Get(cacheKey)
+		if len(cached) > 0 {
+			if len(cached) > limit {
+				return cached[:limit]
+			}
+			return cached
+		}
+		// If cache is empty but we have the result from the lock, use it
+		return lp.trackIDs
+	}
+
 	// Map genre name to hot.monochrome.tf format
 	hotGenre, ok := hotGenreMapping[genre]
 	if !ok {
@@ -107,6 +130,8 @@ func (c *Controller) fetchHotGenreTracks(ctx context.Context, genre string, limi
 	var result hotResponse
 	if err := fetchJSON(ctx, c.httpClient, url, "RANDOM", &result); err != nil {
 		log.Printf("[RANDOM] Error fetching genre tracks from hot.monochrome.tf: %v", err)
+		close(lp.done)
+		go func() { time.Sleep(100 * time.Millisecond); c.hotLocks.Delete(cacheKey) }()
 		return nil
 	}
 
@@ -171,6 +196,14 @@ func (c *Controller) fetchHotGenreTracks(ctx context.Context, genre string, limi
 	if len(trackIDs) > 0 {
 		c.genreCache.Set(cacheKey, trackIDs, 0) // Use default TTL
 	}
+	lp.trackIDs = trackIDs
+	close(lp.done)
+
+	// Cleanup lock after brief delay
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		c.hotLocks.Delete(cacheKey)
+	}()
 
 	return trackIDs
 }
