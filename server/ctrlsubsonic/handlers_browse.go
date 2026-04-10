@@ -2,14 +2,13 @@ package ctrlsubsonic
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
+	"math/rand"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.senan.xyz/gonic/db"
@@ -19,91 +18,8 @@ import (
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
-const hotMonochromeURL = "https://hot.monochrome.tf"
-
-// hotAlbumItem represents an album item from hot.monochrome.tf
-type hotAlbumItem struct {
-	ID     int    `json:"id"`
-	Title  string `json:"title"`
-	Artist string `json:"artist"`
-}
-
-// hotAlbumSection represents a section from hot.monochrome.tf
-type hotAlbumSection struct {
-	Title string           `json:"title"`
-	Type  string           `json:"type"`
-	Items []hotAlbumItem   `json:"items"`
-}
-
-// hotAlbumResponse represents the response from hot.monochrome.tf/explore/genre
-type hotAlbumResponse struct {
-	Sections []hotAlbumSection `json:"sections"`
-}
-
-// fetchHotGenreAlbums fetches albums for a genre from hot.monochrome.tf
-func fetchHotGenreAlbums(ctx context.Context, genreName string, limit int) []hotAlbumItem {
-	// Map genre name to hot ID
-	genreMap := map[string]string{
-		"Hip-Hop": "hip_hop", "R&B / Soul": "rnb", "Blues": "blues",
-		"Classical": "classical", "Country": "country", "Dance & Electronic": "dance_electronic",
-		"Folk / Americana": "americana", "Global": "world", "Gospel / Christian": "gospel",
-		"Jazz": "jazz", "K-Pop": "kpop", "Kids": "kids", "Latin": "latin",
-		"Metal": "metal", "Pop": "pop", "Reggae / Dancehall": "reggae",
-		"Legacy": "retro", "Rock / Indie": "indierock",
-	}
-	
-	genreID, ok := genreMap[genreName]
-	if !ok {
-		// Try generic search if genre not in hot list
-		return nil
-	}
-	
-	reqURL := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, url.QueryEscape(genreID))
-	
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return nil
-	}
-	
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-	
-	var data hotAlbumResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil
-	}
-	
-	// Extract albums from sections
-	var albums []hotAlbumItem
-	for _, section := range data.Sections {
-		if section.Type == "ALBUM_LIST" {
-			for _, item := range section.Items {
-				if item.ID != 0 {
-					albums = append(albums, item)
-					if len(albums) >= limit {
-						break
-					}
-				}
-			}
-		}
-		if len(albums) >= limit {
-			break
-		}
-	}
-	
-	return albums
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
 func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
@@ -306,6 +222,10 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		for _, s := range stars {
 			albumIDs = append(albumIDs, s.TidalID)
 		}
+		// Fallback to hot new releases if less than threshold local albums
+		if len(albumIDs) < hotFallbackThresholdRecent {
+			albumIDs = c.fetchHotFallback(r.Context(), albumIDs, size-len(albumIDs), "new", "recent")
+		}
 
 	case "frequent":
 		// Most played favorited albums (by PlayCount, 0 at end)
@@ -317,6 +237,10 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		for _, s := range stars {
 			albumIDs = append(albumIDs, s.TidalID)
 		}
+		// Fallback to hot trending if less than threshold local albums
+		if len(albumIDs) < hotFallbackThresholdRecent {
+			albumIDs = c.fetchHotFallback(r.Context(), albumIDs, size-len(albumIDs), "trending", "frequent")
+		}
 
 	case "alphabeticalByName", "alphabeticalByArtist":
 		// Get all starred albums
@@ -324,22 +248,22 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		c.dbc.Where("user_id=?", user.ID).
 			Order("star_date DESC").
 			Find(&stars)
-		
+
 		if len(stars) == 0 {
 			break
 		}
-		
+
 		// Fetch all album metadata to sort properly
 		allAlbumIDs := make([]int, len(stars))
 		for i, s := range stars {
 			allAlbumIDs[i] = s.TidalID
 		}
-		
+
 		// Use fast fetch with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), hotFetchTimeout)
 		allAlbums := c.batchFetchAlbumsWithContext(ctx, allAlbumIDs)
 		cancel()
-		
+
 		// Sort by name or artist
 		if listType == "alphabeticalByName" {
 			sort.Slice(allAlbums, func(i, j int) bool {
@@ -350,7 +274,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 				return strings.ToLower(allAlbums[i].Artist) < strings.ToLower(allAlbums[j].Artist)
 			})
 		}
-		
+
 		// Apply offset/limit
 		start := offset
 		if start >= len(allAlbums) {
@@ -377,6 +301,10 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		for _, s := range stars {
 			albumIDs = append(albumIDs, s.TidalID)
 		}
+		// Fallback to hot popular albums if less than threshold local albums
+		if len(albumIDs) < hotFallbackThresholdRandom {
+			albumIDs = c.fetchHotFallback(r.Context(), albumIDs, size-len(albumIDs), "popular", "random")
+		}
 
 	case "highest":
 		var ratings []db.AlbumRating
@@ -392,31 +320,27 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		// Filter albums by year range
 		fromYear := p.GetOrInt("fromYear", 0)
 		toYear := p.GetOrInt("toYear", 3000)
-		
 		// Determine actual min/max for filtering
 		minYear, maxYear := fromYear, toYear
 		if fromYear > toYear {
 			minYear, maxYear = toYear, fromYear
 		}
-		
 		// Get all starred albums
 		var stars []db.AlbumStar
 		c.dbc.Where("user_id=?", user.ID).Find(&stars)
-		
 		if len(stars) == 0 {
 			break
 		}
-		
+
 		// Fetch album metadata to get years
 		allAlbumIDs := make([]int, len(stars))
 		for i, s := range stars {
 			allAlbumIDs[i] = s.TidalID
 		}
-		
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), hotFetchTimeout)
 		allAlbums := c.batchFetchAlbumsWithContext(ctx, allAlbumIDs)
 		cancel()
-		
+
 		// Filter by year range
 		var filtered []*spec.Album
 		for _, a := range allAlbums {
@@ -424,7 +348,6 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 				filtered = append(filtered, a)
 			}
 		}
-		
 		// Sort by year (ascending if fromYear < toYear, descending otherwise)
 		if fromYear < toYear {
 			sort.Slice(filtered, func(i, j int) bool {
@@ -435,7 +358,6 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 				return filtered[i].Year > filtered[j].Year
 			})
 		}
-		
 		// Apply offset/limit
 		start := offset
 		if start < len(filtered) {
@@ -455,35 +377,35 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		if genre == "" {
 			break
 		}
-		
 		// Cap max albums per genre to avoid infinite scroll issues
-		const maxGenreAlbums = 50
+		maxGenreAlbums := genreFetchMaxCount
 		if offset >= maxGenreAlbums {
 			log.Printf("[GENRE] Max albums reached for %s at offset %d", genre, offset)
 			break
 		}
-		
 		// Limit size to not exceed max
 		if offset+size > maxGenreAlbums {
 			size = maxGenreAlbums - offset
 		}
-		
 		// Try hot.monochrome.tf first for discovery
-		hotAlbums := fetchHotGenreAlbums(r.Context(), genre, maxGenreAlbums)
-		if len(hotAlbums) > offset {
-			log.Printf("[GENRE] hot.monochrome.tf returned %d albums for %s (offset %d, size %d)", len(hotAlbums), genre, offset, size)
-			// Apply offset/limit locally with deduplication
-			start := offset
-			end := offset + size
-			if end > len(hotAlbums) {
-				end = len(hotAlbums)
-			}
+		trackIDs := c.fetchHotGenreTracks(r.Context(), genre, maxGenreAlbums*5)
+		if len(trackIDs) > offset {
+			log.Printf("[GENRE] hot.monochrome.tf returned %d track IDs for %s (offset %d, size %d)", len(trackIDs), genre, offset, size)
+			// Fetch tracks to get their album IDs
+			tracks := c.batchFetchTracks(r, trackIDs)
 			seen := make(map[int]bool)
-			for _, a := range hotAlbums[start:end] {
-				if a.ID != 0 && !seen[a.ID] {
-					seen[a.ID] = true
-					albumIDs = append(albumIDs, a.ID)
+			for _, tc := range tracks {
+				if tc.AlbumID != nil && !seen[tc.AlbumID.Value] {
+					seen[tc.AlbumID.Value] = true
+					albumIDs = append(albumIDs, tc.AlbumID.Value)
+					if len(albumIDs) >= size {
+						break
+					}
 				}
+			}
+			// Apply offset
+			if offset > 0 && offset < len(albumIDs) {
+				albumIDs = albumIDs[offset:]
 			}
 		} else {
 			log.Printf("[GENRE] hot.monochrome.tf exhausted for %s at offset %d", genre, offset)
@@ -547,6 +469,106 @@ func appendUnique(slice []int, val int) []int {
 		}
 	}
 	return append(slice, val)
+}
+
+// fetchHotFallback fetches albums from hot.monochrome.tf and appends them to existing albumIDs
+// when the local library doesn't have enough albums. This provides a seamless fallback
+// to external content for discovery purposes.
+func (c *Controller) fetchHotFallback(ctx context.Context, albumIDs []int, needed int, filter string, logType string) []int {
+	if needed <= 0 {
+		return albumIDs
+	}
+	log.Printf("[BROWSE] %s: only %d local albums, fetching %d %s from hot.monochrome.tf", logType, len(albumIDs), needed, filter)
+	hotAlbums := c.fetchHotAlbumsWithFilter(ctx, needed, filter)
+	for _, album := range hotAlbums {
+		albumIDs = appendUnique(albumIDs, album.ID)
+	}
+	return albumIDs
+}
+
+// fetchHotAlbumsWithFilter fetches albums from hot.monochrome.tf with a specific filter.
+// It selects a random genre for variety, fetches album IDs from the API, then batch fetches
+// full album metadata using concurrent goroutines with a semaphore for rate limiting.
+func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, filter string) []tidalproxy.TidalAlbum {
+	// Validate and cap limit to prevent excessive requests
+	const maxFetchLimit = 50
+	if limit <= 0 {
+		return nil
+	}
+	if limit > maxFetchLimit {
+		limit = maxFetchLimit
+		log.Printf("[BROWSE] Limit capped to %d for filter %s", maxFetchLimit, filter)
+	}
+
+	// Try to get popular albums from first genre as fallback
+	genres := []string{"pop", "electronic", "rock", "hip-hop", "r-b"}
+
+	// Pick a random genre for variety
+	genre := genres[rand.Intn(len(genres))]
+	url := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, genre)
+
+	var result struct {
+		Albums []struct {
+			ID int `json:"id"`
+		} `json:"albums"`
+	}
+
+	if err := fetchJSON(ctx, c.httpClient, url, "BROWSE", &result); err != nil {
+		log.Printf("[BROWSE] Error fetching albums from hot.monochrome.tf: %v", err)
+		return nil
+	}
+
+	if len(result.Albums) == 0 {
+		return nil
+	}
+
+	// Fetch full album info
+	albumIDs := make([]int, 0, limit)
+	for i, album := range result.Albums {
+		if i >= limit {
+			break
+		}
+		if album.ID != 0 {
+			albumIDs = append(albumIDs, album.ID)
+		}
+	}
+
+	if len(albumIDs) == 0 {
+		return nil
+	}
+
+	// Batch fetch albums with context awareness
+	albumChan := make(chan *tidalproxy.TidalAlbum, len(albumIDs))
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, hotFetchConcurrency)
+
+	for _, id := range albumIDs {
+		wg.Add(1)
+		go func(albumID int) {
+			defer wg.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+
+				album, err := c.proxy.GetAlbumInfo(ctx, albumID)
+				if err == nil && album != nil {
+					albumChan <- album
+				}
+			case <-ctx.Done():
+				// Context cancelled, skip this request
+			}
+		}(id)
+	}
+
+	wg.Wait()
+	close(albumChan)
+
+	var albums []tidalproxy.TidalAlbum
+	for album := range albumChan {
+		albums = append(albums, *album)
+	}
+
+	return albums
 }
 
 func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {

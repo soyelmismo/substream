@@ -40,9 +40,16 @@ type Controller struct {
 	searchCache  sync.Map
 	proxySem     chan struct{}
 	coverLocks   sync.Map // dedup concurrent cover requests
+	httpClient   *http.Client // HTTP client for external requests
+	genreCache   *genreCache // Cache for genre tracks with LRU eviction
+	genreCountsCache      *cachedGenreCounts // Cache for genre counts with TTL
+	genreCountsCacheMu    sync.RWMutex       // Mutex for genre counts cache
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
+	// Load configuration from environment variables
+	initConfig()
+
 	c := &Controller{
 		ServeMux:   http.NewServeMux(),
 		dbc:        dbc,
@@ -50,6 +57,15 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 		scrobblers: scrobblers,
 		cachePath:  cachePath,
 		proxySem:   make(chan struct{}, 30), // limit total concurrent proxy calls
+		httpClient: &http.Client{
+			Timeout: httpClientTimeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        httpMaxIdleConns,
+				MaxIdleConnsPerHost: httpMaxIdleConnsPerHost,
+				IdleConnTimeout:     httpIdleConnTimeout,
+			},
+		},
+		genreCache: newGenreCache(maxGenreCacheSize),
 	}
 
 	chain := handlerutil.Chain(

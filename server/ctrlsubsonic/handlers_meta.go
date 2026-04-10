@@ -2,9 +2,7 @@ package ctrlsubsonic
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,69 +12,71 @@ import (
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
 
-// Genre mapping from hot.monochrome.tf
-var hotGenres = []struct {
-	ID   string
-	Name string
-}{
-	{ID: "hip_hop", Name: "Hip-Hop"},
-	{ID: "rnb", Name: "R&B / Soul"},
-	{ID: "blues", Name: "Blues"},
-	{ID: "classical", Name: "Classical"},
-	{ID: "country", Name: "Country"},
-	{ID: "dance_electronic", Name: "Dance & Electronic"},
-	{ID: "americana", Name: "Folk / Americana"},
-	{ID: "world", Name: "Global"},
-	{ID: "gospel", Name: "Gospel / Christian"},
-	{ID: "jazz", Name: "Jazz"},
-	{ID: "kpop", Name: "K-Pop"},
-	{ID: "kids", Name: "Kids"},
-	{ID: "latin", Name: "Latin"},
-	{ID: "metal", Name: "Metal"},
-	{ID: "pop", Name: "Pop"},
-	{ID: "reggae", Name: "Reggae / Dancehall"},
-	{ID: "retro", Name: "Legacy"},
-	{ID: "indierock", Name: "Rock / Indie"},
-}
-
-// hotTrack represents a track from hot.monochrome.tf
-type hotTrack struct {
-	ID       int    `json:"id"`
-	Title    string `json:"title"`
-	Artist   string `json:"artist"`
-	Album    string `json:"album"`
-	Cover    string `json:"cover"`
-	Duration int    `json:"duration"`
-}
-
-// hotAlbum represents an album from hot.monochrome.tf
-type hotAlbum struct {
-	ID          int    `json:"id"`
-	Title       string `json:"title"`
-	Artist      string `json:"artist"`
-	Cover       string `json:"cover"`
-	ReleaseDate string `json:"releaseDate"`
-}
-
-// hotSection represents a section from hot.monochrome.tf
-type hotSection struct {
-	Title string `json:"title"`
-	Type  string `json:"type"`
-	Items []struct {
-		ID       int    `json:"id"`
-		Title    string `json:"title"`
-		Artist   string `json:"artist,omitempty"`
-		Album    string `json:"album,omitempty"`
-		Cover    string `json:"cover"`
-		Duration int    `json:"duration,omitempty"`
-	} `json:"items"`
-}
-
-// hotGenreResponse represents the response from hot.monochrome.tf/explore/genre
-type hotGenreResponse struct {
-	Sections []hotSection `json:"sections"`
+// defaultInternetRadioStations defines the default internet radio stations
+var defaultInternetRadioStations = []*spec.InternetRadioStation{
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 1},
+		Name:        "SomaFM Groove Salad",
+		StreamURL:   "http://ice1.somafm.com/groovesalad-128-mp3",
+		HomepageURL: "https://somafm.com/groovesalad/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 2},
+		Name:        "SomaFM Drone Zone",
+		StreamURL:   "http://ice1.somafm.com/dronezone-128-mp3",
+		HomepageURL: "https://somafm.com/dronezone/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 3},
+		Name:        "SomaFM Secret Agent",
+		StreamURL:   "http://ice1.somafm.com/secretagent-128-mp3",
+		HomepageURL: "https://somafm.com/secretagent/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 4},
+		Name:        "SomaFM Beat Blender",
+		StreamURL:   "http://ice1.somafm.com/beatblender-128-mp3",
+		HomepageURL: "https://somafm.com/beatblender/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 5},
+		Name:        "SomaFM Fluid",
+		StreamURL:   "http://ice1.somafm.com/fluid-128-mp3",
+		HomepageURL: "https://somafm.com/fluid/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 6},
+		Name:        "Radio Paradise Main Mix",
+		StreamURL:   "http://stream.radioparadise.com/mp3-192",
+		HomepageURL: "https://radioparadise.com/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 7},
+		Name:        "Radio Paradise Mellow Mix",
+		StreamURL:   "http://stream.radioparadise.com/mellow-192",
+		HomepageURL: "https://radioparadise.com/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 8},
+		Name:        "Radio Paradise Rock Mix",
+		StreamURL:   "http://stream.radioparadise.com/rock-192",
+		HomepageURL: "https://radioparadise.com/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 9},
+		Name:        "Zen Radio",
+		StreamURL:   "https://streamingp.shoutcast.com/ZenRadio",
+		HomepageURL: "https://zenradio.com/",
+	},
+	{
+		ID:          &specid.ID{Type: specid.InternetRadioStation, Value: 10},
+		Name:        "Chillhop Music",
+		StreamURL:   "https://streams.fluxfm.de/chillhop/mp3-128",
+		HomepageURL: "https://chillhop.com/",
+	},
 }
 
 // cachedGenreCounts holds cached counts with timestamp
@@ -85,24 +85,18 @@ type cachedGenreCounts struct {
 	timestamp time.Time
 }
 
-var (
-	genreCountsCache     *cachedGenreCounts
-	genreCountsCacheMu   sync.RWMutex
-	genreCountsCacheTTL  = 5 * time.Minute
-)
-
 func (c *Controller) ServeGetGenres(r *http.Request) *spec.Response {
 	sub := spec.NewResponse()
-	
+
 	// Get cached counts (fetch fresh if expired)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), httpClientTimeout)
 	defer cancel()
-	
-	genreCounts := getCachedGenreCounts(ctx)
-	
+
+	genreCounts := c.getCachedGenreCounts(ctx)
+
 	// Convert hot genres to spec.Genre with counts
-	genres := make([]*spec.Genre, 0, len(hotGenres))
-	for _, g := range hotGenres {
+	genres := make([]*spec.Genre, 0, len(hotGenreList))
+	for _, g := range hotGenreList {
 		counts := genreCounts[g.ID]
 		genres = append(genres, &spec.Genre{
 			Name:       g.Name,
@@ -110,9 +104,9 @@ func (c *Controller) ServeGetGenres(r *http.Request) *spec.Response {
 			AlbumCount: counts.albums,
 		})
 	}
-	
+
 	log.Printf("[GENRES] Returning %d genres with counts from hot.monochrome.tf", len(genres))
-	
+
 	sub.Genres = &spec.Genres{
 		List: genres,
 	}
@@ -126,89 +120,70 @@ type genreCount struct {
 }
 
 // getCachedGenreCounts returns cached counts or fetches new ones if expired
-func getCachedGenreCounts(ctx context.Context) map[string]genreCount {
+func (c *Controller) getCachedGenreCounts(ctx context.Context) map[string]genreCount {
 	// Check cache first
-	genreCountsCacheMu.RLock()
-	if genreCountsCache != nil && time.Since(genreCountsCache.timestamp) < genreCountsCacheTTL {
-		cache := genreCountsCache.counts
-		genreCountsCacheMu.RUnlock()
+	c.genreCountsCacheMu.RLock()
+	if c.genreCountsCache != nil && time.Since(c.genreCountsCache.timestamp) < genreCountsCacheTTL {
+		cache := c.genreCountsCache.counts
+		c.genreCountsCacheMu.RUnlock()
 		log.Printf("[GENRES] Using cached counts")
 		return cache
 	}
-	genreCountsCacheMu.RUnlock()
-	
+	c.genreCountsCacheMu.RUnlock()
+
 	// Fetch fresh counts
 	log.Printf("[GENRES] Fetching fresh counts from hot.monochrome.tf")
-	fresh := fetchFreshGenreCounts(ctx)
-	
+	fresh := fetchFreshGenreCounts(ctx, c.httpClient)
+
 	// Update cache
-	genreCountsCacheMu.Lock()
-	genreCountsCache = &cachedGenreCounts{
+	c.genreCountsCacheMu.Lock()
+	c.genreCountsCache = &cachedGenreCounts{
 		counts:    fresh,
 		timestamp: time.Now(),
 	}
-	genreCountsCacheMu.Unlock()
-	
+	c.genreCountsCacheMu.Unlock()
+
 	return fresh
 }
 
 // fetchFreshGenreCounts fetches counts for all genres concurrently
-func fetchFreshGenreCounts(ctx context.Context) map[string]genreCount {
+func fetchFreshGenreCounts(ctx context.Context, client *http.Client) map[string]genreCount {
 	result := make(map[string]genreCount)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	
+
 	// Semaphore to limit concurrent requests
-	sem := make(chan struct{}, 5)
-	
-	for _, g := range hotGenres {
+	sem := make(chan struct{}, genreCountFetchConcurrency)
+
+	for _, g := range hotGenreList {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			
+
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			
-			counts := fetchSingleGenreCount(ctx, id)
+
+			counts := fetchSingleGenreCount(ctx, client, id)
 			mu.Lock()
 			result[id] = counts
 			mu.Unlock()
 		}(g.ID)
 	}
-	
+
 	wg.Wait()
 	return result
 }
 
 // fetchSingleGenreCount fetches counts for a single genre
-func fetchSingleGenreCount(ctx context.Context, genreID string) genreCount {
+func fetchSingleGenreCount(ctx context.Context, client *http.Client, genreID string) genreCount {
 	reqURL := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, url.QueryEscape(genreID))
-	
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
+
+	var data hotResponse
+	if err := fetchJSON(ctx, client, reqURL, "GENRES", &data); err != nil {
+		log.Printf("[GENRES] Error fetching genre count for %s: %v", genreID, err)
 		return genreCount{}
 	}
-	
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return genreCount{}
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return genreCount{}
-	}
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return genreCount{}
-	}
-	
-	var data hotGenreResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return genreCount{}
-	}
-	
+
 	var songs, albums int
 	for _, section := range data.Sections {
 		switch section.Type {
@@ -218,68 +193,57 @@ func fetchSingleGenreCount(ctx context.Context, genreID string) genreCount {
 			albums += len(section.Items)
 		}
 	}
-	
+
 	return genreCount{songs: songs, albums: albums}
 }
 
 func (c *Controller) ServeGetSongsByGenre(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	user := r.Context().Value(CtxUser).(*db.User)
-	
+
 	genreName, err := p.Get("genre")
 	if err != nil || genreName == "" {
 		return spec.NewError(10, "provide a genre parameter")
 	}
-	
+
 	size := p.GetOrInt("count", 20)
-	if size > 50 {
-		size = 50
+	if size > genreFetchMaxCount {
+		size = genreFetchMaxCount
 	}
-	
+
 	// Find genre ID from name
 	var genreID string
-	for _, g := range hotGenres {
+	for _, g := range hotGenreList {
 		if g.Name == genreName {
 			genreID = g.ID
 			break
 		}
 	}
-	
+
 	// If found in hot genres, try hot.monochrome.tf first
 	if genreID != "" {
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), genreFetchTimeout)
 		defer cancel()
-		
-		tracks, err := fetchHotGenreTracks(ctx, genreID, size)
-		if err == nil && len(tracks) > 0 {
-			log.Printf("[GENRE] hot.monochrome.tf returned %d tracks for %s", len(tracks), genreName)
-			
-			// Convert hot tracks to TrackChild
-			trackList := make([]*spec.TrackChild, 0, len(tracks))
-			for _, t := range tracks {
-				if t.ID != 0 {
-					// Fetch full track info from Tidal
-					trackInfo, _ := c.proxy.GetTrackInfo(r.Context(), t.ID)
-					if trackInfo != nil {
-						tc := spec.NewTrackFromTidal(trackInfo)
-						c.applyTrackStar(user.ID, tc)
-						trackList = append(trackList, tc)
-					}
-				}
-			}
-			
-			if len(trackList) > 0 {
+
+		trackIDs := c.fetchHotGenreTracks(ctx, genreName, size)
+		if len(trackIDs) > 0 {
+			log.Printf("[GENRE] hot.monochrome.tf returned %d track IDs for %s", len(trackIDs), genreName)
+
+			// Fetch full track info from Tidal
+			tracks := c.batchFetchTracks(r, trackIDs)
+
+			if len(tracks) > 0 {
 				sub := spec.NewResponse()
 				sub.SongsByGenre = &spec.SongsByGenre{
-					List: trackList,
+					List: tracks,
 				}
 				return sub
 			}
 		}
-		
+
 		log.Printf("[GENRE] hot.monochrome.tf failed for %s, falling back to Tidal search", genreName)
 	}
-	
+
 	// Fallback: Search tracks by genre name using Tidal
 	ctx := r.Context()
 	tracks, err := c.proxy.SearchTracks(ctx, genreName, size, 0)
@@ -291,7 +255,7 @@ func (c *Controller) ServeGetSongsByGenre(r *http.Request) *spec.Response {
 		}
 		return sub
 	}
-	
+
 	// Convert to TrackChild
 	trackList := make([]*spec.TrackChild, 0, len(tracks))
 	for _, t := range tracks {
@@ -301,7 +265,7 @@ func (c *Controller) ServeGetSongsByGenre(r *http.Request) *spec.Response {
 			trackList = append(trackList, tc)
 		}
 	}
-	
+
 	sub := spec.NewResponse()
 	sub.SongsByGenre = &spec.SongsByGenre{
 		List: trackList,
@@ -309,67 +273,10 @@ func (c *Controller) ServeGetSongsByGenre(r *http.Request) *spec.Response {
 	return sub
 }
 
-// fetchHotGenreTracks fetches tracks for a genre from hot.monochrome.tf
-func fetchHotGenreTracks(ctx context.Context, genreID string, limit int) ([]hotTrack, error) {
-	url := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, url.QueryEscape(genreID))
-	
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hot.monochrome.tf returned status %d", resp.StatusCode)
-	}
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	
-	var data hotGenreResponse
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, err
-	}
-	
-	// Extract tracks from sections
-	var tracks []hotTrack
-	for _, section := range data.Sections {
-		if section.Type == "TRACK_LIST" {
-			for _, item := range section.Items {
-				if item.ID != 0 {
-					tracks = append(tracks, hotTrack{
-						ID:       item.ID,
-						Title:    item.Title,
-						Artist:   item.Artist,
-						Album:    item.Album,
-						Cover:    item.Cover,
-						Duration: item.Duration,
-					})
-					if len(tracks) >= limit {
-						break
-					}
-				}
-			}
-		}
-		if len(tracks) >= limit {
-			break
-		}
-	}
-	
-	return tracks, nil
-}
-
 func (c *Controller) ServeGetInternetRadioStations(r *http.Request) *spec.Response {
 	sub := spec.NewResponse()
 	sub.InternetRadioStations = &spec.InternetRadioStations{
-		List: []*spec.InternetRadioStation{},
+		List: defaultInternetRadioStations,
 	}
 	return sub
 }
