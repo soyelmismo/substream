@@ -72,5 +72,24 @@ func (db *DB) UpdateProxyHealth(id int, healthy bool) error {
 	return db.Model(&ProxyInstance{}).Where("id=?", id).Update("is_healthy", healthy).Error
 }
 
+func (db *DB) GetSetting(key string, defaultValue string) string {
+	var setting Setting
+	err := db.Where("key=?", key).First(&setting).Error
+	if err != nil {
+		return defaultValue
+	}
+	return setting.Value
+}
+
+func (db *DB) SetSetting(key string, value string) error {
+	var setting Setting
+	err := db.Where("key=?", key).First(&setting).Error
+	if err != nil {
+		return db.Create(&Setting{Key: key, Value: value}).Error
+	}
+	setting.Value = value
+	return db.Save(&setting).Error
+}
+
 
 

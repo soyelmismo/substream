@@ -1,5 +1,5 @@
-{{ component "layout" . }}
-{{ component "layout_user" . }}
+{{ template "head" . }}
+{{ template "nav" . }}
 
 <div class="flex flex-col gap-8">
     <div class="flex flex-col gap-4 text-right">
@@ -7,58 +7,71 @@
         <p class="text-gray-500">manage tidal proxy instances for the pool</p>
     </div>
 
-    {{ component "block" (props .
-        "Icon" "globe"
-        "Name" "active instances"
-        "Desc" "currently configured hifi-api proxies"
-    ) }}
-        <div class="flex flex-col divide-y divide-gray-200">
-            {{ range .Proxies }}
-            <div class="flex items-center justify-between py-3">
-                <form action="{{ path "/admin/delete_proxy_do" }}" method="POST" onsubmit="return confirm('remove this instance?')">
-                    <input type="hidden" name="id" value="{{ .ID }}">
-                    <input type="submit" value="delete" class="text-rose-600 hover:text-rose-700 cursor-pointer text-sm font-bold">
-                </form>
-                <div class="flex items-center gap-4">
-                    {{ if .IsHealthy }}
-                        <span class="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded">healthy</span>
-                    {{ else }}
-                        <span class="text-xs font-bold text-rose-600 bg-rose-50 px-2 py-0.5 rounded">unhealthy</span>
-                    {{ end }}
-                    <div class="flex flex-col items-end">
-                        <span class="font-bold text-gray-900">{{ .URL }}</span>
-                        <span class="text-[10px] text-gray-400 capitalize">{{ .Name }} • added {{ dateHuman .CreatedAt }}</span>
+    <!-- Active Instances Block -->
+    <div class="border-b-2 border-r-2 border-gray-300/80 bg-gray-50 p-4">
+        <div class="inline-flex items-center gap-x-3">
+            <span class="text-gray-500/80 w-4">
+                <svg class="fill-current aspect-square" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            </span>
+            <span class="text-gray-900 font-bold">active instances</span>
+        </div>
+        <hr class="bg-gray-900/30 my-1" />
+        <div class="font-medium text-gray-500 max-w-[700px]">currently configured hifi-api proxies</div>
+        <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
+            <div class="flex flex-col divide-y divide-gray-200">
+                {{ range .Proxies }}
+                <div class="flex items-center justify-between py-3">
+                    <form action="{{ path "/admin/delete_proxy_do" }}" method="POST" onsubmit="return confirm('remove this instance?')">
+                        <input type="hidden" name="id" value="{{ .ID }}">
+                        <input type="submit" value="delete" class="text-rose-600 hover:text-rose-700 cursor-pointer text-sm font-bold">
+                    </form>
+                    <div class="flex items-center gap-4">
+                        {{ if .IsHealthy }}
+                            <span class="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded">healthy</span>
+                        {{ else }}
+                            <span class="text-xs font-bold text-rose-600 bg-rose-50 px-2 py-0.5 rounded">unhealthy</span>
+                        {{ end }}
+                        <div class="flex flex-col items-end">
+                            <span class="font-bold text-gray-900">{{ .URL }}</span>
+                            <span class="text-[10px] text-gray-400 capitalize">{{ .Name }} • added {{ dateHuman .CreatedAt }}</span>
+                        </div>
                     </div>
                 </div>
+                {{ else }}
+                <div class="py-12 text-center text-gray-400 font-medium italic">
+                    no proxies configured. using CLI defaults.
+                </div>
+                {{ end }}
             </div>
-            {{ else }}
-            <div class="py-12 text-center text-gray-400 font-medium italic">
-                no proxies configured. using CLI defaults.
-            </div>
-            {{ end }}
         </div>
-    {{ end }}
+    </div>
 
-    {{ component "block" (props .
-        "Icon" "plus"
-        "Name" "add instance"
-        "Desc" "add a new hifi-api instance to the pool"
-    ) }}
-        <form action="{{ path "/admin/add_proxy_do" }}" method="POST" class="grid grid-cols-[1fr_auto] gap-2 items-center justify-items-end">
-            <input type="url" name="url" placeholder="https://example.com/hifi" required
-                class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors">
-            <label class="text-[10px] uppercase font-bold text-gray-400">instance url</label>
-            
-            <input type="text" name="name" placeholder="my-proxy"
-                class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors">
-            <label class="text-[10px] uppercase font-bold text-gray-400">friendly name</label>
+    <!-- Add Instance Block -->
+    <div class="border-b-2 border-r-2 border-gray-300/80 bg-gray-50 p-4">
+        <div class="inline-flex items-center gap-x-3">
+            <span class="text-gray-500/80 w-4">
+                <svg class="fill-current aspect-square" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            </span>
+            <span class="text-gray-900 font-bold">add instance</span>
+        </div>
+        <hr class="bg-gray-900/30 my-1" />
+        <div class="font-medium text-gray-500 max-w-[700px]">add a new hifi-api instance to the pool</div>
+        <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
+            <form action="{{ path "/admin/add_proxy_do" }}" method="POST" class="grid grid-cols-[1fr_auto] gap-2 items-center justify-items-end">
+                <input type="url" name="url" placeholder="https://example.com/hifi" required
+                    class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors">
+                <label class="text-[10px] uppercase font-bold text-gray-400">instance url</label>
+                
+                <input type="text" name="name" placeholder="my-proxy"
+                    class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors">
+                <label class="text-[10px] uppercase font-bold text-gray-400">friendly name</label>
 
-            <div class="col-span-full mt-2">
-                <input type="submit" value="add instance" class="bg-blue-600 text-white font-bold px-4 py-2 rounded cursor-pointer hover:bg-blue-700 transition-colors">
-            </div>
-        </form>
-    {{ end }}
+                <div class="col-span-full mt-2">
+                    <input type="submit" value="add instance" class="bg-blue-600 text-white font-bold px-4 py-2 rounded cursor-pointer hover:bg-blue-700 transition-colors">
+                </div>
+            </form>
+        </div>
+    </div>
 </div>
 
-{{ end }}
-{{ end }}
+{{ template "foot" . }}

@@ -66,6 +66,19 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		return spec.NewError(0, "error getting stream URL: %v", err)
 	}
 
+	// Check if we should proxy or redirect based on settings
+	proxyStreams := strings.TrimSpace(c.dbc.GetSetting("proxy_streams", "false"))
+	if proxyStreams != "true" {
+		// Redirect directly to tidal CDN - better performance but may cause CORS issues
+		if streamURL == "" {
+			log.Printf("[STREAM] track %d → error: empty stream URL for redirect", id.Value)
+			return spec.NewError(0, "empty stream URL from tidal")
+		}
+		log.Printf("[STREAM] track %d → 302 redirect to tidal CDN (proxy_streams=%s)", id.Value, proxyStreams)
+		http.Redirect(w, r, streamURL, http.StatusFound) // 302 redirect, no body
+		return nil
+	}
+
 	// Use a proxy instead of redirect to avoid CORS issues for web clients
 	// and certificate issues for clients using self-signed certs.
 

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"net/url"
@@ -18,9 +19,7 @@ import (
 
 	"github.com/Masterminds/sprig"
 	"github.com/dustin/go-humanize"
-	"github.com/fatih/structs"
 	"github.com/gorilla/sessions"
-	"github.com/philippta/go-template/html/template"
 	"github.com/sentriz/gormstore"
 
 	"go.senan.xyz/gonic"
@@ -98,6 +97,10 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resol
 	// admin routes (if session is valid, and is admin)
 	c.Handle("/create_user", adminChain(resp(c.ServeCreateUser)))
 	c.Handle("/create_user_do", adminChain(resp(c.ServeCreateUserDo)))
+
+	// admin settings
+	c.Handle("/settings", adminChain(resp(c.ServeSettings)))
+	c.Handle("/settings_do", adminChain(resp(c.ServeSettingsDo)))
 
 	// admin proxies
 	c.Handle("/proxies", adminChain(resp(c.ServeProxies)))
@@ -288,6 +291,10 @@ type templateData struct {
 
 	// proxies
 	Proxies []*db.ProxyInstance
+
+	// settings
+	AutoRegister   bool
+	ProxyStreams   bool
 }
 
 
@@ -309,22 +316,6 @@ func funcMap() template.FuncMap {
 		},
 		"dateHuman": humanize.Time,
 		"base64":    base64.StdEncoding.EncodeToString,
-		"props": func(parent any, values ...any) map[string]any {
-			if len(values)%2 != 0 {
-				panic("uneven number of key/value pairs")
-			}
-			props := map[string]any{}
-			for i := 0; i < len(values); i += 2 {
-				k, v := fmt.Sprint(values[i]), values[i+1]
-				props[k] = v
-			}
-			merged := map[string]any{}
-			if structs.IsStruct(parent) {
-				merged = structs.Map(parent)
-			}
-			merged["Props"] = props
-			return merged
-		},
 	}
 }
 

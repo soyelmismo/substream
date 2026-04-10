@@ -1,0 +1,73 @@
+{{ define "head" }}
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <title>substream</title>
+        <style>
+          @font-face {
+            font-family: "Inconsolata";
+            font-style: normal;
+            font-weight: 500;
+            src: local(""),
+              url("{{ path "/admin/static/inconsolata-v31-latin-500.woff2" }}") format("woff2"),
+              url("{{ path "/admin/static/inconsolata-v31-latin-500.woff" }}") format("woff");
+          }
+          @font-face {
+            font-family: "Inconsolata";
+            font-style: normal;
+            font-weight: 600;
+            src: local(""),
+              url("{{ path "/admin/static/inconsolata-v31-latin-600.woff2" }}") format("woff2"),
+              url("{{ path "/admin/static/inconsolata-v31-latin-600.woff" }}") format("woff");
+          }
+        </style>
+        <link rel="stylesheet" href="{{ path "/admin/static/style.css" | noCache }}">
+        <link rel="shortcut icon" href="{{ path "/admin/static/favicon.ico" }}" type="image/x-icon">
+        <link rel="icon" href="{{ path "/admin/static/favicon.ico" }}" type="image/x-icon">
+        <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+        <script src="{{ path "/admin/static/main.js" }}" defer></script>
+    </head>
+    <body class="font-mono leading-4 text-base text-gray-800 bg-zinc-50">
+        <div class="container mx-auto min-w-min space-y-5 p-5">
+            <div class="border-b-2 border-gray-300">
+                <a href="{{ path "/admin/home" }}">
+                    <img class="mx-auto w-[400px]" src="{{ path "/admin/static/gonic.png" }}" alt="substream">
+                </a>
+            </div>
+            {{ range $flash := .Flashes }}
+                {{ $colour := "bg-emerald-100/50 border-emerald-500/20" }}
+                {{ if eq $flash.Type "warning" }}{{ $colour = "bg-rose-100/50 border-rose-500/20" }}{{ end }}
+                <div class="p-4 border shadow-sm {{ $colour }} inline-flex items-center gap-x-3 w-full">
+                    <span class="text-zinc-500 w-5">
+                        <svg class="fill-current aspect-square" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM216 336h24V272H216c-13.3 0-24-10.7-24-24s10.7-24 24-24h48c13.3 0 24 10.7 24 24v88h8c13.3 0 24 10.7 24 24s-10.7 24-24 24H216c-13.3 0-24-10.7-24-24s10.7-24 24-24zm40-208a32 32 0 1 1 0 64 32 32 0 1 1 0-64z"/></svg>
+                    </span>
+                    <span>{{ $flash.Message }}</span>
+                </div>
+            {{ end }}
+{{ end }}
+
+{{ define "nav" }}
+            <div class="px-4 text-gray-500 text-right whitespace-nowrap">
+                welcome {{ .User.Name }}
+                &#124;
+                <a class="text-blue-500" href="{{ path "/admin/home" }}">home&#8230;</a>
+                &#124;
+                {{ if .User.IsAdmin }}
+                <a class="text-blue-500" href="{{ path "/admin/proxies" }}">proxies&#8230;</a>
+                &#124;
+                {{ end }}
+                <a class="text-blue-500" href="{{ path "/admin/logout" }}">logout&#8230;</a>
+            </div>
+{{ end }}
+
+{{ define "foot" }}
+            <div class="px-5 text-right whitespace-nowrap text-xs">
+                <span class="text-gray-400">v{{ .Version }}</span>
+                <span class="text-gray-400">&#124;</span>
+                <a class="text-blue-500" href="https://github.com/sentriz/gonic" target="_blank" rel="noopener noreferrer">original project</a>
+            </div>
+        </div>
+    </body>
+</html>
+{{ end }}
