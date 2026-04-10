@@ -118,75 +118,9 @@ func (p *Pool) pick() (string, error) {
 	return p.instances[0].url, nil
 }
 
-// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries.
-// It now accepts an optional clientIP to set X-Forwarded-For for Tidal's IP-locked streaming.
-func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result interface{}, clientIP string) error {
-	var lastErr error
-	for i := 0; i < 3; i++ {
-		base, err := p.pick()
-		if err != nil {
-			return err
-		}
-
-		u := base + path
-		if len(query) > 0 {
-			u += "?" + query.Encode()
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-		if err != nil {
-			return fmt.Errorf("build request: %w", err)
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-		if clientIP != "" {
-			req.Header.Set("X-Forwarded-For", clientIP)
-			req.Header.Set("X-Real-IP", clientIP)
-		}
-
-		resp, err := p.client.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("upstream %s (try %d) returned %d: %s", path, i+1, resp.StatusCode, string(body))
-			if resp.StatusCode == 404 { // don't retry on 404
-				return lastErr
-			}
-			continue
-		}
-
-		// Envelope handling: many hifi-api endpoints wrap data in a top-level JSON
-		var envelope struct {
-			Data json.RawMessage `json:"data"`
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return fmt.Errorf("read body: %w", err)
-		}
-
-		if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
-			if err := json.Unmarshal(envelope.Data, result); err == nil {
-				return nil
-			}
-		}
-
-		// Fallback: try unmarshaling directly into result
-		if err := json.Unmarshal(body, result); err != nil {
-			return fmt.Errorf("decode result: %w (body: %s)", err, string(body))
-		}
-		return nil
-	}
-	return lastErr
-}
-
-// apiGetRaw returns the raw body as bytes with retries.
-// It now accepts an optional clientIP to set X-Forwarded-For.
-func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
+// doFetchRaw performs a GET request with retries and returns the raw body bytes.
+// It handles proxy selection, URL construction, header injection, and the 3-attempt retry loop.
+func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
 	var lastErr error
 	for i := 0; i < 3; i++ {
 		base, err := p.pick()
@@ -230,6 +164,38 @@ func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values, cli
 		return body, err
 	}
 	return nil, lastErr
+}
+
+// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries.
+// It now accepts an optional clientIP to set X-Forwarded-For for Tidal's IP-locked streaming.
+func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result interface{}, clientIP string) error {
+	body, err := p.doFetchRaw(ctx, path, query, clientIP)
+	if err != nil {
+		return err
+	}
+
+	// Envelope handling: many hifi-api endpoints wrap data in a top-level JSON
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+		if err := json.Unmarshal(envelope.Data, result); err == nil {
+			return nil
+		}
+	}
+
+	// Fallback: try unmarshaling directly into result
+	if err := json.Unmarshal(body, result); err != nil {
+		return fmt.Errorf("decode result: %w (body: %s)", err, string(body))
+	}
+	return nil
+}
+
+// apiGetRaw returns the raw body as bytes with retries.
+// It now accepts an optional clientIP to set X-Forwarded-For.
+func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
+	return p.doFetchRaw(ctx, path, query, clientIP)
 }
 
 // =====================================================================
