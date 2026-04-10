@@ -399,6 +399,7 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
+			log.Printf("[TIDAL] GetStreamURL track=%d try=%d quality=%s", trackID, try, qStr)
 
 			// 1. Try V2 OpenAPI Manifests first (HLS)
 			v2Ctx, v2Cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -439,16 +440,25 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 			if err == nil {
 				if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
 					lastErr = fmt.Errorf("proxy returned PREVIEW (V2)")
+					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW returned (V2)", trackID)
 					break // try next proxy in outer loop
 				}
-				if v2Response.Data.Attributes.URI != "" {
-					return v2Response.Data.Attributes.URI, nil
+				// V2 URI is often a manifest URL (manifest.tidal.com), not direct audio.
+				// Only use it if it's a direct audio URL (contains audio file extension or CDN pattern).
+				uri := v2Response.Data.Attributes.URI
+				if uri != "" && !strings.Contains(uri, "manifest.tidal.com") && !strings.Contains(uri, "/manifests/") {
+					log.Printf("[TIDAL] GetStreamURL track=%d got direct URI via V2: %s...", trackID, uri[:min(50, len(uri))])
+					return uri, nil
+				}
+				if uri != "" {
+					log.Printf("[TIDAL] GetStreamURL track=%d V2 URI is manifest URL, skipping to V1: %s...", trackID, uri[:min(50, len(uri))])
 				}
 				if v2Response.Data.Attributes.Manifest != "" {
-					u, err := parseManifestURL(v2Response.Data.Attributes.ManifestMimeType, v2Response.Data.Attributes.Manifest)
-					if err == nil {
+					u, err := parseManifestURL(trackID, "V2", v2Response.Data.Attributes.ManifestMimeType, v2Response.Data.Attributes.Manifest)
+					if err == nil && u != "" && !strings.Contains(u, "manifest.tidal.com") {
 						return u, nil
 					}
+					log.Printf("[TIDAL] GetStreamURL track=%d V2 manifest parse error or manifest URL: %v", trackID, err)
 				}
 			}
 
@@ -463,13 +473,16 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 			if err := p.apiGet(ctx, "/track/", q, &stream, clientIP); err == nil {
 				if stream.TrackPresentation == "PREVIEW" {
 					lastErr = fmt.Errorf("proxy returned PREVIEW (V1)")
+					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW returned (V1)", trackID)
 					break // try next proxy in outer loop
 				}
-				u, err := parseManifestURL(stream.ManifestMimeType, stream.Manifest)
+				u, err := parseManifestURL(trackID, "V1", stream.ManifestMimeType, stream.Manifest)
 				if err == nil {
+					log.Printf("[TIDAL] GetStreamURL track=%d got URL via V1 manifest: %s...", trackID, u[:min(50, len(u))])
 					return u, nil
 				}
 				lastErr = err
+				log.Printf("[TIDAL] GetStreamURL track=%d V1 manifest parse error: %v", trackID, err)
 			} else {
 				lastErr = err
 			}
@@ -477,6 +490,13 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 	}
 
 	return "", fmt.Errorf("could not get full stream after retries: %v", lastErr)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (p *Pool) GetCoverURL(coverUUID string, size int) string {
@@ -610,7 +630,7 @@ func (p *Pool) GetLyrics(ctx context.Context, trackID int) (*TidalLyrics, error)
 }
 
 // Manifest Parsing
-func parseManifestURL(mimeType, manifest string) (string, error) {
+func parseManifestURL(trackID int, version, mimeType, manifest string) (string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(manifest)
 	if err != nil {
 		decoded, err = base64.RawStdEncoding.DecodeString(manifest)
@@ -620,6 +640,10 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 	}
 
 	content := string(decoded)
+	contentPreview := content
+	if len(contentPreview) > 100 {
+		contentPreview = contentPreview[:100] + "..."
+	}
 
 	// DASH manifest: look for <BaseURL>
 	if strings.Contains(content, "<BaseURL>") {
@@ -627,7 +651,9 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 		end := strings.Index(content[start:], "</BaseURL>")
 		if end > 0 {
 			u := content[start : start+end]
-			return strings.ReplaceAll(u, "&amp;", "&"), nil
+			url := strings.ReplaceAll(u, "&amp;", "&")
+			log.Printf("[TIDAL] parseManifestURL track=%d %s: DASH BaseURL found: %s...", trackID, version, url[:min(50, len(url))])
+			return url, nil
 		}
 	}
 
@@ -640,9 +666,13 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 				end := strings.IndexAny(line[start:], " \"'<>")
 				if end > 0 {
 					u := line[start : start+end]
-					return strings.ReplaceAll(u, "&amp;", "&"), nil
+					url := strings.ReplaceAll(u, "&amp;", "&")
+					log.Printf("[TIDAL] parseManifestURL track=%d %s: XML fallback found: %s...", trackID, version, url[:min(50, len(url))])
+					return url, nil
 				}
-				return strings.ReplaceAll(line[start:], "&amp;", "&"), nil
+				url := strings.ReplaceAll(line[start:], "&amp;", "&")
+				log.Printf("[TIDAL] parseManifestURL track=%d %s: XML fallback (no end): %s...", trackID, version, url[:min(50, len(url))])
+				return url, nil
 			}
 		}
 	}
@@ -655,9 +685,11 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 		}
 		if err := json.Unmarshal(decoded, &manifestData); err == nil {
 			if manifestData.URL != "" {
+				log.Printf("[TIDAL] parseManifestURL track=%d %s: JSON url found: %s...", trackID, version, manifestData.URL[:min(50, len(manifestData.URL))])
 				return manifestData.URL, nil
 			}
 			if len(manifestData.URLs) > 0 {
+				log.Printf("[TIDAL] parseManifestURL track=%d %s: JSON urls[0] found: %s...", trackID, version, manifestData.URLs[0][:min(50, len(manifestData.URLs[0]))])
 				return manifestData.URLs[0], nil
 			}
 		}
@@ -667,6 +699,7 @@ func parseManifestURL(mimeType, manifest string) (string, error) {
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "http") {
+			log.Printf("[TIDAL] parseManifestURL track=%d %s: M3U8 found: %s...", trackID, version, line[:min(50, len(line))])
 			return line, nil
 		}
 	}

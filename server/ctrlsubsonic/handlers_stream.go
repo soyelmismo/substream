@@ -82,6 +82,11 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	}
 	log.Printf("[STREAM] URL: track=%d quality=%s url_hash=%s", id.Value, tidalQuality, urlHash)
 
+	// Debug: log full URL if it looks suspicious (no query params or very short)
+	if len(streamURL) < 50 || !strings.Contains(streamURL, "?") {
+		log.Printf("[STREAM] DEBUG: track=%d full_url=%q", id.Value, streamURL)
+	}
+
 	// Check if we should proxy or redirect based on settings (cached)
 	settingStart := time.Now()
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
