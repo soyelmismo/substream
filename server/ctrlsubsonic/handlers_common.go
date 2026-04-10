@@ -108,6 +108,18 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 		} else {
 			log.Printf("[SCROBBLE] SAVED play record for track=%d count=%d", id.Value, play.Count)
 		}
+
+		// Update album play stats if album is favorited
+		track, _ := c.proxy.GetTrackInfo(r.Context(), id.Value)
+		if track != nil && track.Album.ID != 0 {
+			var albumStar db.AlbumStar
+			if c.dbc.Where("user_id=? AND tidal_id=?", user.ID, track.Album.ID).First(&albumStar).Error == nil {
+				albumStar.LastPlayed = time.Now()
+				albumStar.PlayCount++
+				c.dbc.Save(&albumStar)
+				log.Printf("[SCROBBLE] Updated album %d stats: play_count=%d", track.Album.ID, albumStar.PlayCount)
+			}
+		}
 	}
 
 	// fetch track info for scrobbling (fire and forget if fails)

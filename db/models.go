@@ -23,9 +23,11 @@ type TrackStar struct {
 }
 
 type AlbumStar struct {
-	UserID   int       `gorm:"primary_key; auto_increment:false" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
-	TidalID  int       `gorm:"primary_key; auto_increment:false"`
-	StarDate time.Time `sql:"DEFAULT:current_timestamp"`
+	UserID     int       `gorm:"primary_key; auto_increment:false" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
+	TidalID    int       `gorm:"primary_key; auto_increment:false"`
+	StarDate   time.Time `sql:"DEFAULT:current_timestamp"`
+	LastPlayed time.Time `sql:"DEFAULT:NULL"` // last time any track from this album was played
+	PlayCount  int       `sql:"DEFAULT:0"`  // aggregated play count for this album
 }
 
 type ArtistStar struct {

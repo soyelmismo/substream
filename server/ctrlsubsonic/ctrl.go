@@ -126,6 +126,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 
 	// Browsing / Empty placeholders for mobile compatibility
 	c.Handle("/getGenres", chain(resp(c.ServeGetGenres)))
+	c.Handle("/getSongsByGenre", chain(resp(c.ServeGetSongsByGenre)))
 	c.Handle("/getInternetRadioStations", chain(resp(c.ServeGetInternetRadioStations)))
 	c.Handle("/getNewestPodcasts", chain(resp(c.ServeGetNewestPodcasts)))
 	c.Handle("/getPodcasts", chain(resp(c.ServeGetPodcasts)))

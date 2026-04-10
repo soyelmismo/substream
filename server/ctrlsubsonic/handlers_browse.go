@@ -1,8 +1,16 @@
 package ctrlsubsonic
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
+	"time"
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
@@ -10,6 +18,93 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 	"go.senan.xyz/gonic/tidalproxy"
 )
+
+const hotMonochromeURL = "https://hot.monochrome.tf"
+
+// hotAlbumItem represents an album item from hot.monochrome.tf
+type hotAlbumItem struct {
+	ID     int    `json:"id"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+}
+
+// hotAlbumSection represents a section from hot.monochrome.tf
+type hotAlbumSection struct {
+	Title string           `json:"title"`
+	Type  string           `json:"type"`
+	Items []hotAlbumItem   `json:"items"`
+}
+
+// hotAlbumResponse represents the response from hot.monochrome.tf/explore/genre
+type hotAlbumResponse struct {
+	Sections []hotAlbumSection `json:"sections"`
+}
+
+// fetchHotGenreAlbums fetches albums for a genre from hot.monochrome.tf
+func fetchHotGenreAlbums(ctx context.Context, genreName string, limit int) []hotAlbumItem {
+	// Map genre name to hot ID
+	genreMap := map[string]string{
+		"Hip-Hop": "hip_hop", "R&B / Soul": "rnb", "Blues": "blues",
+		"Classical": "classical", "Country": "country", "Dance & Electronic": "dance_electronic",
+		"Folk / Americana": "americana", "Global": "world", "Gospel / Christian": "gospel",
+		"Jazz": "jazz", "K-Pop": "kpop", "Kids": "kids", "Latin": "latin",
+		"Metal": "metal", "Pop": "pop", "Reggae / Dancehall": "reggae",
+		"Legacy": "retro", "Rock / Indie": "indierock",
+	}
+	
+	genreID, ok := genreMap[genreName]
+	if !ok {
+		// Try generic search if genre not in hot list
+		return nil
+	}
+	
+	reqURL := fmt.Sprintf("%s/explore/genre/?id=%s", hotMonochromeURL, url.QueryEscape(genreID))
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil
+	}
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+	
+	var data hotAlbumResponse
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil
+	}
+	
+	// Extract albums from sections
+	var albums []hotAlbumItem
+	for _, section := range data.Sections {
+		if section.Type == "ALBUM_LIST" {
+			for _, item := range section.Items {
+				if item.ID != 0 {
+					albums = append(albums, item)
+					if len(albums) >= limit {
+						break
+					}
+				}
+			}
+		}
+		if len(albums) >= limit {
+			break
+		}
+	}
+	
+	return albums
+}
 
 func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
@@ -182,10 +277,16 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 	size := p.GetOrInt("size", 10)
 	offset := p.GetOrInt("offset", 0)
 
+	// Normalize offset to be multiple of size to avoid duplicate items from buggy clients
+	// Round UP to next multiple to avoid showing same items again
+	if offset > 0 && offset%size != 0 {
+		offset = ((offset / size) + 1) * size
+	}
+
 	var albumIDs []int
 
 	switch listType {
-	case "starred":
+	case "starred", "newest":
 		var stars []db.AlbumStar
 		c.dbc.Where("user_id=?", user.ID).
 			Order("star_date DESC").
@@ -196,44 +297,21 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		}
 
 	case "recent":
-		var plays []db.Play
-		c.dbc.Select("DISTINCT tidal_id").
-			Where("user_id=?", user.ID).
-			Order("played_at DESC").
+		// Recently played favorited albums (by LastPlayed first, then star_date for never played)
+		var stars []db.AlbumStar
+		c.dbc.Where("user_id=?", user.ID).
+			Order("last_played DESC, star_date DESC").
 			Offset(offset).Limit(size).
-			Find(&plays)
-		// plays table stores track IDs, need to get album IDs from tracks
-		for _, p := range plays {
-			track, err := c.proxy.GetTrackInfo(r.Context(), p.TidalID)
-			if err != nil {
-				continue
-			}
-			albumIDs = appendUnique(albumIDs, track.Album.ID)
+			Find(&stars)
+		for _, s := range stars {
+			albumIDs = append(albumIDs, s.TidalID)
 		}
 
 	case "frequent":
-		var plays []db.Play
-		c.dbc.Select("DISTINCT tidal_id").
-			Where("user_id=?", user.ID).
-			Order("count DESC").
-			Offset(offset).Limit(size*2).
-			Find(&plays)
-		for _, p := range plays {
-			track, err := c.proxy.GetTrackInfo(r.Context(), p.TidalID)
-			if err != nil {
-				continue
-			}
-			albumIDs = appendUnique(albumIDs, track.Album.ID)
-			if len(albumIDs) >= size {
-				break
-			}
-		}
-
-	case "newest":
-		// newest starred albums
+		// Most played favorited albums (by PlayCount, 0 at end)
 		var stars []db.AlbumStar
 		c.dbc.Where("user_id=?", user.ID).
-			Order("star_date DESC").
+			Order("play_count DESC, star_date DESC").
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
@@ -241,27 +319,56 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		}
 
 	case "alphabeticalByName", "alphabeticalByArtist":
-		// for tidal proxy, we treat these as just "all starred" since we don't have a local library
+		// Get all starred albums
 		var stars []db.AlbumStar
 		c.dbc.Where("user_id=?", user.ID).
 			Order("star_date DESC").
 			Find(&stars)
-
-		// we fetch all and sort later or just return in star order for now
-		// but we must honor offset/limit
-		start := offset
-		if start >= len(stars) {
+		
+		if len(stars) == 0 {
 			break
 		}
-		end := start + size
-		if end > len(stars) {
-			end = len(stars)
+		
+		// Fetch all album metadata to sort properly
+		allAlbumIDs := make([]int, len(stars))
+		for i, s := range stars {
+			allAlbumIDs[i] = s.TidalID
 		}
-		for _, s := range stars[start:end] {
-			albumIDs = append(albumIDs, s.TidalID)
+		
+		// Use fast fetch with timeout
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		allAlbums := c.batchFetchAlbumsWithContext(ctx, allAlbumIDs)
+		cancel()
+		
+		// Sort by name or artist
+		if listType == "alphabeticalByName" {
+			sort.Slice(allAlbums, func(i, j int) bool {
+				return strings.ToLower(allAlbums[i].Name) < strings.ToLower(allAlbums[j].Name)
+			})
+		} else {
+			sort.Slice(allAlbums, func(i, j int) bool {
+				return strings.ToLower(allAlbums[i].Artist) < strings.ToLower(allAlbums[j].Artist)
+			})
+		}
+		
+		// Apply offset/limit
+		start := offset
+		if start >= len(allAlbums) {
+			albumIDs = nil
+		} else {
+			end := start + size
+			if end > len(allAlbums) {
+				end = len(allAlbums)
+			}
+			for _, a := range allAlbums[start:end] {
+				if a.ID != nil {
+					albumIDs = append(albumIDs, a.ID.Value)
+				}
+			}
 		}
 
 	case "random":
+		// Fast random - limit to avoid timeout
 		var stars []db.AlbumStar
 		c.dbc.Where("user_id=?", user.ID).
 			Order("RANDOM()").
@@ -281,8 +388,117 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			albumIDs = append(albumIDs, r.TidalID)
 		}
 
+	case "byYear":
+		// Filter albums by year range
+		fromYear := p.GetOrInt("fromYear", 0)
+		toYear := p.GetOrInt("toYear", 3000)
+		
+		// Determine actual min/max for filtering
+		minYear, maxYear := fromYear, toYear
+		if fromYear > toYear {
+			minYear, maxYear = toYear, fromYear
+		}
+		
+		// Get all starred albums
+		var stars []db.AlbumStar
+		c.dbc.Where("user_id=?", user.ID).Find(&stars)
+		
+		if len(stars) == 0 {
+			break
+		}
+		
+		// Fetch album metadata to get years
+		allAlbumIDs := make([]int, len(stars))
+		for i, s := range stars {
+			allAlbumIDs[i] = s.TidalID
+		}
+		
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		allAlbums := c.batchFetchAlbumsWithContext(ctx, allAlbumIDs)
+		cancel()
+		
+		// Filter by year range
+		var filtered []*spec.Album
+		for _, a := range allAlbums {
+			if a.Year >= minYear && a.Year <= maxYear {
+				filtered = append(filtered, a)
+			}
+		}
+		
+		// Sort by year (ascending if fromYear < toYear, descending otherwise)
+		if fromYear < toYear {
+			sort.Slice(filtered, func(i, j int) bool {
+				return filtered[i].Year < filtered[j].Year
+			})
+		} else {
+			sort.Slice(filtered, func(i, j int) bool {
+				return filtered[i].Year > filtered[j].Year
+			})
+		}
+		
+		// Apply offset/limit
+		start := offset
+		if start < len(filtered) {
+			end := start + size
+			if end > len(filtered) {
+				end = len(filtered)
+			}
+			for _, a := range filtered[start:end] {
+				if a.ID != nil {
+					albumIDs = append(albumIDs, a.ID.Value)
+				}
+			}
+		}
+
+	case "byGenre":
+		genre, _ := p.Get("genre")
+		if genre == "" {
+			break
+		}
+		
+		// Cap max albums per genre to avoid infinite scroll issues
+		const maxGenreAlbums = 50
+		if offset >= maxGenreAlbums {
+			log.Printf("[GENRE] Max albums reached for %s at offset %d", genre, offset)
+			break
+		}
+		
+		// Limit size to not exceed max
+		if offset+size > maxGenreAlbums {
+			size = maxGenreAlbums - offset
+		}
+		
+		// Try hot.monochrome.tf first for discovery
+		hotAlbums := fetchHotGenreAlbums(r.Context(), genre, maxGenreAlbums)
+		if len(hotAlbums) > offset {
+			log.Printf("[GENRE] hot.monochrome.tf returned %d albums for %s (offset %d, size %d)", len(hotAlbums), genre, offset, size)
+			// Apply offset/limit locally with deduplication
+			start := offset
+			end := offset + size
+			if end > len(hotAlbums) {
+				end = len(hotAlbums)
+			}
+			seen := make(map[int]bool)
+			for _, a := range hotAlbums[start:end] {
+				if a.ID != 0 && !seen[a.ID] {
+					seen[a.ID] = true
+					albumIDs = append(albumIDs, a.ID)
+				}
+			}
+		} else {
+			log.Printf("[GENRE] hot.monochrome.tf exhausted for %s at offset %d", genre, offset)
+			// Try Tidal search as fallback
+			albums, err := c.proxy.SearchAlbums(r.Context(), genre, size, offset)
+			if err == nil {
+				for _, a := range albums {
+					if a.ID != 0 {
+						albumIDs = append(albumIDs, a.ID)
+					}
+				}
+			}
+		}
+
 	default:
-		// Fallback to starred for anything else like alphabeticalByName if not specifically handled
 		var stars []db.AlbumStar
 		c.dbc.Where("user_id=?", user.ID).
 			Order("star_date DESC").

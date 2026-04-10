@@ -6,9 +6,13 @@
     "Name" "creating new user"
 ) }}
     <form class="flex flex-col gap-2 items-end" action="{{ path "/admin/create_user_do" }}" method="post">
-        <input type="text" id="username" name="username" placeholder="username">
-        <input type="password" id="password_one" name="password_one" placeholder="password">
-        <input type="password" id="password_two" name="password_two" placeholder="verify password">
+        <input type="text" id="username" name="username" placeholder="username" required>
+        <input type="password" id="password_one" name="password_one" placeholder="password" required>
+        <input type="password" id="password_two" name="password_two" placeholder="verify password" required>
+        <select name="role" id="role" style="width: 100%;">
+            <option value="user" selected>regular user</option>
+            <option value="admin">admin user</option>
+        </select>
         <input type="submit" value="create">
     </form>
 {{ end }}

@@ -96,6 +96,7 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resol
 	c.Handle("/unlink_listenbrainz_do", userChain(resp(c.ServeUnlinkListenBrainzDo)))
 
 	// admin routes (if session is valid, and is admin)
+	c.Handle("/create_user", adminChain(resp(c.ServeCreateUser)))
 	c.Handle("/create_user_do", adminChain(resp(c.ServeCreateUserDo)))
 
 	// admin proxies

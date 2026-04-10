@@ -1,6 +1,7 @@
 package ctrlsubsonic
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -116,6 +117,53 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 			tid := tidalIDs[i]
 			c.applyAlbumStar(user.ID, a)
 			a.UserRating = c.getAlbumRating(user.ID, tid)
+			albums = append(albums, a)
+		}
+	}
+	return albums
+}
+
+// batchFetchAlbumsWithContext fetches metadata with custom context (for timeout control)
+func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs []int) []*spec.Album {
+	if len(tidalIDs) == 0 {
+		return nil
+	}
+
+	type result struct {
+		idx   int
+		album *spec.Album
+	}
+
+	results := make(chan result, len(tidalIDs))
+	var wg sync.WaitGroup
+
+	for i, id := range tidalIDs {
+		wg.Add(1)
+		go func(idx, tid int) {
+			defer wg.Done()
+			
+			info, err := c.proxy.GetAlbumInfo(ctx, tid)
+			if err != nil {
+				return
+			}
+			a := spec.NewAlbumFromTidal(info)
+			results <- result{idx: idx, album: a}
+		}(i, id)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	ordered := make([]*spec.Album, len(tidalIDs))
+	for r := range results {
+		ordered[r.idx] = r.album
+	}
+
+	var albums []*spec.Album
+	for _, a := range ordered {
+		if a != nil {
 			albums = append(albums, a)
 		}
 	}

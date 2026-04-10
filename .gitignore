@@ -18,3 +18,4 @@ substream
 .fuse*
 *.pem
 substream_linux
+*.key

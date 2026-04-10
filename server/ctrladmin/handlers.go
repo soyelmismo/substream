@@ -256,9 +256,16 @@ func (c *Controller) ServeCreateUserDo(r *http.Request) *Response {
 			flashW:   []string{err.Error()},
 		}
 	}
+	
+	// Check role selection
+	roleVal := r.FormValue("role")
+	log.Printf("[ADMIN] Creating user %s, role: %q", username, roleVal)
+	isAdmin := roleVal == "admin"
+	
 	user := db.User{
 		Name:     username,
 		Password: passwordOne,
+		IsAdmin:  isAdmin,
 	}
 	if err := c.dbc.Create(&user).Error; err != nil {
 		return &Response{
@@ -266,7 +273,15 @@ func (c *Controller) ServeCreateUserDo(r *http.Request) *Response {
 			flashW:   []string{fmt.Sprintf("could not create user %q: %v", username, err)},
 		}
 	}
-	return &Response{redirect: "/admin/home"}
+	
+	role := "user"
+	if isAdmin {
+		role = "admin"
+	}
+	return &Response{
+		redirect: "/admin/home",
+		flashN:   []string{fmt.Sprintf("created %s %q successfully", role, username)},
+	}
 }
 
 func getAvatarFile(r *http.Request) ([]byte, error) {
