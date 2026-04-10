@@ -67,6 +67,14 @@ var (
 	// Genre counts change slowly, so 5 minutes is reasonable for freshness vs load.
 	genreCountsCacheTTL = 5 * time.Minute
 
+	// genreAlbumCacheTTL is the time-to-live for genre album caches before they expire.
+	// Album metadata changes infrequently, so 1 hour balances freshness with API rate limiting.
+	genreAlbumCacheTTL = time.Hour
+
+	// searchCacheTTL is the time-to-live for search result caches before they expire.
+	// Search results can become stale as library changes, so 5 minutes is reasonable.
+	searchCacheTTL = 5 * time.Minute
+
 	// genreFetchTimeout is the timeout for genre track fetching from hot.monochrome.tf.
 	// Short timeout ensures quick fallback to local content.
 	genreFetchTimeout = 3 * time.Second

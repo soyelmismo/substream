@@ -17,7 +17,6 @@ type cachedSearch struct {
 	tracks  []spec.TrackChild
 	artists []spec.Artist
 	albums  []spec.Album
-	expiresAt time.Time
 }
 
 func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
@@ -34,14 +33,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	var fromCache bool
 
 	// Check cache
-	if val, ok := c.searchCache.Load(query); ok {
-		cached := val.(cachedSearch)
-		if time.Now().Before(cached.expiresAt) {
-			tracks = cached.tracks
-			artists = cached.artists
-			albums = cached.albums
-			fromCache = true
-		}
+	if cached := c.searchCache.Get(query); len(cached.tracks) > 0 || len(cached.artists) > 0 || len(cached.albums) > 0 {
+		tracks = cached.tracks
+		artists = cached.artists
+		albums = cached.albums
+		fromCache = true
 	}
 
 
@@ -321,12 +317,11 @@ favLoop:
 	}
 
 	if !fromCache && (len(tracks) > 0 || len(artists) > 0 || len(albums) > 0) {
-		c.searchCache.Store(query, cachedSearch{
-			tracks:    tracks,
-			artists:   artists,
-			albums:    albums,
-			expiresAt: time.Now().Add(1 * time.Minute),
-		})
+		c.searchCache.Set(query, cachedSearch{
+			tracks:  tracks,
+			artists: artists,
+			albums:  albums,
+		}, 0) // Use default TTL
 	}
 
 	log.Printf("[SUBS] Search results ready for query %q: tracks=%d artists=%d albums=%d", query, len(tracks), len(artists), len(albums))

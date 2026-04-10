@@ -191,7 +191,7 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 
 	// negative cache: avoid re-fetching covers we know are missing
 	negKey := fmt.Sprintf("neg-%s-%d", id.Type, id.Value)
-	if _, negHit := c.searchCache.Load(negKey); negHit {
+	if c.negCoverCache.Get(negKey) {
 		w.Header().Set("Content-Type", "image/gif")
 		w.Header().Set("Cache-Control", "public, max-age=3600")
 		w.Write(transparentPixel)
@@ -278,7 +278,7 @@ func (c *Controller) fetchAndCacheCover(ctx context.Context, id *specid.ID, size
 	}
 
 	if coverUUID == "" {
-		c.searchCache.Store(negKey, true)
+		c.negCoverCache.Set(negKey, true, 0)
 		return nil, fmt.Errorf("no cover found")
 	}
 

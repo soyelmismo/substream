@@ -395,11 +395,11 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		
 		// Try hot.monochrome.tf first for discovery - use cache
 		cacheKey := fmt.Sprintf("genre_albums_%s", genreID)
-		allAlbums := c.genreAlbumCache.get(cacheKey)
-		if allAlbums == nil {
+		allAlbums := c.genreAlbumCache.Get(cacheKey)
+		if len(allAlbums) == 0 {
 			allAlbums = c.fetchHotAlbumsWithFilter(r.Context(), maxGenreAlbums, "new", genreID)
 			if len(allAlbums) > 0 {
-				c.genreAlbumCache.set(cacheKey, allAlbums, 10*time.Minute)
+				c.genreAlbumCache.Set(cacheKey, allAlbums, 10*time.Minute)
 			}
 		}
 		
@@ -494,16 +494,16 @@ func (c *Controller) fetchHotFallback(ctx context.Context, albumIDs []int, neede
 	
 	// Use cache key based on filter type
 	cacheKey := fmt.Sprintf("fallback_%s", filter)
-	cachedAlbums := c.genreAlbumCache.get(cacheKey)
+	cachedAlbums := c.genreAlbumCache.Get(cacheKey)
 	
-	if cachedAlbums == nil {
+	if len(cachedAlbums) == 0 {
 		// Use random genre for non-specific fallback cases
 		genres := []string{"pop", "electronic", "rock", "hip_hop", "rnb"}
 		genre := genres[rand.Intn(len(genres))]
 		
 		cachedAlbums = c.fetchHotAlbumsWithFilter(ctx, 50, filter, genre)
 		if len(cachedAlbums) > 0 {
-			c.genreAlbumCache.set(cacheKey, cachedAlbums, 15*time.Minute)
+			c.genreAlbumCache.Set(cacheKey, cachedAlbums, 15*time.Minute)
 		}
 	}
 	

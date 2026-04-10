@@ -79,12 +79,6 @@ var defaultInternetRadioStations = []*spec.InternetRadioStation{
 	},
 }
 
-// cachedGenreCounts holds cached counts with timestamp
-type cachedGenreCounts struct {
-	counts    map[string]genreCount
-	timestamp time.Time
-}
-
 func (c *Controller) ServeGetGenres(r *http.Request) *spec.Response {
 	sub := spec.NewResponse()
 
@@ -122,26 +116,17 @@ type genreCount struct {
 // getCachedGenreCounts returns cached counts or fetches new ones if expired
 func (c *Controller) getCachedGenreCounts(ctx context.Context) map[string]genreCount {
 	// Check cache first
-	c.genreCountsCacheMu.RLock()
-	if c.genreCountsCache != nil && time.Since(c.genreCountsCache.timestamp) < genreCountsCacheTTL {
-		cache := c.genreCountsCache.counts
-		c.genreCountsCacheMu.RUnlock()
+	if cached := c.genreCountsCache.Get("counts"); len(cached) > 0 {
 		log.Printf("[GENRES] Using cached counts")
-		return cache
+		return cached
 	}
-	c.genreCountsCacheMu.RUnlock()
 
 	// Fetch fresh counts
 	log.Printf("[GENRES] Fetching fresh counts from hot.monochrome.tf")
 	fresh := fetchFreshGenreCounts(ctx, c.httpClient)
 
 	// Update cache
-	c.genreCountsCacheMu.Lock()
-	c.genreCountsCache = &cachedGenreCounts{
-		counts:    fresh,
-		timestamp: time.Now(),
-	}
-	c.genreCountsCacheMu.Unlock()
+	c.genreCountsCache.Set("counts", fresh, 0) // Use default TTL
 
 	return fresh
 }

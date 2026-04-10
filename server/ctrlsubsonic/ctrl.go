@@ -37,14 +37,14 @@ type Controller struct {
 	proxy        tidalproxy.TidalProxy
 	scrobblers   []scrobble.Scrobbler
 	cachePath    string
-	searchCache  sync.Map
+	searchCache  *Cache[cachedSearch]
 	proxySem     chan struct{}
 	coverLocks   sync.Map // dedup concurrent cover requests
 	httpClient   *http.Client // HTTP client for external requests
-	genreCache   *genreCache // Cache for genre tracks with LRU eviction
-	genreAlbumCache *genreAlbumCache // Cache for genre albums
-	genreCountsCache      *cachedGenreCounts // Cache for genre counts with TTL
-	genreCountsCacheMu    sync.RWMutex       // Mutex for genre counts cache
+	genreCache   *Cache[[]int] // Cache for genre tracks with LRU eviction
+	genreAlbumCache *Cache[[]tidalproxy.TidalAlbum] // Cache for genre albums
+	genreCountsCache *Cache[map[string]genreCount] // Cache for genre counts with TTL
+	negCoverCache *Cache[bool] // Negative cache for missing covers
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
@@ -66,8 +66,36 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 				IdleConnTimeout:     httpIdleConnTimeout,
 			},
 		},
-		genreCache: newGenreCache(maxGenreCacheSize),
-		genreAlbumCache: newGenreAlbumCache(20), // Cache up to 20 genres
+		genreCache: NewCache[[]int](CacheConfig{
+			Name:            "genre-tracks",
+			MaxSize:         maxGenreCacheSize,
+			DefaultTTL:      genreCacheTTL,
+			CleanupInterval: 5 * time.Minute,
+		}),
+		genreAlbumCache: NewCache[[]tidalproxy.TidalAlbum](CacheConfig{
+			Name:            "genre-albums",
+			MaxSize:         20,
+			DefaultTTL:      genreAlbumCacheTTL,
+			CleanupInterval: 5 * time.Minute,
+		}),
+		genreCountsCache: NewCache[map[string]genreCount](CacheConfig{
+			Name:            "genre-counts",
+			MaxSize:         10,
+			DefaultTTL:      genreCountsCacheTTL,
+			CleanupInterval: 5 * time.Minute,
+		}),
+		searchCache: NewCache[cachedSearch](CacheConfig{
+			Name:            "search",
+			MaxSize:         100,
+			DefaultTTL:      searchCacheTTL,
+			CleanupInterval: 5 * time.Minute,
+		}),
+		negCoverCache: NewCache[bool](CacheConfig{
+			Name:            "neg-covers",
+			MaxSize:         1000,
+			DefaultTTL:      time.Hour,
+			CleanupInterval: 10 * time.Minute,
+		}),
 	}
 
 	chain := handlerutil.Chain(
