@@ -16,6 +16,7 @@ import (
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
+	"go.senan.xyz/gonic/internal/cache"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -37,14 +38,14 @@ type Controller struct {
 	proxy        tidalproxy.TidalProxy
 	scrobblers   []scrobble.Scrobbler
 	cachePath    string
-	searchCache  *Cache[cachedSearch]
+	searchCache  *cache.Cache[cachedSearch]
 	proxySem     chan struct{}
 	coverLocks   sync.Map // dedup concurrent cover requests
 	httpClient   *http.Client // HTTP client for external requests
-	genreCache   *Cache[[]int] // Cache for genre tracks with LRU eviction
-	genreAlbumCache *Cache[[]tidalproxy.TidalAlbum] // Cache for genre albums
-	genreCountsCache *Cache[map[string]genreCount] // Cache for genre counts with TTL
-	negCoverCache *Cache[bool] // Negative cache for missing covers
+	genreCache   *cache.Cache[[]int] // Cache for genre tracks with LRU eviction
+	genreAlbumCache *cache.Cache[[]tidalproxy.TidalAlbum] // Cache for genre albums
+	genreCountsCache *cache.Cache[map[string]genreCount] // Cache for genre counts with TTL
+	negCoverCache *cache.Cache[bool] // Negative cache for missing covers
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
@@ -66,31 +67,31 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 				IdleConnTimeout:     httpIdleConnTimeout,
 			},
 		},
-		genreCache: NewCache[[]int](CacheConfig{
+		genreCache: cache.New[[]int](cache.Config{
 			Name:            "genre-tracks",
 			MaxSize:         maxGenreCacheSize,
 			DefaultTTL:      genreCacheTTL,
 			CleanupInterval: 5 * time.Minute,
 		}),
-		genreAlbumCache: NewCache[[]tidalproxy.TidalAlbum](CacheConfig{
+		genreAlbumCache: cache.New[[]tidalproxy.TidalAlbum](cache.Config{
 			Name:            "genre-albums",
 			MaxSize:         20,
 			DefaultTTL:      genreAlbumCacheTTL,
 			CleanupInterval: 5 * time.Minute,
 		}),
-		genreCountsCache: NewCache[map[string]genreCount](CacheConfig{
+		genreCountsCache: cache.New[map[string]genreCount](cache.Config{
 			Name:            "genre-counts",
 			MaxSize:         10,
 			DefaultTTL:      genreCountsCacheTTL,
 			CleanupInterval: 5 * time.Minute,
 		}),
-		searchCache: NewCache[cachedSearch](CacheConfig{
+		searchCache: cache.New[cachedSearch](cache.Config{
 			Name:            "search",
 			MaxSize:         100,
 			DefaultTTL:      searchCacheTTL,
 			CleanupInterval: 5 * time.Minute,
 		}),
-		negCoverCache: NewCache[bool](CacheConfig{
+		negCoverCache: cache.New[bool](cache.Config{
 			Name:            "neg-covers",
 			MaxSize:         1000,
 			DefaultTTL:      time.Hour,
