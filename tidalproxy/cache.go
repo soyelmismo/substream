@@ -2,38 +2,46 @@ package tidalproxy
 
 import (
 	"context"
-	"strconv"
+	"encoding/json"
+	"fmt"
 	"time"
 
+	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/internal/cache"
 )
 
-// CachedProxy wraps TidalProxy with type-safe LRU+TTL caches
+// metadataCacheTTL is the default TTL for persistent metadata cache (24 hours)
+const metadataCacheTTL = 86400
+
+// CachedProxy wraps TidalProxy with unified LRU+TTL caches + SQLite persistence
+// Keys use the format: td:tr:ID, td:al:ID, td:ar:ID for consistency with metadata_cache
 type CachedProxy struct {
 	TidalProxy
-	tracks     *cache.Cache[*TidalTrack]
-	albums     *cache.Cache[*TidalAlbum]
-	artists    *cache.Cache[*TidalArtistDetail]
-	albumArt   *cache.Cache[string] // int -> string UUID
-	albumCount *cache.Cache[int]    // artistID -> int (album count)
+	db         *db.DB               // Optional SQLite persistence (nil if not provided)
+	tracks     *cache.Cache[[]byte] // JSON serialized TidalTrack
+	albums     *cache.Cache[[]byte] // JSON serialized TidalAlbum
+	artists    *cache.Cache[[]byte] // JSON serialized TidalArtistDetail
+	albumArt   *cache.Cache[string] // td:al:ID -> cover UUID
+	albumCount *cache.Cache[int]    // td:ar:ID -> album count
 }
 
-func NewCachedProxy(base TidalProxy, ttl time.Duration) *CachedProxy {
+func NewCachedProxy(base TidalProxy, dbc *db.DB, ttl time.Duration) *CachedProxy {
 	return &CachedProxy{
 		TidalProxy: base,
-		tracks: cache.New[*TidalTrack](cache.Config{
+		db:         dbc,
+		tracks: cache.New[[]byte](cache.Config{
 			Name:            "tidal-tracks",
 			MaxSize:         500,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
-		albums: cache.New[*TidalAlbum](cache.Config{
+		albums: cache.New[[]byte](cache.Config{
 			Name:            "tidal-albums",
 			MaxSize:         200,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
-		artists: cache.New[*TidalArtistDetail](cache.Config{
+		artists: cache.New[[]byte](cache.Config{
 			Name:            "tidal-artists",
 			MaxSize:         100,
 			DefaultTTL:      ttl,
@@ -55,45 +63,121 @@ func NewCachedProxy(base TidalProxy, ttl time.Duration) *CachedProxy {
 }
 
 func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrack, error) {
-	key := strconv.Itoa(trackID)
+	key := fmt.Sprintf("td:tr:%d", trackID)
+
+	// 1. Check in-memory LRU cache
 	if cached := c.tracks.Get(key); cached != nil {
-		return cached, nil
+		var t TidalTrack
+		if err := json.Unmarshal(cached, &t); err == nil {
+			return &t, nil
+		}
 	}
+
+	// 2. Check SQLite persistent cache (if db available)
+	if c.db != nil {
+		if cached := c.db.GetCachedMetadata(key); cached != nil {
+			var t TidalTrack
+			if err := json.Unmarshal(cached, &t); err == nil {
+				c.tracks.Set(key, cached, 0) // Warm LRU cache
+				return &t, nil
+			}
+		}
+	}
+
+	// 3. Fetch from API
 	t, err := c.TidalProxy.GetTrackInfo(ctx, trackID)
 	if err == nil && t != nil {
-		c.tracks.Set(key, t, 0)
+		// Serialize to JSON
+		if data, err := json.Marshal(t); err == nil {
+			c.tracks.Set(key, data, 0)
+			// Write-through to SQLite (if db available)
+			if c.db != nil {
+				c.db.SetCachedMetadata(key, data, metadataCacheTTL)
+			}
+		}
 		if t.Album.Cover != "" {
-			c.albumArt.Set(strconv.Itoa(t.Album.ID), t.Album.Cover, 0)
+			c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
 		}
 	}
 	return t, err
 }
 
 func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error) {
-	key := strconv.Itoa(albumID)
+	key := fmt.Sprintf("td:al:%d", albumID)
+
+	// 1. Check in-memory LRU cache
 	if cached := c.albums.Get(key); cached != nil {
-		return cached, nil
-	}
-	t, err := c.TidalProxy.GetAlbumInfo(ctx, albumID)
-	if err == nil && t != nil {
-		c.albums.Set(key, t, 0)
-		if t.Cover != "" {
-			c.albumArt.Set(key, t.Cover, 0)
+		var a TidalAlbum
+		if err := json.Unmarshal(cached, &a); err == nil {
+			return &a, nil
 		}
 	}
-	return t, err
+
+	// 2. Check SQLite persistent cache (if db available)
+	if c.db != nil {
+		if cached := c.db.GetCachedMetadata(key); cached != nil {
+			var a TidalAlbum
+			if err := json.Unmarshal(cached, &a); err == nil {
+				c.albums.Set(key, cached, 0) // Warm LRU cache
+				return &a, nil
+			}
+		}
+	}
+
+	// 3. Fetch from API
+	a, err := c.TidalProxy.GetAlbumInfo(ctx, albumID)
+	if err == nil && a != nil {
+		// Serialize to JSON
+		if data, err := json.Marshal(a); err == nil {
+			c.albums.Set(key, data, 0)
+			// Write-through to SQLite (if db available)
+			if c.db != nil {
+				c.db.SetCachedMetadata(key, data, metadataCacheTTL)
+			}
+		}
+		// Cache album art with consistent key format
+		if a.Cover != "" {
+			c.albumArt.Set(key, a.Cover, 0)
+		}
+	}
+	return a, err
 }
 
 func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error) {
-	key := strconv.Itoa(artistID)
+	key := fmt.Sprintf("td:ar:%d", artistID)
+
+	// 1. Check in-memory LRU cache
 	if cached := c.artists.Get(key); cached != nil {
-		return cached, nil
+		var a TidalArtistDetail
+		if err := json.Unmarshal(cached, &a); err == nil {
+			return &a, nil
+		}
 	}
-	t, err := c.TidalProxy.GetArtistInfo(ctx, artistID)
-	if err == nil && t != nil {
-		c.artists.Set(key, t, 0)
+
+	// 2. Check SQLite persistent cache (if db available)
+	if c.db != nil {
+		if cached := c.db.GetCachedMetadata(key); cached != nil {
+			var a TidalArtistDetail
+			if err := json.Unmarshal(cached, &a); err == nil {
+				c.artists.Set(key, cached, 0) // Warm LRU cache
+				return &a, nil
+			}
+		}
 	}
-	return t, err
+
+	// 3. Fetch from API
+	a, err := c.TidalProxy.GetArtistInfo(ctx, artistID)
+	if err == nil && a != nil {
+		// Serialize to JSON
+		if data, err := json.Marshal(a); err == nil {
+			c.artists.Set(key, data, 0)
+			// Write-through to SQLite (if db available)
+			if c.db != nil {
+				c.db.SetCachedMetadata(key, data, metadataCacheTTL)
+			}
+		}
+	}
+	return a, err
 }
 
 // GetMirrorManager returns the underlying MirrorManager if the base is a Pool
@@ -105,7 +189,7 @@ func (c *CachedProxy) GetMirrorManager() *MirrorManager {
 }
 
 func (c *CachedProxy) GetCoverUUIDForAlbum(ctx context.Context, albumID int) string {
-	key := strconv.Itoa(albumID)
+	key := fmt.Sprintf("td:al:%d", albumID)
 	if cached := c.albumArt.Get(key); cached != "" {
 		return cached
 	}
@@ -121,7 +205,7 @@ func (c *CachedProxy) SearchAlbums(ctx context.Context, query string, limit, off
 	if err == nil {
 		for _, a := range albums {
 			if a.Cover != "" {
-				c.albumArt.Set(strconv.Itoa(a.ID), a.Cover, 0)
+				c.albumArt.Set(fmt.Sprintf("td:al:%d", a.ID), a.Cover, 0)
 			}
 		}
 	}
@@ -133,7 +217,7 @@ func (c *CachedProxy) SearchTracks(ctx context.Context, query string, limit, off
 	if err == nil {
 		for _, t := range tracks {
 			if t.Album.Cover != "" {
-				c.albumArt.Set(strconv.Itoa(t.Album.ID), t.Album.Cover, 0)
+				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
 			}
 		}
 	}
@@ -146,13 +230,13 @@ func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTra
 		if len(page.Albums.Items) > 0 {
 			for _, a := range page.Albums.Items {
 				if a.Cover != "" {
-					c.albumArt.Set(strconv.Itoa(a.ID), a.Cover, 0)
+					c.albumArt.Set(fmt.Sprintf("td:al:%d", a.ID), a.Cover, 0)
 				}
 			}
 		}
 		for _, t := range page.Tracks {
 			if t.Album.Cover != "" {
-				c.albumArt.Set(strconv.Itoa(t.Album.ID), t.Album.Cover, 0)
+				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
 			}
 		}
 	}
@@ -164,7 +248,7 @@ func (c *CachedProxy) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack
 	if err == nil {
 		for _, t := range tracks {
 			if t.Album.Cover != "" {
-				c.albumArt.Set(strconv.Itoa(t.Album.ID), t.Album.Cover, 0)
+				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
 			}
 		}
 	}
@@ -176,7 +260,7 @@ func (c *CachedProxy) GetRecommendations(ctx context.Context, trackID int) ([]Ti
 	if err == nil {
 		for _, t := range tracks {
 			if t.Album.Cover != "" {
-				c.albumArt.Set(strconv.Itoa(t.Album.ID), t.Album.Cover, 0)
+				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
 			}
 		}
 	}
@@ -188,7 +272,7 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 	if err == nil {
 		for _, t := range tracks {
 			if t.Album.Cover != "" {
-				c.albumArt.Set(strconv.Itoa(t.Album.ID), t.Album.Cover, 0)
+				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
 			}
 		}
 	}
@@ -197,7 +281,7 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 
 // GetArtistAlbumCount returns cached album count for an artist, fetching if needed
 func (c *CachedProxy) GetArtistAlbumCount(ctx context.Context, artistID int) int {
-	key := strconv.Itoa(artistID)
+	key := fmt.Sprintf("td:ar:%d", artistID)
 	if cached := c.albumCount.Get(key); cached != 0 {
 		return cached
 	}

@@ -426,27 +426,32 @@ func MigrateDropTidalID(db *gorm.DB) error {
 	return nil
 }
 
-// MigrateCleanupOldCacheKeys removes metadata_cache entries with old key format
-// Old format: "artist:12345", "album:12345", "track:12345"
-// New format: "artist:td:ar:12345", "album:td:al:12345", "track:td:tr:12345"
+// MigrateCleanupOldCacheKeys removes metadata_cache entries with old key formats
+// Old formats: "artist:td:ar:12345", "album:td:al:12345", "track:td:tr:12345" (with type prefix)
+//
+//	"artist:12345", "album:12345", "track:12345" (numeric only)
+//
+// New format: "td:ar:12345", "td:al:12345", "td:tr:12345" (clean URI format)
 func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
 	// Check if migration has already been run
 	var setting Setting
-	err := db.Where("key = ?", "cleanup_old_cache_keys_completed").First(&setting).Error
+	err := db.Where("key = ?", "cleanup_v2_cache_keys_completed").First(&setting).Error
 	if err == nil && setting.Value == "true" {
 		return nil
 	}
 
 	log.Printf("[MIGRATION] Cleaning up old cache key formats...")
 
-	// Delete keys that match old format: artist:NUMBER, album:NUMBER, track:NUMBER
-	// These patterns have only one colon, while new format has two colons
+	// Delete keys with old type-prefixed format: artist:td:ar:*, album:td:al:*, track:td:tr:*
+	// Also clean any other non-standard formats
 	result := db.Exec(`
 		DELETE FROM metadata_cache 
-		WHERE key LIKE 'artist:_%' 
-		   OR key LIKE 'album:_%' 
-		   OR key LIKE 'track:_%'
-		   AND key NOT LIKE '%:%:%'
+		WHERE key LIKE 'artist:td:ar:%' 
+		   OR key LIKE 'album:td:al:%' 
+		   OR key LIKE 'track:td:tr:%'
+		   OR key GLOB 'artist:[0-9]*'
+		   OR key GLOB 'album:[0-9]*'
+		   OR key GLOB 'track:[0-9]*'
 	`)
 	if result.Error != nil {
 		log.Printf("[MIGRATION] Warning: could not clean old cache keys: %v", result.Error)
@@ -457,7 +462,7 @@ func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
 
 	// Mark migration as completed
 	if err := db.Exec(`
-		INSERT INTO settings (key, value) VALUES ('cleanup_old_cache_keys_completed', 'true')
+		INSERT INTO settings (key, value) VALUES ('cleanup_v2_cache_keys_completed', 'true')
 		ON CONFLICT(key) DO UPDATE SET value = 'true'
 	`).Error; err != nil {
 		log.Printf("[MIGRATION] Warning: could not mark cleanup complete: %v", err)

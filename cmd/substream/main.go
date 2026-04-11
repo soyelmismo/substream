@@ -11,12 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sentriz/gormstore"
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrladmin"
 	"go.senan.xyz/gonic/server/ctrlsubsonic"
 	"go.senan.xyz/gonic/tidalproxy"
-	"github.com/sentriz/gormstore"
 )
 
 func getEnv(key, defaultVal string) string {
@@ -57,15 +57,14 @@ func main() {
 	if dbc.UserCount() == 0 {
 		log.Printf("No users found. Creating default 'admin' user with password 'admin'")
 		admin := db.User{
-			Name:    "admin",
+			Name:     "admin",
 			Password: "admin",
-			IsAdmin: true,
+			IsAdmin:  true,
 		}
 		if err := dbc.Create(&admin).Error; err != nil {
 			log.Fatalf("Error creating default admin user: %v", err)
 		}
 	}
-
 
 	// Tidal Proxy Pool
 	urls := strings.Split(*confProxyURLs, ",")
@@ -73,7 +72,7 @@ func main() {
 		HealthInterval: 30 * time.Second,
 		Timeout:        10 * time.Second,
 	})
-	proxy := tidalproxy.NewCachedProxy(proxyPool, 5*time.Minute)
+	proxy := tidalproxy.NewCachedProxy(proxyPool, dbc, 5*time.Minute)
 
 	// Load proxies from DB if any
 	dbProxies, _ := dbc.GetProxies()
@@ -89,7 +88,7 @@ func main() {
 			"https://katze.qqdl.site",
 		}
 		for _, u := range seeds {
-			 dbc.AddProxy(u, "Community", "auto-seed")
+			dbc.AddProxy(u, "Community", "auto-seed")
 		}
 		// also add CLI defaults if not already present
 		for _, u := range urls {
@@ -98,7 +97,6 @@ func main() {
 
 		dbProxies, _ = dbc.GetProxies()
 	}
-
 
 	if len(dbProxies) > 0 {
 		var dbURLs []string
@@ -114,9 +112,6 @@ func main() {
 		"https://tidal-uptime.props-76styles.workers.dev",
 	}
 	proxyPool.StartDiscovery(trackers, 30*time.Minute, dbc)
-
-
-
 
 	// Scrobblers (Keep empty for Phase 1 MVP, can add ListenBrainz here)
 	var scrobblers []scrobble.Scrobbler
@@ -139,10 +134,9 @@ func main() {
 		log.Fatalf("Error initializing admin controller: %v", err)
 	}
 
-
 	// Routes
 	mux := http.NewServeMux()
-	
+
 	// Add prefix if given
 	restPath := "/rest/"
 	adminPath := "/admin/"
@@ -150,7 +144,7 @@ func main() {
 		restPath = *confProxyPrefix + restPath
 		adminPath = *confProxyPrefix + adminPath
 	}
-	
+
 	mux.Handle(restPath, http.StripPrefix(strings.TrimRight(restPath, "/"), ctrlSubsonic))
 	mux.Handle(adminPath, http.StripPrefix(strings.TrimRight(adminPath, "/"), ctrlAdmin))
 

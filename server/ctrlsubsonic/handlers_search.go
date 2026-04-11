@@ -544,7 +544,7 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 // warmArtistCache pre-fetches artist metadata and caches albums globally
 // This runs async so the star response is instant, but makes content available in global virtual library
 func (c *Controller) warmArtistCache(r *http.Request, artistID int) {
-	cacheKey := fmt.Sprintf("artist:td:ar:%d", artistID)
+	cacheKey := fmt.Sprintf("td:ar:%d", artistID)
 
 	// Fetch artist info
 	info, err := c.proxy.GetArtistInfo(r.Context(), artistID)
@@ -583,7 +583,7 @@ func (c *Controller) warmArtistCache(r *http.Request, artistID int) {
 	// Tracks are cached on-demand when the user actually opens an album
 	albumsCached := 0
 	for _, album := range page.Albums.Items {
-		albumCacheKey := fmt.Sprintf("album:td:al:%d", album.ID)
+		albumCacheKey := fmt.Sprintf("td:al:%d", album.ID)
 		if cached := c.dbc.GetCachedMetadata(albumCacheKey); cached == nil {
 			// Create minimal album spec for cache
 			cachedAlbum := map[string]interface{}{

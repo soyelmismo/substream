@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/jinzhu/gorm"
@@ -138,16 +137,14 @@ func (db *DB) GetVirtualLibraryArtistIDs(userID int) []string {
 	// GLOBAL CACHE: Include all artists that have been cached by any user
 	// This makes the virtual library a shared exploration space
 	var cachedArtists []MetadataCache
-	if err := db.Where("key LIKE ?", "artist:%").Find(&cachedArtists).Error; err != nil {
+	if err := db.Where("key LIKE ?", "td:ar:%").Find(&cachedArtists).Error; err != nil {
 		log.Printf("[CACHE ERROR] Failed to query artist cache: %v", err)
 	} else {
 		log.Printf("[CACHE DEBUG] Found %d cached artists", len(cachedArtists))
 	}
 	for _, cache := range cachedArtists {
-		// Extract URI from "artist:td:ar:12345" -> "td:ar:12345"
-		if id := strings.TrimPrefix(cache.Key, "artist:"); id != cache.Key {
-			uris = appendUniqueURI(uris, id)
-		}
+		// Key is already in URI format: "td:ar:12345"
+		uris = appendUniqueURI(uris, cache.Key)
 	}
 
 	return uris
@@ -198,16 +195,14 @@ func (db *DB) GetVirtualLibraryAlbumIDs(userID int) []string {
 
 	// GLOBAL CACHE: Include all albums that have been cached by any user
 	var cachedAlbums []MetadataCache
-	if err := db.Where("key LIKE ?", "album:%").Find(&cachedAlbums).Error; err != nil {
+	if err := db.Where("key LIKE ?", "td:al:%").Find(&cachedAlbums).Error; err != nil {
 		log.Printf("[CACHE ERROR] Failed to query album cache: %v", err)
 	} else {
 		log.Printf("[CACHE DEBUG] Found %d cached albums", len(cachedAlbums))
 	}
 	for _, cache := range cachedAlbums {
-		// Extract URI from "album:td:al:12345" -> "td:al:12345"
-		if id := strings.TrimPrefix(cache.Key, "album:"); id != cache.Key {
-			uris = appendUniqueURI(uris, id)
-		}
+		// Key is already in URI format: "td:al:12345"
+		uris = appendUniqueURI(uris, cache.Key)
 	}
 
 	return uris
@@ -242,16 +237,14 @@ func (db *DB) GetVirtualLibraryTrackIDs(userID int) []string {
 
 	// GLOBAL CACHE: Include all tracks that have been cached by any user
 	var cachedTracks []MetadataCache
-	if err := db.Where("key LIKE ?", "track:%").Find(&cachedTracks).Error; err != nil {
+	if err := db.Where("key LIKE ?", "td:tr:%").Find(&cachedTracks).Error; err != nil {
 		log.Printf("[CACHE ERROR] Failed to query track cache: %v", err)
 	} else {
 		log.Printf("[CACHE DEBUG] Found %d cached tracks", len(cachedTracks))
 	}
 	for _, cache := range cachedTracks {
-		// Extract URI from "track:td:tr:12345" -> "td:tr:12345"
-		if id := strings.TrimPrefix(cache.Key, "track:"); id != cache.Key {
-			uris = appendUniqueURI(uris, id)
-		}
+		// Key is already in URI format: "td:tr:12345"
+		uris = appendUniqueURI(uris, cache.Key)
 	}
 
 	return uris
