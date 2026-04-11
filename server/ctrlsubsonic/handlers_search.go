@@ -1,11 +1,12 @@
 package ctrlsubsonic
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
 	"time"
-
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
@@ -525,9 +526,67 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 		uri := id.String()
 		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
 			FirstOrCreate(&db.ArtistStar{UserID: user.ID, URI: uri})
+
+		// Async cache warm-up: pre-fetch artist metadata and add all albums to user's library
+		go c.warmArtistCache(r, user.ID, id.Value())
 	}
 
 	return spec.NewResponse()
+}
+
+// warmArtistCache pre-fetches artist metadata, caches albums, AND adds all albums to user's library
+// This runs async so the star response is instant, but the artist's full discography appears in user's virtual library
+func (c *Controller) warmArtistCache(r *http.Request, userID, artistID int) {
+	cacheKey := fmt.Sprintf("artist:%d", artistID)
+
+	// Fetch artist info (do this regardless of cache to get name for logging)
+	info, err := c.proxy.GetArtistInfo(r.Context(), artistID)
+	if err != nil {
+		return
+	}
+
+	artist := spec.NewArtistFromTidal(&info.Artist)
+	artist.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), artistID)
+
+	// Store in persistent cache (skip only if fully cached)
+	if cached := c.dbc.GetCachedMetadata(cacheKey); cached == nil {
+		if artistJSON, err := json.Marshal(artist); err == nil {
+			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
+			log.Printf("[CACHE] Warmed artist %d (%s)", artistID, artist.Name)
+		}
+	}
+
+	// Fetch and cache album list for this artist
+	page, err := c.proxy.GetArtistAlbums(r.Context(), artistID, true)
+	if err != nil || page == nil || len(page.Albums.Items) == 0 {
+		return
+	}
+
+	// Cache albums metadata
+	albumsCacheKey := fmt.Sprintf("artist_albums:%d", artistID)
+	if cached := c.dbc.GetCachedMetadata(albumsCacheKey); cached == nil {
+		if albumsJSON, err := json.Marshal(page.Albums.Items); err == nil {
+			c.dbc.SetCachedMetadata(albumsCacheKey, albumsJSON, metadataCacheTTL)
+			log.Printf("[CACHE] Warmed %d albums for artist %d", len(page.Albums.Items), artistID)
+		}
+	}
+
+	// ADD ALL ALBUMS TO USER'S VIRTUAL LIBRARY
+	// When you star an artist, you get their entire discography in your library
+	albumCount := 0
+	for _, album := range page.Albums.Items {
+		albumURI := fmt.Sprintf("td:al:%d", album.ID)
+		// Use FirstOrCreate to avoid duplicates
+		result := c.dbc.Where("user_id=? AND uri=?", userID, albumURI).
+			FirstOrCreate(&db.AlbumStar{UserID: userID, URI: albumURI})
+		if result.Error == nil {
+			albumCount++
+		}
+	}
+
+	if albumCount > 0 {
+		log.Printf("[LIBRARY] Added %d albums from artist %d to user %d's virtual library", albumCount, artistID, userID)
+	}
 }
 
 func (c *Controller) ServeUnstar(r *http.Request) *spec.Response {

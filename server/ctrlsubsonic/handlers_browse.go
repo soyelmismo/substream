@@ -2,6 +2,7 @@ package ctrlsubsonic
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -114,6 +115,9 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 
 	artist := spec.NewArtistFromTidal(&info.Artist)
 	c.applyArtistStar(user.ID, artist)
+
+	// Warm-up cache in background for future syncs
+	go c.warmArtistCacheFromData(artist, artistPage)
 
 	items := artistPage.Albums.Items
 	// Deduplicate albums by title+release_date (Tidal API returns same album with different IDs)
@@ -723,6 +727,16 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 		artistInfo.Similar = append(artistInfo.Similar, sa)
 	}
 
+	// Warm-up cache in background for the main artist
+	go func() {
+		artist := spec.NewArtistFromTidal(&info.Artist)
+		artist.AlbumCount = c.proxy.GetArtistAlbumCount(context.Background(), id.Value())
+		cacheKey := fmt.Sprintf("artist:%d", id.Value())
+		if artistJSON, err := json.Marshal(artist); err == nil {
+			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
+		}
+	}()
+
 	sub := spec.NewResponse()
 	if strings.Contains(r.URL.Path, "getArtistInfo2") {
 		sub.ArtistInfoTwo = artistInfo
@@ -748,4 +762,31 @@ func (c *Controller) ServeGetAlbumInfoTwo(r *http.Request) *spec.Response {
 	sub := spec.NewResponse()
 	sub.AlbumInfo = albumInfo
 	return sub
+}
+
+// warmArtistCacheFromData caches artist and album data from already-fetched results
+// This is used in background goroutines after ServeGetArtist completes
+func (c *Controller) warmArtistCacheFromData(artist *spec.Artist, artistPage *tidalproxy.TidalArtistPage) {
+	if artist == nil || artistPage == nil {
+		return
+	}
+
+	// Cache artist (artist.ID is *specid.ID)
+	if artist.ID != nil {
+		artistID := artist.ID.Value()
+		cacheKey := fmt.Sprintf("artist:%d", artistID)
+		if artistJSON, err := json.Marshal(artist); err == nil {
+			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
+			log.Printf("[CACHE] Warmed artist %d from getArtist", artistID)
+		}
+
+		// Cache album list
+		if len(artistPage.Albums.Items) > 0 {
+			albumsCacheKey := fmt.Sprintf("artist_albums:%d", artistID)
+			if albumsJSON, err := json.Marshal(artistPage.Albums.Items); err == nil {
+				c.dbc.SetCachedMetadata(albumsCacheKey, albumsJSON, metadataCacheTTL)
+				log.Printf("[CACHE] Warmed %d albums for artist %d from getArtist", len(artistPage.Albums.Items), artistID)
+			}
+		}
+	}
 }
