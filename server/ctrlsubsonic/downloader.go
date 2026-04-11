@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.senan.xyz/gonic/tidalproxy"
@@ -93,8 +94,8 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		return fmt.Errorf("no segments found in manifest")
 	}
 
-	// 3. Download and stream segments with tagging (concurrent for speed)
-	// Use optimized client with keep-alive for better performance
+	// 3. Download and stream segments concurrently with progressive streaming
+	// Start sending data to client as soon as first segment is ready
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
@@ -105,52 +106,75 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		},
 	}
 
-	// Download segments concurrently for better throughput
 	const maxConcurrency = 6 // Limit concurrent downloads
-	semaphore := make(chan struct{}, maxConcurrency)
+	tagger := &flacTagger{w: w, track: track}
+
+	// Download and stream segments in order with look-ahead buffering
+	// This allows us to start streaming immediately while downloading ahead
 	type segmentResult struct {
 		index int
 		data  []byte
 		err   error
 	}
-	results := make(chan segmentResult, len(segments))
 
-	// Launch concurrent downloads
-	for i, segmentURL := range segments {
-		semaphore <- struct{}{} // Acquire
-		go func(idx int, url string) {
-			defer func() { <-semaphore }() // Release
+	results := make(chan segmentResult, maxConcurrency*2) // Buffer for look-ahead
+	var wg sync.WaitGroup
 
-			data, err := downloadSegment(ctx, client, url, clientIP)
-			results <- segmentResult{idx, data, err}
-		}(i, segmentURL)
+	// Start worker pool
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for idx := workerID; idx < len(segments); idx += maxConcurrency {
+				data, err := downloadSegment(ctx, client, segments[idx], clientIP)
+				results <- segmentResult{idx, data, err}
+			}
+		}(i)
 	}
 
-	// Collect results in order
-	segmentData := make([][]byte, len(segments))
-	for i := 0; i < len(segments); i++ {
-		res := <-results
-		if res.err != nil {
-			return fmt.Errorf("segment %d failed: %w", res.index, res.err)
+	// Close results channel when all workers done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect and write segments in order
+	resultMap := make(map[int][]byte)
+	nextToWrite := 0
+
+	for result := range results {
+		if result.err != nil {
+			return fmt.Errorf("segment %d failed: %w", result.index, result.err)
 		}
-		segmentData[res.index] = res.data
-	}
 
-	// Write segments in order with optional tagging
-	tagger := &flacTagger{w: w, track: track}
-	for i, data := range segmentData {
-		if i == 0 && track != nil {
-			// First segment might need tagging if it's FLAC
-			if err := tagger.process(bytes.NewReader(data), c); err != nil {
-				log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
-				if _, err := w.Write(data); err != nil {
-					return err
+		resultMap[result.index] = result.data
+
+		// Write all consecutive segments that are ready
+		for {
+			if data, ok := resultMap[nextToWrite]; ok {
+				if nextToWrite == 0 && track != nil {
+					// First segment might need tagging if it's FLAC
+					if err := tagger.process(bytes.NewReader(data), c); err != nil {
+						log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
+						if _, err := w.Write(data); err != nil {
+							return err
+						}
+					}
+				} else {
+					if _, err := w.Write(data); err != nil {
+						return err
+					}
 				}
+				delete(resultMap, nextToWrite)
+				nextToWrite++
+			} else {
+				break
 			}
-		} else {
-			if _, err := w.Write(data); err != nil {
-				return err
-			}
+		}
+
+		// Safety check
+		if nextToWrite >= len(segments) {
+			break
 		}
 	}
 
