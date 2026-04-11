@@ -42,7 +42,7 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 			defer wg.Done()
 
 			// Check persistent cache first
-			cacheKey := fmt.Sprintf("track:%d", tid)
+			cacheKey := fmt.Sprintf("track:td:tr:%d", tid)
 			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
 				var track spec.TrackChild
 				if err := json.Unmarshal(cached, &track); err == nil {
@@ -115,7 +115,7 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 			defer wg.Done()
 
 			// Check persistent cache first
-			cacheKey := fmt.Sprintf("album:%d", tid)
+			cacheKey := fmt.Sprintf("album:td:al:%d", tid)
 			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
 				var album spec.Album
 				if err := json.Unmarshal(cached, &album); err == nil {
@@ -247,7 +247,7 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 			defer wg.Done()
 
 			// Check persistent cache first
-			cacheKey := fmt.Sprintf("artist:%d", tid)
+			cacheKey := fmt.Sprintf("artist:td:ar:%d", tid)
 			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
 				var artist spec.Artist
 				if err := json.Unmarshal(cached, &artist); err == nil {

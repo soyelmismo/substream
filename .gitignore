@@ -12,7 +12,9 @@ dist
 *.swp
 .tags*
 *.test
-cache/
+cache/*.png
+cache/*.jpg
+cache/*.webp
 ./substream
 substream
 .fuse*

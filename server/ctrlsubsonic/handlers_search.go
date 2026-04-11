@@ -49,8 +49,6 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		fromCache = true
 	}
 
-
-
 	// Respect counts from client. If 0 is sent, don't search that type.
 	// We use -1 as a marker for "not provided"
 	artistCount := p.GetOrInt("artistCount", -1)
@@ -58,13 +56,25 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	songCount := p.GetOrInt("songCount", -1)
 
 	// Set defaults only if not provided (-1) - optimize for Tidal
-	if artistCount == -1 { artistCount = 5 }
-	if albumCount == -1 { albumCount = 30 }
-	if songCount == -1 { songCount = 30 }
+	if artistCount == -1 {
+		artistCount = 5
+	}
+	if albumCount == -1 {
+		albumCount = 30
+	}
+	if songCount == -1 {
+		songCount = 30
+	}
 
-	if artistCount > 50 { artistCount = 50 }
-	if albumCount > 100 { albumCount = 100 }
-	if songCount > 100 { songCount = 100 }
+	if artistCount > 50 {
+		artistCount = 50
+	}
+	if albumCount > 100 {
+		albumCount = 100
+	}
+	if songCount > 100 {
+		songCount = 100
+	}
 
 	artistOffset := p.GetOrInt("artistOffset", 0)
 	albumOffset := p.GetOrInt("albumOffset", 0)
@@ -340,9 +350,6 @@ favLoop:
 		return nil
 	}
 
-
-
-
 	for i := range tracks {
 		results.Tracks = append(results.Tracks, &tracks[i])
 		c.applyTrackStar(user.ID, &tracks[i])
@@ -527,19 +534,19 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
 			FirstOrCreate(&db.ArtistStar{UserID: user.ID, URI: uri})
 
-		// Async cache warm-up: pre-fetch artist metadata and add all albums to user's library
-		go c.warmArtistCache(r, user.ID, id.Value())
+		// Async cache warm-up: pre-fetch artist metadata and index in global library
+		go c.warmArtistCache(r, id.Value())
 	}
 
 	return spec.NewResponse()
 }
 
-// warmArtistCache pre-fetches artist metadata, caches albums, AND adds all albums to user's library
-// This runs async so the star response is instant, but the artist's full discography appears in user's virtual library
-func (c *Controller) warmArtistCache(r *http.Request, userID, artistID int) {
-	cacheKey := fmt.Sprintf("artist:%d", artistID)
+// warmArtistCache pre-fetches artist metadata and caches albums globally
+// This runs async so the star response is instant, but makes content available in global virtual library
+func (c *Controller) warmArtistCache(r *http.Request, artistID int) {
+	cacheKey := fmt.Sprintf("artist:td:ar:%d", artistID)
 
-	// Fetch artist info (do this regardless of cache to get name for logging)
+	// Fetch artist info
 	info, err := c.proxy.GetArtistInfo(r.Context(), artistID)
 	if err != nil {
 		return
@@ -548,7 +555,7 @@ func (c *Controller) warmArtistCache(r *http.Request, userID, artistID int) {
 	artist := spec.NewArtistFromTidal(&info.Artist)
 	artist.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), artistID)
 
-	// Store in persistent cache (skip only if fully cached)
+	// Store in persistent cache
 	if cached := c.dbc.GetCachedMetadata(cacheKey); cached == nil {
 		if artistJSON, err := json.Marshal(artist); err == nil {
 			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
@@ -571,22 +578,66 @@ func (c *Controller) warmArtistCache(r *http.Request, userID, artistID int) {
 		}
 	}
 
-	// ADD ALL ALBUMS TO USER'S VIRTUAL LIBRARY
-	// When you star an artist, you get their entire discography in your library
-	albumCount := 0
+	// Cache each album individually for virtual library indexing
+	// NOTE: We DON'T warm tracks here to avoid N+1 API calls (one per album)
+	// Tracks are cached on-demand when the user actually opens an album
+	albumsCached := 0
 	for _, album := range page.Albums.Items {
-		albumURI := fmt.Sprintf("td:al:%d", album.ID)
-		// Use FirstOrCreate to avoid duplicates
-		result := c.dbc.Where("user_id=? AND uri=?", userID, albumURI).
-			FirstOrCreate(&db.AlbumStar{UserID: userID, URI: albumURI})
-		if result.Error == nil {
-			albumCount++
+		albumCacheKey := fmt.Sprintf("album:td:al:%d", album.ID)
+		if cached := c.dbc.GetCachedMetadata(albumCacheKey); cached == nil {
+			// Create minimal album spec for cache
+			cachedAlbum := map[string]interface{}{
+				"id":    album.ID,
+				"title": album.Title,
+				"artist": func() string {
+					if len(album.Artists) > 0 {
+						return album.Artists[0].Name
+					}
+					return ""
+				}(),
+			}
+			if albumJSON, err := json.Marshal(cachedAlbum); err == nil {
+				c.dbc.SetCachedMetadata(albumCacheKey, albumJSON, metadataCacheTTL)
+				albumsCached++
+			}
 		}
 	}
 
-	if albumCount > 0 {
-		log.Printf("[LIBRARY] Added %d albums from artist %d to user %d's virtual library", albumCount, artistID, userID)
+	log.Printf("[CACHE] Warmed artist %d complete: %d albums indexed (%d new albums cached)", artistID, len(page.Albums.Items), albumsCached)
+}
+
+// warmAlbumTracks fetches and caches all tracks from an album
+func (c *Controller) warmAlbumTracks(r *http.Request, albumID int) {
+	// Get album info (which includes tracks in Items field)
+	info, err := c.proxy.GetAlbumInfo(r.Context(), albumID)
+	if err != nil || info == nil || len(info.Items) == 0 {
+		return
 	}
+
+	// Cache each track
+	for _, track := range info.Items {
+		trackCacheKey := fmt.Sprintf("track:td:tr:%d", track.ID)
+		if cached := c.dbc.GetCachedMetadata(trackCacheKey); cached != nil {
+			continue // Already cached
+		}
+
+		// Create minimal track spec for cache
+		cachedTrack := map[string]interface{}{
+			"id":        track.ID,
+			"title":     track.Title,
+			"artist":    track.Artist.Name,
+			"artist_id": track.Artist.ID,
+			"album_id":  albumID,
+			"duration":  track.Duration,
+			"number":    track.TrackNumber,
+		}
+
+		if trackJSON, err := json.Marshal(cachedTrack); err == nil {
+			c.dbc.SetCachedMetadata(trackCacheKey, trackJSON, metadataCacheTTL)
+		}
+	}
+
+	log.Printf("[CACHE] Warmed %d tracks for album %d", len(info.Items), albumID)
 }
 
 func (c *Controller) ServeUnstar(r *http.Request) *spec.Response {
@@ -666,7 +717,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	// starred tracks
 	var trackStars []db.TrackStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&trackStars)
-	
+
 	trackIDs := make([]int, len(trackStars))
 	for i, s := range trackStars {
 		trackIDs[i] = extractIDFromURI(s.URI)

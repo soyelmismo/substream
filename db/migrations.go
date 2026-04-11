@@ -317,6 +317,33 @@ func containsInternal(s, substr string) bool {
 	return false
 }
 
+// MigrateMetadataCacheTable creates the metadata_cache table if it doesn't exist
+// This is needed for the global virtual library feature
+func MigrateMetadataCacheTable(db *gorm.DB) error {
+	// Check if table exists using GORM - more reliable
+	if db.HasTable("metadata_cache") {
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Creating metadata_cache table...")
+
+	// Create table with IF NOT EXISTS to be safe
+	err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS metadata_cache (
+			key TEXT PRIMARY KEY,
+			value BLOB,
+			fetched_at DATETIME,
+			ttl_seconds INTEGER
+		)
+	`).Error
+	if err != nil {
+		return fmt.Errorf("create metadata_cache table: %w", err)
+	}
+
+	log.Printf("[MIGRATION] metadata_cache table created successfully")
+	return nil
+}
+
 // MigrateDropTidalID drops the tidal_id column from plays table
 // This is a separate migration because it must run after URN migration is complete
 func MigrateDropTidalID(db *gorm.DB) error {
@@ -399,6 +426,46 @@ func MigrateDropTidalID(db *gorm.DB) error {
 	return nil
 }
 
+// MigrateCleanupOldCacheKeys removes metadata_cache entries with old key format
+// Old format: "artist:12345", "album:12345", "track:12345"
+// New format: "artist:td:ar:12345", "album:td:al:12345", "track:td:tr:12345"
+func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
+	// Check if migration has already been run
+	var setting Setting
+	err := db.Where("key = ?", "cleanup_old_cache_keys_completed").First(&setting).Error
+	if err == nil && setting.Value == "true" {
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Cleaning up old cache key formats...")
+
+	// Delete keys that match old format: artist:NUMBER, album:NUMBER, track:NUMBER
+	// These patterns have only one colon, while new format has two colons
+	result := db.Exec(`
+		DELETE FROM metadata_cache 
+		WHERE key LIKE 'artist:_%' 
+		   OR key LIKE 'album:_%' 
+		   OR key LIKE 'track:_%'
+		   AND key NOT LIKE '%:%:%'
+	`)
+	if result.Error != nil {
+		log.Printf("[MIGRATION] Warning: could not clean old cache keys: %v", result.Error)
+		// Don't fail - this is not critical
+	} else {
+		log.Printf("[MIGRATION] Cleaned up %d old cache key entries", result.RowsAffected)
+	}
+
+	// Mark migration as completed
+	if err := db.Exec(`
+		INSERT INTO settings (key, value) VALUES ('cleanup_old_cache_keys_completed', 'true')
+		ON CONFLICT(key) DO UPDATE SET value = 'true'
+	`).Error; err != nil {
+		log.Printf("[MIGRATION] Warning: could not mark cleanup complete: %v", err)
+	}
+
+	return nil
+}
+
 func (db *DB) Migrate() error {
 	// Run URN migration before AutoMigrate
 	if err := MigrateToURNs(db.DB); err != nil {
@@ -408,6 +475,16 @@ func (db *DB) Migrate() error {
 	// Run tidal_id column drop migration
 	if err := MigrateDropTidalID(db.DB); err != nil {
 		return fmt.Errorf("drop tidal_id migration failed: %w", err)
+	}
+
+	// Ensure metadata_cache table exists (for global virtual library)
+	if err := MigrateMetadataCacheTable(db.DB); err != nil {
+		return fmt.Errorf("metadata_cache migration failed: %w", err)
+	}
+
+	// Clean up old format cache keys
+	if err := MigrateCleanupOldCacheKeys(db.DB); err != nil {
+		log.Printf("[MIGRATION] Cache key cleanup warning: %v", err)
 	}
 
 	return db.AutoMigrate(
@@ -428,4 +505,3 @@ func (db *DB) Migrate() error {
 		&MetadataCache{},
 	).Error
 }
-
