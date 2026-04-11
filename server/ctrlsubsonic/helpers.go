@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -269,9 +270,13 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 			// Get album count from cache (avoids extra API call)
 			a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
 
-			// Store in persistent cache
-			if artistJSON, err := json.Marshal(a); err == nil {
-				c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
+			// Store in persistent cache only if artist has name
+			if a.Name != "" {
+				if artistJSON, err := json.Marshal(a); err == nil {
+					c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
+				}
+			} else {
+				log.Printf("[CACHE] Skipping cache for artist %d: no name", tid)
 			}
 
 			results <- result{idx: idx, artist: a}

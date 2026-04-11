@@ -435,7 +435,7 @@ func MigrateDropTidalID(db *gorm.DB) error {
 func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
 	// Check if migration has already been run
 	var setting Setting
-	err := db.Where("key = ?", "cleanup_v2_cache_keys_completed").First(&setting).Error
+	err := db.Where("key = ?", "cleanup_v3_cache_keys_completed").First(&setting).Error
 	if err == nil && setting.Value == "true" {
 		return nil
 	}
@@ -443,7 +443,7 @@ func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
 	log.Printf("[MIGRATION] Cleaning up old cache key formats...")
 
 	// Delete keys with old type-prefixed format: artist:td:ar:*, album:td:al:*, track:td:tr:*
-	// Also clean any other non-standard formats
+	// Also clean any other non-standard formats and invalid IDs (0)
 	result := db.Exec(`
 		DELETE FROM metadata_cache 
 		WHERE key LIKE 'artist:td:ar:%' 
@@ -452,6 +452,10 @@ func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
 		   OR key GLOB 'artist:[0-9]*'
 		   OR key GLOB 'album:[0-9]*'
 		   OR key GLOB 'track:[0-9]*'
+		   OR key = 'td:ar:0'
+		   OR key = 'td:al:0'
+		   OR key = 'td:tr:0'
+		   OR key = 'artist_albums:0'
 	`)
 	if result.Error != nil {
 		log.Printf("[MIGRATION] Warning: could not clean old cache keys: %v", result.Error)
@@ -462,7 +466,7 @@ func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
 
 	// Mark migration as completed
 	if err := db.Exec(`
-		INSERT INTO settings (key, value) VALUES ('cleanup_v2_cache_keys_completed', 'true')
+		INSERT INTO settings (key, value) VALUES ('cleanup_v3_cache_keys_completed', 'true')
 		ON CONFLICT(key) DO UPDATE SET value = 'true'
 	`).Error; err != nil {
 		log.Printf("[MIGRATION] Warning: could not mark cleanup complete: %v", err)

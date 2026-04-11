@@ -213,11 +213,11 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 	// Hard limit for discovery endpoints to prevent infinite sync loops
 	// These endpoints call external APIs (hot.monochrome/Tidal) and should be capped
 	discoveryTypes := map[string]bool{
-		"newest":    true,
-		"random":    true,
-		"recent":    true,
-		"frequent":  true,
-		"byGenre":   true,
+		"newest":   true,
+		"random":   true,
+		"recent":   true,
+		"frequent": true,
+		"byGenre":  true,
 	}
 	if discoveryTypes[listType] && offset >= 200 {
 		log.Printf("[BROWSE] Hard limit reached for discovery type %s at offset %d", listType, offset)
@@ -413,7 +413,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		if genreID == "" {
 			genreID = strings.ToLower(strings.ReplaceAll(genre, " ", "_"))
 		}
-		
+
 		// Try hot.monochrome.tf first for discovery - use cache with deduplication
 		cacheKey := fmt.Sprintf("genre_albums_%s", genreID)
 		allAlbums := c.genreAlbumCache.Get(cacheKey)
@@ -441,7 +441,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 				}()
 			}
 		}
-		
+
 		if len(allAlbums) > 0 {
 			log.Printf("[GENRE] hot.monochrome.tf returned %d albums for %s", len(allAlbums), genre)
 			// Apply offset and size locally
@@ -729,9 +729,17 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 
 	// Warm-up cache in background for the main artist
 	go func() {
+		artistID := id.Value()
+		if artistID <= 0 {
+			return
+		}
 		artist := spec.NewArtistFromTidal(&info.Artist)
-		artist.AlbumCount = c.proxy.GetArtistAlbumCount(context.Background(), id.Value())
-		cacheKey := fmt.Sprintf("artist:%d", id.Value())
+		if artist.Name == "" {
+			log.Printf("[CACHE] Skipping warm for artist %d: no name", artistID)
+			return
+		}
+		artist.AlbumCount = c.proxy.GetArtistAlbumCount(context.Background(), artistID)
+		cacheKey := fmt.Sprintf("td:ar:%d", artistID)
 		if artistJSON, err := json.Marshal(artist); err == nil {
 			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
 		}
@@ -774,18 +782,58 @@ func (c *Controller) warmArtistCacheFromData(artist *spec.Artist, artistPage *ti
 	// Cache artist (artist.ID is *specid.ID)
 	if artist.ID != nil {
 		artistID := artist.ID.Value()
-		cacheKey := fmt.Sprintf("artist:%d", artistID)
+		// Skip invalid artist IDs
+		if artistID <= 0 {
+			log.Printf("[CACHE] Skipping warm for invalid artist ID: %d", artistID)
+			return
+		}
+		// Skip artists without name
+		if artist.Name == "" {
+			log.Printf("[CACHE] Skipping warm for artist %d: no name", artistID)
+			return
+		}
+
+		cacheKey := fmt.Sprintf("td:ar:%d", artistID)
 		if artistJSON, err := json.Marshal(artist); err == nil {
 			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
 			log.Printf("[CACHE] Warmed artist %d from getArtist", artistID)
 		}
 
-		// Cache album list
+		// Cache each album individually for virtual library indexing
+		albumsCached := 0
+		for _, album := range artistPage.Albums.Items {
+			if album.ID <= 0 {
+				continue
+			}
+			albumCacheKey := fmt.Sprintf("td:al:%d", album.ID)
+			if cached := c.dbc.GetCachedMetadata(albumCacheKey); cached == nil {
+				// Create minimal album spec for cache
+				cachedAlbum := map[string]interface{}{
+					"id":    album.ID,
+					"title": album.Title,
+					"artist": func() string {
+						if len(album.Artists) > 0 {
+							return album.Artists[0].Name
+						}
+						return ""
+					}(),
+				}
+				if albumJSON, err := json.Marshal(cachedAlbum); err == nil {
+					c.dbc.SetCachedMetadata(albumCacheKey, albumJSON, metadataCacheTTL)
+					albumsCached++
+				}
+			}
+		}
+		if albumsCached > 0 {
+			log.Printf("[CACHE] Warmed %d albums for virtual library from artist %d", albumsCached, artistID)
+		}
+
+		// Cache full album list for quick retrieval
 		if len(artistPage.Albums.Items) > 0 {
 			albumsCacheKey := fmt.Sprintf("artist_albums:%d", artistID)
 			if albumsJSON, err := json.Marshal(artistPage.Albums.Items); err == nil {
 				c.dbc.SetCachedMetadata(albumsCacheKey, albumsJSON, metadataCacheTTL)
-				log.Printf("[CACHE] Warmed %d albums for artist %d from getArtist", len(artistPage.Albums.Items), artistID)
+				log.Printf("[CACHE] Warmed %d albums list for artist %d from getArtist", len(artistPage.Albums.Items), artistID)
 			}
 		}
 	}
