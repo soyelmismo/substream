@@ -17,6 +17,7 @@ import (
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/internal/cache"
+	"go.senan.xyz/gonic/internal/importer"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -51,6 +52,7 @@ type Controller struct {
 	streamURLCache *cache.Cache[string] // Cache for stream URLs (TTL 30s)
 	streamURLLocks sync.Map // dedup concurrent stream URL requests
 	streamLocks    sync.Map // dedup concurrent stream serving per track+client
+	importer       *importer.JobManager // Background playlist import manager
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
@@ -64,6 +66,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 		scrobblers: scrobblers,
 		cachePath:  cachePath,
 		proxySem:   make(chan struct{}, 30), // limit total concurrent proxy calls
+		importer:   importer.NewJobManager(dbc, proxy),
 		httpClient: &http.Client{
 			Timeout: httpClientTimeout,
 			Transport: &http.Transport{

@@ -1,11 +1,13 @@
 package ctrlsubsonic
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/internal/importer"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -113,6 +115,11 @@ func (c *Controller) ServeCreatePlaylist(r *http.Request) *spec.Response {
 
 	name := p.GetOr("name", "New Playlist")
 
+	// Check if name is an import URL (Spotify, Apple Music, etc.)
+	if c.importer.Registry().IsImportURL(name) {
+		return c.handleImportPlaylist(r.Context(), user, name)
+	}
+
 	// if playlistId is provided, this is an update
 	if plID, err := p.GetID("playlistId"); err == nil {
 		playlistID, _ := strconv.Atoi(plID.StringValue)
@@ -176,6 +183,31 @@ func (c *Controller) ServeCreatePlaylist(r *http.Request) *spec.Response {
 	}
 	return sub
 }
+
+// handleImportPlaylist initiates a background import and returns immediately
+func (c *Controller) handleImportPlaylist(ctx context.Context, user *db.User, sourceURL string) *spec.Response {
+	// Start the import job (returns immediately with placeholder)
+	pl, err := c.importer.StartImport(ctx, user.ID, sourceURL)
+	if err != nil {
+		return spec.NewError(0, "Failed to start import: %v", err)
+	}
+
+	// Return the placeholder playlist immediately
+	sub := spec.NewResponse()
+	sub.Playlist = &spec.Playlist{
+		ID:      specid.ID{Type: specid.Playlist, StringValue: strconv.Itoa(pl.ID)},
+		Name:    pl.Name,
+		Comment: pl.Comment,
+		Owner:   user.Name,
+		Created: pl.CreatedAt,
+		Changed: pl.UpdatedAt,
+	}
+	return sub
+}
+
+// Helper function to satisfy the unused import linter
+var _ = importer.ImportedTrack{}
+var _ = context.Background
 
 func (c *Controller) ServeUpdatePlaylist(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
