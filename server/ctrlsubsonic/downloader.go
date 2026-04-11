@@ -16,8 +16,15 @@ import (
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
+// segmentInfo holds HLS segment URL and duration
+type segmentInfo struct {
+	url      string
+	duration float64 // in seconds
+}
+
 // downloadAndStitchHLS fetches an M3U8 manifest and streams all its segments to w
-func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack) error {
+// offsetSeconds allows time-based seeking (skip segments until offset)
+func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64) error {
 	// 1. Fetch the manifest
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
 	if err != nil {
@@ -38,8 +45,8 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		return fmt.Errorf("manifest fetch failed: %d", resp.StatusCode)
 	}
 
-	// 2. Parse segments
-	var segments []string
+	// 2. Parse segments with duration info
+	var segments []segmentInfo
 	var variantURL string
 	scanner := bufio.NewScanner(resp.Body)
 	baseURL := manifestURL
@@ -48,6 +55,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	}
 
 	isMaster := false
+	var currentDuration float64
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -57,13 +65,21 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			isMaster = true
 			continue
 		}
+		// Parse segment duration from #EXTINF tag
+		if strings.HasPrefix(line, "#EXTINF:") {
+			durStr := strings.TrimPrefix(line, "#EXTINF:")
+			durStr = strings.TrimSuffix(durStr, ",")
+			fmt.Sscanf(durStr, "%f", &currentDuration)
+			continue
+		}
 		if strings.HasPrefix(line, "#") {
 			if strings.HasPrefix(line, "#EXT-X-MAP:URI=") {
 				mapURL := strings.Trim(strings.TrimPrefix(line, "#EXT-X-MAP:URI="), "\"")
 				if !strings.HasPrefix(mapURL, "http") {
 					mapURL = baseURL + mapURL
 				}
-				segments = append(segments, mapURL)
+				// Init segments (fMP4) have no duration in manifest, use 0
+				segments = append(segments, segmentInfo{url: mapURL, duration: 0})
 			}
 			continue
 		}
@@ -78,12 +94,30 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			variantURL = fullURL
 			break
 		}
-		segments = append(segments, fullURL)
+		segments = append(segments, segmentInfo{url: fullURL, duration: currentDuration})
+		currentDuration = 0
 	}
 
 	if isMaster && variantURL != "" {
 		log.Printf("[DOWNLOAD] HLS Master detected, following variant: %s", variantURL)
-		return c.downloadAndStitchHLS(ctx, variantURL, w, clientIP, track)
+		return c.downloadAndStitchHLS(ctx, variantURL, w, clientIP, track, offsetSeconds)
+	}
+
+	// Calculate which segment to start from based on time offset
+	startIdx := 0
+	if offsetSeconds > 0 {
+		elapsed := 0.0
+		for i, seg := range segments {
+			if elapsed+seg.duration > offsetSeconds {
+				startIdx = i
+				break
+			}
+			elapsed += seg.duration
+		}
+		if startIdx > 0 {
+			log.Printf("[DOWNLOAD] Time-based seek: offset=%.2fs, skipping %d/%d segments (%.2fs elapsed)", 
+				offsetSeconds, startIdx, len(segments), elapsed)
+		}
 	}
 
 	log.Printf("[DOWNLOAD] HLS Media playlist parsed: %d segments found", len(segments))
@@ -126,7 +160,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		go func(workerID int) {
 			defer wg.Done()
 			for idx := workerID; idx < len(segments); idx += maxConcurrency {
-				data, err := downloadSegment(ctx, client, segments[idx], clientIP)
+				data, err := downloadSegment(ctx, client, segments[idx].url, clientIP)
 				results <- segmentResult{idx, data, err}
 			}
 		}(i)
@@ -138,9 +172,10 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		close(results)
 	}()
 
-	// Collect and write segments in order
+	// Collect and write segments in order (start from startIdx for seeking)
 	resultMap := make(map[int][]byte)
-	nextToWrite := 0
+	nextToWrite := startIdx
+	writtenInit := false
 
 	for result := range results {
 		if result.err != nil {
@@ -152,8 +187,16 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		// Write all consecutive segments that are ready
 		for {
 			if data, ok := resultMap[nextToWrite]; ok {
-				if nextToWrite == 0 && track != nil {
-					// First segment might need tagging if it's FLAC
+				// For time-based seeking, skip writing init segment (index 0) if we start later
+				// UNLESS it's the init segment for fMP4 which is always needed
+				if nextToWrite == 0 && segments[0].duration == 0 {
+					// This is an init segment (fMP4), always write it
+					if _, err := w.Write(data); err != nil {
+						return err
+					}
+					writtenInit = true
+				} else if nextToWrite == startIdx && track != nil && !writtenInit {
+					// First media segment, try tagging if FLAC
 					if err := tagger.process(bytes.NewReader(data), c); err != nil {
 						log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
 						if _, err := w.Write(data); err != nil {

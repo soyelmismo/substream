@@ -50,6 +50,7 @@ type Controller struct {
 	settingsCache *cache.Cache[string] // Cache for DB settings (proxy_streams, etc)
 	streamURLCache *cache.Cache[string] // Cache for stream URLs (TTL 30s)
 	streamURLLocks sync.Map // dedup concurrent stream URL requests
+	streamLocks    sync.Map // dedup concurrent stream serving per track+client
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {

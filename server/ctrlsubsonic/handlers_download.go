@@ -215,8 +215,8 @@ func (c *Controller) downloadAndAddToZip(ctx context.Context, streamURL string, 
 	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
 	
 	if isHLS {
-		// Use HLS stitcher - download and concatenate all segments
-		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, nil)
+		// Use HLS stitcher - download and concatenate all segments (no seeking for downloads)
+		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, nil, 0)
 	}
 	if isDASH {
 		// Use DASH stitcher

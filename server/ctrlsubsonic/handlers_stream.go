@@ -30,9 +30,48 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// Log raw request details for debugging
 	rawID := p.GetOr("id", "")
 	client := p.GetOr("c", "unknown")
-	log.Printf("[STREAM] REQUEST: client=%s raw_id=%s parsed_track_id=%d", client, rawID, id.Value)
+	rangeHdr := r.Header.Get("Range")
+	log.Printf("[STREAM] REQUEST: client=%s raw_id=%s parsed_track_id=%d range=%q", client, rawID, id.Value, rangeHdr)
+
+	// Deduplicate concurrent stream requests for same track+client
+	// If client sends duplicate requests, wait for the first one to complete
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		clientIP = r.Header.Get("X-Real-IP")
+	}
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	streamKey := fmt.Sprintf("%s:%d", clientIP, id.Value)
+	
+	type streamLock struct {
+		done chan struct{}
+	}
+	
+	lockVal, loaded := c.streamLocks.LoadOrStore(streamKey, &streamLock{done: make(chan struct{})})
+	if loaded {
+		// Another stream is in progress for this track+client, wait for it
+		log.Printf("[STREAM] DEDUP: client=%s track=%d already streaming, waiting...", client, id.Value)
+		lp := lockVal.(*streamLock)
+		select {
+		case <-lp.done:
+			log.Printf("[STREAM] DEDUP: client=%s track=%d previous stream complete, returning", client, id.Value)
+			return nil // Previous stream completed successfully
+		case <-r.Context().Done():
+			log.Printf("[STREAM] DEDUP: client=%s track=%d client disconnected while waiting", client, id.Value)
+			return nil // Client disconnected
+		}
+	}
+	
+	// We own this stream, clean up lock when done
+	defer func() {
+		c.streamLocks.Delete(streamKey)
+		close(lockVal.(*streamLock).done)
+	}()
 
 	bitrate := p.GetOrInt("maxBitRate", 0)
+	offset := p.GetOrInt("timeOffset", 0) // Time-based seeking offset in seconds
+	log.Printf("[STREAM] bitRate=%d offset=%ds", bitrate, offset)
 	tidalQuality := ""
 	switch {
 	case bitrate == 0:
@@ -55,17 +94,12 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	metaCtx, metaCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer metaCancel()
 
-	clientIP := r.Header.Get("X-Forwarded-For")
-	if clientIP == "" {
-		clientIP = r.Header.Get("X-Real-IP")
+	// clientIP already determined above for deduplication
+	// Clean up port if present for API calls
+	if pos := strings.LastIndex(clientIP, ":"); pos != -1 {
+		clientIP = clientIP[:pos]
 	}
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-		if pos := strings.LastIndex(clientIP, ":"); pos != -1 {
-			clientIP = clientIP[:pos]
-		}
-		clientIP = strings.Trim(clientIP, "[]")
-	}
+	clientIP = strings.Trim(clientIP, "[]")
 
 	proxyStart := time.Now()
 	streamURL, err := c.getStreamURLWithCache(metaCtx, id.Value, tidalQuality, clientIP)
@@ -144,13 +178,14 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	log.Printf("[STREAM] PROXY: track=%d type=%s format=%s artist=%q title=%q", id.Value, streamType, contentType, track.Artist.Name, track.Title)
 
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Accept-Ranges", "bytes") // Enable seeking for all players including Tempus/ExoPlayer
 	if strings.Contains(r.URL.Path, "download") {
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 	}
 
 	var stitchErr error
 	if isHLS {
-		stitchErr = c.downloadAndStitchHLS(r.Context(), streamURL, w, clientIP, track)
+		stitchErr = c.downloadAndStitchHLS(r.Context(), streamURL, w, clientIP, track, float64(offset))
 	} else if isDASH {
 		stitchErr = c.downloadAndStitchDASH(r.Context(), streamURL, w, clientIP, track)
 	} else {
