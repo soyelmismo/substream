@@ -173,8 +173,12 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) int {
 		}
 	}
 
-	// Fallback to text search
-	return jm.searchByText(ctx, track.Artist, track.Title)
+	// Fallback to text search (with album for better matching)
+	// Debug: log album info
+	if track.Album == "" {
+		log.Printf("[IMPORT DEBUG] No album info for track: %s - %s", track.Artist, track.Title)
+	}
+	return jm.searchByText(ctx, track.Artist, track.Title, track.Album)
 }
 
 // searchByISRC searches for a track by ISRC code
@@ -193,10 +197,10 @@ func (jm *JobManager) searchByISRC(ctx context.Context, isrc string) *tidalproxy
 	return nil
 }
 
-// searchByText searches for a track by artist and title with fuzzy matching
-func (jm *JobManager) searchByText(ctx context.Context, artist, title string) int {
+// searchByText searches for a track by artist, title, and optionally album
+func (jm *JobManager) searchByText(ctx context.Context, artist, title, album string) int {
 	// For tracks with non-ASCII characters (Japanese, Chinese, etc.)
-	// searching by title only often works better than full artist+title
+	// searching by title + album often works better than full artist+title
 	query := fmt.Sprintf("%s %s", artist, title)
 	hasNonASCII := false
 	for _, r := range artist {
@@ -208,33 +212,32 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title string) in
 
 	results, err := jm.proxy.SearchTracks(ctx, query, maxSearchResults, 0)
 	if err != nil {
-		// Try title-only fallback for non-ASCII
-		if hasNonASCII {
-			results, err = jm.proxy.SearchTracks(ctx, title, maxSearchResults, 0)
+		// Try title+album fallback for non-ASCII
+		if hasNonASCII && album != "" {
+			results, err = jm.proxy.SearchTracks(ctx, fmt.Sprintf("%s %s", title, album), maxSearchResults, 0)
 			if err != nil {
-				return 0
+				results, err = jm.proxy.SearchTracks(ctx, title, maxSearchResults, 0)
 			}
 		} else {
 			return 0
 		}
 	}
 
-	// If no good results and we have non-ASCII, try title-only search
-	if hasNonASCII && len(results) > 0 {
+	// If no good results and we have non-ASCII, try title+album search
+	if hasNonASCII && len(results) > 0 && album != "" {
 		// Check if we got good matches
 		best := 0.0
 		for _, t := range results {
-			score := matchScore(artist, title, t)
+			score := matchScoreWithAlbum(artist, title, album, t)
 			if score > best {
 				best = score
 			}
 		}
-		// If best score is poor, try title-only search
+		// If best score is poor, try title+album search
 		if best < 0.5 {
-			titleResults, err := jm.proxy.SearchTracks(ctx, title, maxSearchResults, 0)
-			if err == nil && len(titleResults) > 0 {
-				// Use title-only results if they give better matches
-				results = titleResults
+			albumResults, err := jm.proxy.SearchTracks(ctx, fmt.Sprintf("%s %s", title, album), maxSearchResults, 0)
+			if err == nil && len(albumResults) > 0 {
+				results = albumResults
 			}
 		}
 	}
@@ -267,11 +270,40 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title string) in
 		return bestMatch
 	}
 
-	// AGGRESSIVE FALLBACK: If no good match but we have results, take the best available
-	// This handles cases where Tidal has the track but fuzzy matching fails (e.g., Japanese characters)
-	// MINIMUM 20% threshold to prevent completely wrong matches
-	if anyMatch != 0 && anyScore >= 0.2 {
-		log.Printf("[IMPORT] Very low confidence match (%.0f%%) - using anyway: %s - %s -> Tidal ID %d",
+	// For non-ASCII tracks (Japanese, etc.), require high title similarity
+	// to avoid importing wrong tracks from same artist
+	if hasNonASCII {
+		// Find best title match specifically
+		bestTitleMatch := 0.0
+		bestTitleTrack := 0
+		for _, t := range results {
+			qTitle := strings.ToLower(title)
+			tTitle := strings.ToLower(t.Title)
+			
+			// Exact match
+			if qTitle == tTitle {
+				return t.ID
+			}
+			
+			// Check title similarity
+			titleSim := similarity(qTitle, tTitle)
+			if titleSim > bestTitleMatch && titleSim >= 0.7 { // Require 70% title match
+				bestTitleMatch = titleSim
+				bestTitleTrack = t.ID
+			}
+		}
+		if bestTitleTrack != 0 {
+			log.Printf("[IMPORT] Title match (%.0f%%) for non-ASCII track: %s - %s -> Tidal ID %d",
+				bestTitleMatch*100, artist, title, bestTitleTrack)
+			return bestTitleTrack
+		}
+		// No good title match found - fail this track
+		return 0
+	}
+
+	// For ASCII tracks without album info, can use fallback with caution
+	if album == "" && anyMatch != 0 && anyScore >= 0.3 {
+		log.Printf("[IMPORT] Fallback match (%.0f%%) - no album info: %s - %s -> Tidal ID %d",
 			anyScore*100, artist, title, anyMatch)
 		return anyMatch
 	}
@@ -282,6 +314,11 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title string) in
 // matchScore calculates similarity between search query and result
 // Returns 0.0-1.0 where 1.0 is perfect match
 func matchScore(queryArtist, queryTitle string, track tidalproxy.TidalTrack) float64 {
+	return matchScoreWithAlbum(queryArtist, queryTitle, "", track)
+}
+
+// matchScoreWithAlbum includes album name in matching for better precision
+func matchScoreWithAlbum(queryArtist, queryTitle, queryAlbum string, track tidalproxy.TidalTrack) float64 {
 	// Normalize strings for comparison
 	normalize := func(s string) string {
 		s = strings.ToLower(s)
@@ -310,6 +347,19 @@ func matchScore(queryArtist, queryTitle string, track tidalproxy.TidalTrack) flo
 
 	titleMatch := similarity(qTitle, tTitle)
 
+	// Check album match if provided (strong signal for correct track)
+	albumMatch := 0.0
+	if queryAlbum != "" {
+		qAlbum := normalize(queryAlbum)
+		tAlbum := normalize(track.Album.Title)
+		albumMatch = similarity(qAlbum, tAlbum)
+		// Bonus for album match
+		if albumMatch > 0.8 {
+			// If album matches well, boost the score significantly
+			titleMatch = maxFloat(titleMatch, 0.9)
+		}
+	}
+
 	// Bonus for exact or near-exact title match (prevents wrong track from same album)
 	if qTitle == tTitle || strings.EqualFold(qTitle, tTitle) {
 		titleMatch = 1.0 // Perfect title match
@@ -322,8 +372,35 @@ func matchScore(queryArtist, queryTitle string, track tidalproxy.TidalTrack) flo
 		return artistMatch * 0.3 // Very low score
 	}
 
-	// Weight: artist 30%, title 70% (title is more important for track identification)
-	return (artistMatch*0.3 + titleMatch*0.7)
+	// PRIORITY: If title matches perfectly (100%), be lenient with artist
+	// This handles cases where artist name format differs (e.g., "豊平区民Toyohirakumin" vs "豊平区民")
+	if titleMatch >= 0.99 {
+		// Perfect title match - artist just needs to be somewhat related
+		// Or album needs to match
+		if artistMatch >= 0.2 || strings.Contains(qArtist, tArtist) || strings.Contains(tArtist, qArtist) {
+			return 0.9 + (artistMatch * 0.1) // 90-100% score
+		}
+		// If album matches well, also accept
+		if albumMatch > 0.7 {
+			return 0.85 // Good score for perfect title + matching album
+		}
+		// Even with poor artist match, if title is perfect, accept it
+		return 0.75 // 75% score for perfect title, unknown artist
+	}
+
+	// Weight: artist 25%, title 65%, album 10% (if provided)
+	score := (artistMatch*0.25 + titleMatch*0.65)
+	if queryAlbum != "" {
+		score = score*0.9 + albumMatch*0.1 // 10% weight to album
+	}
+	return score
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // similarity calculates string similarity
@@ -397,6 +474,7 @@ type trackResult struct {
 	tidalID int
 	artist  string
 	title   string
+	album   string
 }
 
 // processTracksConcurrent processes tracks using a worker pool for concurrent searches
@@ -440,6 +518,7 @@ func (jm *JobManager) processTracksConcurrent(ctx context.Context, tracks []Impo
 					tidalID: tidalID,
 					artist:  job.track.Artist,
 					title:   job.track.Title,
+					album:   job.track.Album,
 				}
 
 				// Rate limiting per worker (still respects proxy limits)

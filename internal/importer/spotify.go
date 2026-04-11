@@ -425,8 +425,22 @@ func parseTrack(track map[string]interface{}) ImportedTrack {
 		}
 	}
 
+	// Debug: log available keys for album extraction
 	if album, ok := track["album"].(map[string]interface{}); ok {
 		result.Album = getString(album, "name", "title", "")
+	} else if track["album"] != nil {
+		// Album field exists but is not a map - log for debug
+		log.Printf("[SPOTIFY DEBUG] Album field type: %T, value: %v", track["album"], track["album"])
+	}
+
+	// Also try alternative album fields
+	if result.Album == "" {
+		for _, key := range []string{"albumName", "album_title", "releaseName"} {
+			if val, ok := track[key].(string); ok && val != "" {
+				result.Album = val
+				break
+			}
+		}
 	}
 
 	return result
