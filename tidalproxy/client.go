@@ -722,7 +722,6 @@ func (p *Pool) GetCoverByTrackID(ctx context.Context, trackID int) (*TidalCover,
 }
 
 func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error) {
-	// Usar endpoint directo /recommendations/ de hifi-api (usa API nativa de Tidal)
 	q := url.Values{
 		"id": {fmt.Sprint(trackID)},
 	}
@@ -732,24 +731,27 @@ func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrac
 		return nil, err
 	}
 
-	// Estructura real de Tidal: data.items[].track
-	var result struct {
-		Data struct {
+	// [Resilience] Support multiple Tidal API response formats (Direct Items or Data Wrapper)
+	var resp struct {
+		Items []TidalTrack `json:"items"`
+		Data  struct {
 			Items []struct {
 				Track TidalTrack `json:"track"`
 			} `json:"items"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("[TIDAL] GetRecommendations PARSE ERROR for track %d: %v", trackID, err)
-		return nil, err
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode recommendations: %w", err)
 	}
 
-	// Extraer tracks del wrapper
-	tracks := make([]TidalTrack, 0, len(result.Data.Items))
-	for _, item := range result.Data.Items {
-		if item.Track.ID != 0 {
-			tracks = append(tracks, item.Track)
+	var tracks []TidalTrack
+	if len(resp.Items) > 0 {
+		tracks = resp.Items
+	} else if len(resp.Data.Items) > 0 {
+		for _, item := range resp.Data.Items {
+			if item.Track.ID != 0 {
+				tracks = append(tracks, item.Track)
+			}
 		}
 	}
 
@@ -758,42 +760,40 @@ func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrac
 }
 
 func (p *Pool) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) {
-	// Use a popular artist or a generic search if no direct top-tracks endpoint
+	// Fallback to searching for popular tracks if no direct top-tracks endpoint
+	q := url.Values{
+		"s":     {"top"}, // Search for 'top' songs
+		"limit": {fmt.Sprint(limit)},
+	}
 	var result struct {
 		Items []TidalTrack `json:"items"`
 	}
-	q := url.Values{
-		"query": {"top"},
-		"limit": {fmt.Sprint(limit)},
-	}
-	if err := p.apiGet(ctx, "/search/tracks/", q, &result, ""); err != nil {
+	// Use /search/ instead of /search/tracks/ to avoid 404 in hifi-api
+	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
 		return nil, err
 	}
 	return result.Items, nil
 }
 
 func (p *Pool) GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) {
-	// Our proxy (hifi-api) doesn't have a dedicated /artist/toptracks/ endpoint.
-	// Instead, the /artist/ endpoint with the 'f' parameter returns an aggregate
-	// response that includes top_tracks.
+	// Our proxy (hifi-api) aggregation returns top tracks in the 'tracks' field.
 	q := url.Values{
-		"f": {fmt.Sprint(artistID)},
+		"f":           {fmt.Sprint(artistID)},
+		"skip_tracks": {"true"},
 	}
 
 	var result struct {
-		TopTracks []TidalTrack `json:"top_tracks"`
+		Tracks []TidalTrack `json:"tracks"`
 	}
 
 	if err := p.apiGet(ctx, "/artist/", q, &result, ""); err != nil {
 		return nil, err
 	}
 
-	// Apply limit if necessary (proxy returns ~15 by default)
-	if len(result.TopTracks) > limit && limit > 0 {
-		return result.TopTracks[:limit], nil
+	if len(result.Tracks) > limit && limit > 0 {
+		return result.Tracks[:limit], nil
 	}
-
-	return result.TopTracks, nil
+	return result.Tracks, nil
 }
 
 // GetArtistAlbumCount returns the number of albums for an artist

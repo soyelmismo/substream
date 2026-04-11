@@ -225,14 +225,14 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 	case specid.Track:
 		trackID = id.Value()
 	case specid.Artist:
-		// fast timeout for artist
+		// Use top tracks for artist - much faster than full discography aggregation
 		ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
-		page, err := c.proxy.GetArtistAlbums(ctx, id.Value(), false)
+		top, err := c.proxy.GetArtistTopTracks(ctx, id.Value(), 1)
 		cancel()
-		if err != nil || page == nil || len(page.Tracks) == 0 {
+		if err != nil || len(top) == 0 {
 			return c.ServeGetRandomSongs(r)
 		}
-		trackID = page.Tracks[0].ID
+		trackID = top[0].ID
 	default:
 		return c.ServeGetRandomSongs(r)
 	}
