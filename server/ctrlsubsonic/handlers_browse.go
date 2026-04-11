@@ -30,6 +30,16 @@ func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
 	artistIDs := extractIDsFromURIs(artistURIs)
 
 	artists := c.batchFetchArtists(r, artistIDs)
+	
+	// Filter out artists with 0 albums to avoid showing empty entries
+	filtered := make([]*spec.Artist, 0, len(artists))
+	for _, a := range artists {
+		if a.AlbumCount > 0 {
+			filtered = append(filtered, a)
+		}
+	}
+	artists = filtered
+
 	indexes := c.buildArtistIndexes(artists)
 
 	sub := spec.NewResponse()
@@ -79,6 +89,15 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 			c.hydrateArtistBackground(a.ID.Value())
 		}
 	}
+
+	// Filter out artists with 0 albums to avoid showing empty entries in the list
+	filteredArtists := make([]*spec.Artist, 0, len(artists))
+	for _, a := range artists {
+		if a.AlbumCount > 0 {
+			filteredArtists = append(filteredArtists, a)
+		}
+	}
+	artists = filteredArtists
 
 	indexes := c.buildArtistIndexes(artists)
 
