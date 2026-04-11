@@ -255,22 +255,63 @@ func migrateBookmarksTable(tx *gorm.DB) error {
 		}
 	}
 
-	// Populate URI
-	if err := tx.Exec(`
-		UPDATE bookmarks 
-		SET uri = 'td:tr:' || CAST(tidal_id AS TEXT),
-		    provider = 'tidal'
-		WHERE uri IS NULL OR uri = ''
-	`).Error; err != nil {
-		if isNoSuchColumnError(err, "tidal_id") {
-			return nil
-		}
-		return fmt.Errorf("populate uri: %w", err)
+	// Drop tidal_id column by recreating the table
+	if err := dropBookmarksTidalIDColumn(tx); err != nil {
+		return fmt.Errorf("drop tidal_id column: %w", err)
 	}
 
 	return nil
 }
 
+// dropBookmarksTidalIDColumn recreates the bookmarks table without tidal_id
+func dropBookmarksTidalIDColumn(tx *gorm.DB) error {
+	var count int
+	err := tx.Raw(`SELECT COUNT(*) FROM pragma_table_info('bookmarks') WHERE name = 'tidal_id'`).Scan(&count).Error
+	if err != nil || count == 0 {
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Dropping tidal_id from bookmarks table...")
+	if err := tx.Exec(`PRAGMA foreign_keys = OFF`).Error; err != nil {
+		return err
+	}
+	defer tx.Exec(`PRAGMA foreign_keys = ON`)
+
+	steps := []string{
+		`CREATE TABLE bookmarks_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			uri TEXT NOT NULL,
+			provider TEXT DEFAULT 'tidal',
+			isrc TEXT,
+			fallback_artist TEXT,
+			fallback_title TEXT,
+			position INTEGER NOT NULL DEFAULT 0,
+			comment TEXT DEFAULT '',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`INSERT INTO bookmarks_new (id, user_id, uri, provider, isrc, fallback_artist, fallback_title, position, comment, created_at, updated_at)
+		 SELECT id, user_id, uri, provider, isrc, fallback_artist, fallback_title, position, comment, created_at, updated_at FROM bookmarks`,
+		`DROP TABLE bookmarks`,
+		`ALTER TABLE bookmarks_new RENAME TO bookmarks`,
+		`CREATE INDEX idx_bookmark_uri ON bookmarks(uri)`,
+		`CREATE INDEX idx_bookmark_isrc ON bookmarks(isrc)`,
+	}
+	for _, step := range steps {
+		if err := tx.Exec(step).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MigrateFixBookmarks ensures tidal_id is dropped from bookmarks table
+func MigrateFixBookmarks(db *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		return dropBookmarksTidalIDColumn(tx)
+	})
+}
 // migratePlayQueueTable handles the play_queues table with CurrentURI and Items as JSON array of URIs
 func migratePlayQueueTable(tx *gorm.DB) error {
 	// Add new columns
@@ -529,6 +570,11 @@ func (db *DB) Migrate() error {
 	// Ensure metadata_cache table exists (for global virtual library)
 	if err := MigrateMetadataCacheTable(db.DB); err != nil {
 		return fmt.Errorf("metadata_cache migration failed: %w", err)
+	}
+
+	// Fix bookmarks table (drop tidal_id NOT NULL constraint)
+	if err := MigrateFixBookmarks(db.DB); err != nil {
+		log.Printf("[MIGRATION] Bookmarks fix warning: %v", err)
 	}
 
 	// Fix tables that were accidentally pluralized by GORM (drop metadata_caches, track_metadatas)

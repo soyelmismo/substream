@@ -622,7 +622,12 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	for i, s := range artistStars {
 		artistIDs[i] = extractIDFromURI(s.URI)
 	}
-	results.Artists = c.batchFetchArtists(r, artistIDs)
+	artists := c.batchFetchArtists(r, artistIDs)
+	for _, a := range artists {
+		if a.AlbumCount > 0 {
+			results.Artists = append(results.Artists, a)
+		}
+	}
 
 	sub := spec.NewResponse()
 	sub.StarredTwo = results

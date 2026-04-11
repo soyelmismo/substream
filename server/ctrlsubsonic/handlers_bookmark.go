@@ -23,25 +23,32 @@ func (c *Controller) ServeGetBookmarks(r *http.Request) *spec.Response {
 	}
 	tracks := c.batchFetchTracks(r, tidalIDs)
 
-	sub := spec.NewResponse()
-	sub.Bookmarks = &spec.Bookmarks{
-		List: make([]*spec.Bookmark, 0, len(tracks)),
+	results := make([]*spec.Bookmark, 0, len(bookmarks))
+	for _, b := range bookmarks {
+		// Find matching track child
+		var track *spec.TrackChild
+		tid := extractIDFromURI(b.URI)
+		for _, t := range tracks {
+			if t != nil && t.ID != nil && t.ID.Value() == tid {
+				track = t
+				break
+			}
+		}
+
+		if track != nil {
+			results = append(results, &spec.Bookmark{
+				Entry:    track,
+				Username: user.Name,
+				Position: b.Position,
+				Comment:  b.Comment,
+				Created:  b.CreatedAt,
+				Changed:  b.UpdatedAt,
+			})
+		}
 	}
 
-	for i, tc := range tracks {
-		if tc == nil {
-			continue
-		}
-		bm := bookmarks[i]
-		sub.Bookmarks.List = append(sub.Bookmarks.List, &spec.Bookmark{
-			Entry:    tc,
-			Username: user.Name,
-			Position: bm.Position,
-			Comment:  bm.Comment,
-			Created:  bm.CreatedAt,
-			Changed:  bm.UpdatedAt,
-		})
-	}
+	sub := spec.NewResponse()
+	sub.Bookmarks = &spec.Bookmarks{List: results}
 	return sub
 }
 
