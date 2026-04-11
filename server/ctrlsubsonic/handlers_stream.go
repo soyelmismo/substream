@@ -33,8 +33,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	rangeHdr := r.Header.Get("Range")
 	log.Printf("[STREAM] REQUEST: client=%s raw_id=%s parsed_track_id=%d range=%q", client, rawID, id.Value, rangeHdr)
 
-	// Deduplicate concurrent stream requests for same track+client
-	// If client sends duplicate requests, wait for the first one to complete
+	// Get client IP for proxy requests
 	clientIP := r.Header.Get("X-Forwarded-For")
 	if clientIP == "" {
 		clientIP = r.Header.Get("X-Real-IP")
@@ -42,32 +41,6 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	if clientIP == "" {
 		clientIP = r.RemoteAddr
 	}
-	streamKey := fmt.Sprintf("%s:%d", clientIP, id.Value)
-	
-	type streamLock struct {
-		done chan struct{}
-	}
-	
-	lockVal, loaded := c.streamLocks.LoadOrStore(streamKey, &streamLock{done: make(chan struct{})})
-	if loaded {
-		// Another stream is in progress for this track+client, wait for it
-		log.Printf("[STREAM] DEDUP: client=%s track=%d already streaming, waiting...", client, id.Value)
-		lp := lockVal.(*streamLock)
-		select {
-		case <-lp.done:
-			log.Printf("[STREAM] DEDUP: client=%s track=%d previous stream complete, returning", client, id.Value)
-			return nil // Previous stream completed successfully
-		case <-r.Context().Done():
-			log.Printf("[STREAM] DEDUP: client=%s track=%d client disconnected while waiting", client, id.Value)
-			return nil // Client disconnected
-		}
-	}
-	
-	// We own this stream, clean up lock when done
-	defer func() {
-		c.streamLocks.Delete(streamKey)
-		close(lockVal.(*streamLock).done)
-	}()
 
 	bitrate := p.GetOrInt("maxBitRate", 0)
 	offset := p.GetOrInt("timeOffset", 0) // Time-based seeking offset in seconds
@@ -178,7 +151,12 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	log.Printf("[STREAM] PROXY: track=%d type=%s format=%s artist=%q title=%q", id.Value, streamType, contentType, track.Artist.Name, track.Title)
 
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Accept-Ranges", "bytes") // Enable seeking for all players including Tempus/ExoPlayer
+	
+	// Only advertise Accept-Ranges for direct streams (FLAC/MP3)
+	// HLS/DASH stitcheado doesn't support byte-range seeking
+	if !isHLS && !isDASH {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
 	if strings.Contains(r.URL.Path, "download") {
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 	}
