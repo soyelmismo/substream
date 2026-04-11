@@ -112,4 +112,23 @@
     </div>
 </div>
 
+<!-- Cache Management Block -->
+{{ if .User.IsAdmin }}
+<div class="border-b-2 border-r-2 border-gray-300/80 bg-gray-50 p-4">
+    <div class="inline-flex items-center gap-x-3">
+        <span class="text-gray-500/80 w-4">
+            <svg class="fill-current aspect-square" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M480 128c0-17.7-14.3-32-32-32H304l-64-64H128c-17.7 0-32 14.3-32 32v32H48c-26.5 0-48 21.5-48 48v288c0 26.5 21.5 48 48 48h384c26.5 0 48-21.5 48-48V176c0-26.5-21.5-48-48-48h-48V128zm-16 144c0 8.8-7.2 16-16 16H304v48c0 8.8-7.2 16-16 16s-16-7.2-16-16v-48H112c-8.8 0-16-7.2-16-16s7.2-16 16-16h160v-48c0-8.8 7.2-16 16-16s16 7.2 16 16v48h144c8.8 0 16 7.2 16 16z"/></svg>
+        </span>
+        <span class="text-gray-900 font-bold">cache management</span>
+    </div>
+    <hr class="bg-gray-900/30 my-1" />
+    <div class="font-medium text-gray-500 max-w-[700px]">clear cached metadata from tidal api responses</div>
+    <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
+        <form class="contents" action="{{ path "/admin/clear_cache_do" }}" method="post">
+            <input type="submit" value="clear all cache" onclick="return confirm('Are you sure you want to clear all cached metadata?');">
+        </form>
+    </div>
+</div>
+{{ end }}
+
 {{ template "foot" . }}

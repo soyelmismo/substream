@@ -306,3 +306,12 @@ func (c *CachedProxy) Close() {
 	c.albumArt.Stop()
 	c.albumCount.Stop()
 }
+
+// ClearAll clears all in-memory LRU caches
+func (c *CachedProxy) ClearAll() {
+	c.tracks.Clear()
+	c.albums.Clear()
+	c.artists.Clear()
+	c.albumArt.Clear()
+	c.albumCount.Clear()
+}

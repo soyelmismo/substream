@@ -14,7 +14,6 @@ import (
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
-
 func (c *Controller) ServeNotFound(_ *http.Request) *Response {
 	return &Response{template: "not_found.tmpl", code: 404}
 }
@@ -35,7 +34,7 @@ func (c *Controller) ServeHome(r *http.Request) *Response {
 		Artists: artists,
 		Tracks:  tracks,
 	}
-	
+
 	data.RequestRoot = handlerutil.BaseURL(r)
 	data.DefaultListenBrainzURL = listenbrainz.BaseURL
 
@@ -88,9 +87,6 @@ func (c *Controller) ServeUnlinkListenBrainzDo(r *http.Request) *Response {
 	}
 	return &Response{redirect: "/admin/home"}
 }
-
-
-
 
 func (c *Controller) ServeChangeUsername(r *http.Request) *Response {
 	user, err := selectedUserIfAdmin(c, r)
@@ -257,12 +253,12 @@ func (c *Controller) ServeCreateUserDo(r *http.Request) *Response {
 			flashW:   []string{err.Error()},
 		}
 	}
-	
+
 	// Check role selection
 	roleVal := r.FormValue("role")
 	log.Printf("[ADMIN] Creating user %s, role: %q", username, roleVal)
 	isAdmin := roleVal == "admin"
-	
+
 	user := db.User{
 		Name:     username,
 		Password: passwordOne,
@@ -274,7 +270,7 @@ func (c *Controller) ServeCreateUserDo(r *http.Request) *Response {
 			flashW:   []string{fmt.Sprintf("could not create user %q: %v", username, err)},
 		}
 	}
-	
+
 	role := "user"
 	if isAdmin {
 		role = "admin"
@@ -298,7 +294,7 @@ func getAvatarFile(r *http.Request) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
 	}
-	
+
 	// Just stub out resizing since nfnt/resize is removed in SubStream
 	var buff bytes.Buffer
 	if err := jpeg.Encode(&buff, i, nil); err != nil {
@@ -327,14 +323,14 @@ func (c *Controller) ServeProxies(r *http.Request) *Response {
 
 	data := &templateData{}
 	data.Proxies = proxies
-	
+
 	// Get mirror stats from MirrorManager
 	if cachedProxy, ok := c.proxy.(*tidalproxy.CachedProxy); ok {
 		if mgr := cachedProxy.GetMirrorManager(); mgr != nil {
 			data.MirrorStats = mgr.GetStatus()
 		}
 	}
-	
+
 	return &Response{
 		template: "proxies.tmpl",
 		data:     data,
@@ -388,4 +384,14 @@ func (c *Controller) syncProxyPool() error {
 	}
 	c.proxy.SetInstances(urls)
 	return nil
+}
+
+func (c *Controller) ServeClearCacheDo(r *http.Request) *Response {
+	// Clear SQLite metadata_cache
+	if err := c.dbc.ClearAllCache(); err != nil {
+		return &Response{redirect: "/admin/home", flashW: []string{fmt.Sprintf("clear sqlite cache: %v", err)}}
+	}
+	// Clear in-memory LRU caches
+	c.proxy.ClearAll()
+	return &Response{redirect: "/admin/home", flashN: []string{"all caches cleared successfully (SQLite + in-memory)"}}
 }

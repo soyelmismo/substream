@@ -29,7 +29,6 @@ import (
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
-
 type CtxKey int
 
 const (
@@ -46,7 +45,6 @@ type Controller struct {
 	resolveProxyPath ProxyPathResolver
 }
 
-
 type ProxyPathResolver func(in string) string
 
 func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resolveProxyPath ProxyPathResolver) (*Controller, error) {
@@ -58,7 +56,6 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resol
 		proxy:            proxy,
 		resolveProxyPath: resolveProxyPath,
 	}
-
 
 	resp := respHandler(adminui.TemplatesFS, resolveProxyPath)
 
@@ -107,7 +104,9 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resol
 	c.Handle("/add_proxy_do", adminChain(resp(c.ServeAddProxyDo)))
 	c.Handle("/delete_proxy_do", adminChain(resp(c.ServeDeleteProxyDo)))
 
-	
+	// admin cache
+	c.Handle("/clear_cache_do", adminChain(resp(c.ServeClearCacheDo)))
+
 	// Unused endpoints removed
 
 	c.Handle("/", baseChain(resp(c.ServeNotFound)))
@@ -276,10 +275,10 @@ type templateData struct {
 	Version string
 
 	// home
-	Stats                StatsData
-	RequestRoot          string
-	
-	AllUsers             []*db.User
+	Stats       StatsData
+	RequestRoot string
+
+	AllUsers []*db.User
 
 	CurrentLastFMAPIKey    string
 	CurrentLastFMAPISecret string
@@ -294,10 +293,9 @@ type templateData struct {
 	MirrorStats string
 
 	// settings
-	AutoRegister   bool
-	ProxyStreams   bool
+	AutoRegister bool
+	ProxyStreams bool
 }
-
 
 func funcMap() template.FuncMap {
 	return template.FuncMap{

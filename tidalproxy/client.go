@@ -34,7 +34,7 @@ type Pool struct {
 	client    *http.Client
 	quality   string
 	mu        sync.RWMutex
-	
+
 	// New mirror manager for intelligent selection
 	mirrorMgr *MirrorManager
 }
@@ -66,12 +66,12 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 	for _, u := range urls {
 		mirrorConfigs = append(mirrorConfigs, MirrorConfig{
 			URL:            strings.TrimSuffix(u, "/"),
-			Weight:         100, // Default weight
+			Weight:         100,           // Default weight
 			HealthEndpoint: "/info/?id=1", // Lightweight endpoint for health checks
 		})
 		p.instances = append(p.instances, &instance{url: strings.TrimSuffix(u, "/")})
 	}
-	
+
 	p.mirrorMgr = NewMirrorManager(mirrorConfigs, cfg.HealthInterval)
 	p.mirrorMgr.Start()
 	log.Printf("[POOL] Initialized with %d mirrors using intelligent routing", len(mirrorConfigs))
@@ -88,7 +88,7 @@ func (p *Pool) SetInstances(urls []string) {
 	for _, u := range urls {
 		p.instances = append(p.instances, &instance{url: strings.TrimSuffix(u, "/")})
 	}
-	
+
 	// Update MirrorManager with new mirrors
 	if p.mirrorMgr != nil {
 		p.mirrorMgr.UpdateMirrors(urls)
@@ -146,16 +146,16 @@ func (p *Pool) pick() (string, error) {
 // It handles proxy selection, URL construction, header injection, and the 3-attempt retry loop.
 func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
 	var lastErr error
-	
+
 	for i := 0; i < 3; i++ {
 		// Use intelligent mirror selection with MirrorManager
 		var base string
 		var selectedMirror *Mirror
-		
+
 		if p.mirrorMgr != nil {
 			selectedMirror = p.mirrorMgr.SelectMirror()
 		}
-		
+
 		if selectedMirror != nil {
 			base = selectedMirror.URL
 			log.Printf("[TIDAL] Selected mirror: %s (state=%s)", base, selectedMirror.GetState())
@@ -186,7 +186,7 @@ func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, cl
 		start := time.Now()
 		resp, err := p.client.Do(req)
 		latency := time.Since(start)
-		
+
 		if err != nil {
 			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
 			if selectedMirror != nil {
@@ -211,12 +211,12 @@ func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, cl
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		
+
 		// Report success to mirror manager
 		if selectedMirror != nil {
 			p.mirrorMgr.ReportResult(selectedMirror, latency, err)
 		}
-		
+
 		return body, err
 	}
 	return nil, lastErr
@@ -260,7 +260,7 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 	start := time.Now()
 	resp, err := p.client.Do(req)
 	latency := time.Since(start)
-	
+
 	if err != nil {
 		if mirror != nil {
 			p.mirrorMgr.ReportResult(mirror, latency, err)
@@ -280,11 +280,11 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	
+
 	if mirror != nil {
 		p.mirrorMgr.ReportResult(mirror, latency, err)
 	}
-	
+
 	return body, err
 }
 
@@ -828,7 +828,7 @@ func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrac
 		log.Printf("[TIDAL] GetRecommendations ERROR for track %d: %v", trackID, err)
 		return nil, err
 	}
-	
+
 	// Estructura real de Tidal: data.items[].track
 	var result struct {
 		Data struct {
@@ -841,7 +841,7 @@ func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrac
 		log.Printf("[TIDAL] GetRecommendations PARSE ERROR for track %d: %v", trackID, err)
 		return nil, err
 	}
-	
+
 	// Extraer tracks del wrapper
 	tracks := make([]TidalTrack, 0, len(result.Data.Items))
 	for _, item := range result.Data.Items {
@@ -849,7 +849,7 @@ func (p *Pool) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrac
 			tracks = append(tracks, item.Track)
 		}
 	}
-	
+
 	log.Printf("[TIDAL] GetRecommendations track %d: got %d recommendations", trackID, len(tracks))
 	return tracks, nil
 }
@@ -877,7 +877,7 @@ func (p *Pool) GetArtistTopTracks(ctx context.Context, artistID int, limit int) 
 		"id":    {fmt.Sprint(artistID)},
 		"limit": {fmt.Sprint(limit)},
 	}
-	// Many proxies use /artist/toptracks/ or similar. 
+	// Many proxies use /artist/toptracks/ or similar.
 	// The most common route in hifi-api derivatives for this is /artist/toptracks/
 	if err := p.apiGet(ctx, "/artist/toptracks/", q, &result, ""); err != nil {
 		return nil, err
@@ -991,4 +991,9 @@ func parseManifestURL(trackID int, version, mimeType, manifest string) (string, 
 	}
 
 	return "", fmt.Errorf("could not extract URL from manifest (type: %s content preview: %.50s)", mimeType, content)
+}
+
+// ClearAll is a no-op for Pool as it has no internal caches
+func (p *Pool) ClearAll() {
+	// Pool has no in-memory caches to clear
 }

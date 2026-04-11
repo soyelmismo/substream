@@ -371,3 +371,13 @@ func (db *DB) GetCacheStats() (total int64, expired int64, oldest time.Time, new
 
 	return
 }
+
+// ClearAllCache removes all entries from the metadata_cache
+func (db *DB) ClearAllCache() error {
+	result := db.Exec("DELETE FROM metadata_cache")
+	if result.Error != nil {
+		return result.Error
+	}
+	log.Printf("[CACHE] Cleared all metadata_cache entries: %d deleted", result.RowsAffected)
+	return nil
+}
