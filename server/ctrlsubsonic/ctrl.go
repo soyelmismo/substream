@@ -159,7 +159,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 
 	// Streaming
 	c.Handle("/stream", chainRaw(respRaw(c.ServeStream)))
-	c.Handle("/download", chainRaw(respRaw(c.ServeStream)))
+	c.Handle("/download", chainRaw(respRaw(c.ServeDownload)))
 	c.Handle("/getCoverArt", chainRaw(respRaw(c.ServeGetCoverArt)))
 
 	// Stars & Ratings

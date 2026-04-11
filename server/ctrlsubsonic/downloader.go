@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.senan.xyz/gonic/tidalproxy"
 )
@@ -92,45 +93,98 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		return fmt.Errorf("no segments found in manifest")
 	}
 
-	// 3. Download and stream segments with tagging
-	tagger := &flacTagger{w: w, track: track}
+	// 3. Download and stream segments with tagging (concurrent for speed)
+	// Use optimized client with keep-alive for better performance
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true,
+		},
+	}
+
+	// Download segments concurrently for better throughput
+	const maxConcurrency = 6 // Limit concurrent downloads
+	semaphore := make(chan struct{}, maxConcurrency)
+	type segmentResult struct {
+		index int
+		data  []byte
+		err   error
+	}
+	results := make(chan segmentResult, len(segments))
+
+	// Launch concurrent downloads
 	for i, segmentURL := range segments {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+		semaphore <- struct{}{} // Acquire
+		go func(idx int, url string) {
+			defer func() { <-semaphore }() // Release
 
-		// fetch segment
-		sReq, _ := http.NewRequestWithContext(ctx, "GET", segmentURL, nil)
-		sReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-		if clientIP != "" {
-			sReq.Header.Set("X-Forwarded-For", clientIP)
-		}
-		sResp, err := http.DefaultClient.Do(sReq)
-		if err != nil {
-			return err
-		}
+			data, err := downloadSegment(ctx, client, url, clientIP)
+			results <- segmentResult{idx, data, err}
+		}(i, segmentURL)
+	}
 
-		if i == 0 {
+	// Collect results in order
+	segmentData := make([][]byte, len(segments))
+	for i := 0; i < len(segments); i++ {
+		res := <-results
+		if res.err != nil {
+			return fmt.Errorf("segment %d failed: %w", res.index, res.err)
+		}
+		segmentData[res.index] = res.data
+	}
+
+	// Write segments in order with optional tagging
+	tagger := &flacTagger{w: w, track: track}
+	for i, data := range segmentData {
+		if i == 0 && track != nil {
 			// First segment might need tagging if it's FLAC
-			if err := tagger.process(sResp.Body, c); err != nil {
-				log.Printf("[DOWNLOAD] tagging failed, falling back to raw: %v", err)
-				_, err = io.Copy(w, sResp.Body)
-				if err != nil {
-					sResp.Body.Close()
+			if err := tagger.process(bytes.NewReader(data), c); err != nil {
+				log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
+				if _, err := w.Write(data); err != nil {
 					return err
 				}
 			}
 		} else {
-			_, err := io.Copy(w, sResp.Body)
-			if err != nil {
-				sResp.Body.Close()
+			if _, err := w.Write(data); err != nil {
 				return err
 			}
 		}
-		sResp.Body.Close()
 	}
 
 	return nil
+}
+
+func downloadSegment(ctx context.Context, client *http.Client, url, clientIP string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// Pre-allocate buffer based on Content-Length if available
+	var buf bytes.Buffer
+	if cl := resp.ContentLength; cl > 0 && cl < 10*1024*1024 { // Max 10MB per segment
+		buf.Grow(int(cl))
+	}
+
+	_, err = io.Copy(&buf, resp.Body)
+	return buf.Bytes(), err
 }
 
 func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack) error {
