@@ -29,6 +29,7 @@ func NewRegistry() *Registry {
 	}
 	// Register default providers
 	r.Register(&SpotifyProvider{})
+	r.Register(&DeezerProvider{})
 	return r
 }
 
