@@ -35,5 +35,6 @@ type TidalProxy interface {
 
 	// Management
 	SetInstances(urls []string)
+	GetMirrorManager() *MirrorManager
 	ClearAll() // Clear all in-memory caches
 }

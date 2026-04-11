@@ -486,6 +486,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 	return sub
 }
 
+
 func (c *Controller) ServeGetSong(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	user := r.Context().Value(CtxUser).(*db.User)

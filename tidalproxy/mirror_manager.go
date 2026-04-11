@@ -41,12 +41,13 @@ type Mirror struct {
 	HealthEndpoint string // e.g., "/health" or just "/" for HEAD check
 	
 	// Runtime stats - accessed via atomic
-	state        atomic.Int32 // MirrorState
-	latencyEMA   atomic.Int64 // nanoseconds, exponential moving average
-	failCount    atomic.Int32
-	lastFail     atomic.Int64 // unix timestamp
-	lastSuccess  atomic.Int64 // unix timestamp
-	requestCount atomic.Int64
+	state          atomic.Int32 // MirrorState
+	latencyEMA     atomic.Int64 // nanoseconds, exponential moving average
+	failCount      atomic.Int32
+	activeRequests atomic.Int32
+	lastFail       atomic.Int64 // unix timestamp
+	lastSuccess    atomic.Int64 // unix timestamp
+	requestCount   atomic.Int64
 }
 
 // MirrorManager manages multiple proxy mirrors with health checking
@@ -64,6 +65,7 @@ type MirrorManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	gate   chan struct{}
 }
 
 // MirrorConfig for initializing mirrors
@@ -97,6 +99,8 @@ func NewMirrorManager(configs []MirrorConfig, healthCheckInterval time.Duration)
 		m.latencyEMA.Store(int64(100 * time.Millisecond)) // Initial estimate
 		mm.mirrors = append(mm.mirrors, m)
 	}
+
+	mm.gate = make(chan struct{}, len(mm.mirrors))
 	
 	return mm
 }
@@ -167,74 +171,78 @@ func (mm *MirrorManager) Stop() {
 }
 
 // SelectMirror chooses the best mirror based on health and latency
+// AcquireToken waits for a proxy to become available
+func (mm *MirrorManager) AcquireToken(ctx context.Context) error {
+	select {
+	case mm.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ReleaseToken frees a proxy for the next request in queue
+func (mm *MirrorManager) ReleaseToken() {
+	<-mm.gate
+}
+
 func (mm *MirrorManager) SelectMirror() *Mirror {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
-	
-	if len(mm.mirrors) == 0 {
-		return nil
-	}
-	
-	// Filter healthy mirrors
-	var candidates []*Mirror
+
+	var healthyMirrors []*Mirror
 	for _, m := range mm.mirrors {
 		if m.GetState() == StateHealthy {
-			candidates = append(candidates, m)
+			healthyMirrors = append(healthyMirrors, m)
 		}
 	}
-	
-	// If no healthy mirrors, try probing ones
-	if len(candidates) == 0 {
-		for _, m := range mm.mirrors {
-			if m.GetState() == StateProbing {
-				candidates = append(candidates, m)
-			}
+
+	if len(healthyMirrors) == 0 {
+		return nil
+	}
+
+	// [New Strategy] Preference for IDLE mirrors first (activeRequests == 0)
+	var idleMirrors []*Mirror
+	for _, m := range healthyMirrors {
+		if m.activeRequests.Load() == 0 {
+			idleMirrors = append(idleMirrors, m)
 		}
 	}
-	
-	// If still none, force pick from all (even unhealthy)
-	if len(candidates) == 0 {
-		candidates = mm.mirrors
+
+	// Use idle pool if available, otherwise use all healthy ones
+	selectionPool := idleMirrors
+	if len(selectionPool) == 0 {
+		selectionPool = healthyMirrors
 	}
-	
-	if len(candidates) == 1 {
-		return candidates[0]
+
+	if len(selectionPool) == 1 {
+		return selectionPool[0]
 	}
-	
-	// Weighted selection based on performance score
-	// Score = (1/latency) * weight
-	type scoredMirror struct {
-		mirror *Mirror
-		score  float64
-	}
-	
-	scores := make([]scoredMirror, 0, len(candidates))
+
+	// Weighted Random Selection (Shotgun Spread)
 	var totalScore float64
-	
-	for _, m := range candidates {
-		latency := time.Duration(m.latencyEMA.Load())
-		if latency < 1*time.Millisecond {
-			latency = 1 * time.Millisecond
-		}
-		
-		score := (1.0 / float64(latency)) * float64(m.Weight)
-		scores = append(scores, scoredMirror{m, score})
+	type scoredMirror struct {
+		m     *Mirror
+		limit float64
+	}
+	var scoredPool []scoredMirror
+
+	for _, m := range selectionPool {
+		_, latency, _, _ := m.GetStats()
+		// Score = (1/latency) * weight
+		score := 1.0 / (float64(latency+1) / float64(time.Millisecond)) * float64(m.Weight)
 		totalScore += score
+		scoredPool = append(scoredPool, scoredMirror{m: m, limit: totalScore})
 	}
-	
-	// Weighted random selection
-	pick := rand.Float64() * totalScore
-	var cumulative float64
-	
-	for _, sm := range scores {
-		cumulative += sm.score
-		if pick <= cumulative {
-			return sm.mirror
+
+	r := rand.Float64() * totalScore
+	for _, sm := range scoredPool {
+		if r <= sm.limit {
+			return sm.m
 		}
 	}
-	
-	// Fallback to last
-	return scores[len(scores)-1].mirror
+
+	return selectionPool[0]
 }
 
 // ReportResult updates mirror stats after a request
@@ -245,10 +253,16 @@ func (mm *MirrorManager) ReportResult(m *Mirror, latency time.Duration, err erro
 		m.failCount.Add(1)
 		m.lastFail.Store(time.Now().Unix())
 		
+		errStr := err.Error()
+		isRateLimit := strings.Contains(errStr, "429")
+
 		// Check if we should circuit break
-		if int(m.failCount.Load()) >= mm.failureThreshold && m.GetState() == StateHealthy {
+		// [New] 429 (Rate Limit) causes immediate unhealthy state
+		if (isRateLimit || int(m.failCount.Load()) >= mm.failureThreshold) && m.GetState() == StateHealthy {
 			m.SetState(StateUnhealthy)
-			log.Printf("[MIRROR] %s marked unhealthy after %d failures", m.URL, m.failCount.Load())
+			reason := "multiple failures"
+			if isRateLimit { reason = "rate limited (429)" }
+			log.Printf("[MIRROR] %s marked unhealthy: %s", m.URL, reason)
 		}
 		return
 	}
@@ -330,6 +344,9 @@ func (mm *MirrorManager) runHealthChecks() {
 
 // checkMirror probes a single mirror
 func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
+	m.activeRequests.Add(1)
+	defer m.activeRequests.Add(-1)
+
 	start := time.Now()
 	
 	endpoint := m.URL + m.HealthEndpoint
@@ -348,6 +365,12 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 	resp, err := client.Do(req)
 	latency := time.Since(start)
 	
+	// Final health check - if it was marked as unhealthy while we were starting, fail fast
+	if m.GetState() == StateUnhealthy {
+		if resp != nil { resp.Body.Close() }
+		return
+	}
+
 	if err != nil {
 		// Failed - might be network error
 		if m.GetState() == StateHealthy {
@@ -391,4 +414,11 @@ func (mm *MirrorManager) GetStatus() string {
 			m.URL, state, latency, fails, reqs, m.Weight)
 	}
 	return status
+}
+
+// GetMirrors returns the list of mirrors (readonly)
+func (mm *MirrorManager) GetMirrors() []*Mirror {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+	return mm.mirrors
 }

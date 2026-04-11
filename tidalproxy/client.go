@@ -30,7 +30,6 @@ type instance struct {
 // Pool implements TidalProxy with multi-instance failover
 type Pool struct {
 	instances []*instance
-	current   atomic.Int32
 	client    *http.Client
 	quality   string
 	mu        sync.RWMutex
@@ -54,9 +53,6 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 	p := &Pool{
 		client: &http.Client{
 			Timeout: cfg.Timeout,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse // don't follow redirects
-			},
 		},
 		quality: cfg.Quality,
 	}
@@ -124,103 +120,7 @@ func (p *Pool) healthCheck(interval time.Duration) {
 	}
 }
 
-func (p *Pool) pick() (string, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
 
-	if len(p.instances) == 0 {
-		return "", fmt.Errorf("no proxy instances configured")
-	}
-
-	start := p.current.Add(1) % int32(len(p.instances))
-	for i := 0; i < len(p.instances); i++ {
-		idx := (int(start) + i) % len(p.instances)
-		if p.instances[idx].healthy.Load() || i == len(p.instances)-1 {
-			return p.instances[idx].url, nil
-		}
-	}
-	return p.instances[0].url, nil
-}
-
-// doFetchRaw performs a GET request with retries and returns the raw body bytes.
-// It handles proxy selection, URL construction, header injection, and the 3-attempt retry loop.
-func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
-	var lastErr error
-
-	for i := 0; i < 3; i++ {
-		// Use intelligent mirror selection with MirrorManager
-		var base string
-		var selectedMirror *Mirror
-
-		if p.mirrorMgr != nil {
-			selectedMirror = p.mirrorMgr.SelectMirror()
-		}
-
-		if selectedMirror != nil {
-			base = selectedMirror.URL
-			log.Printf("[TIDAL] Selected mirror: %s (state=%s)", base, selectedMirror.GetState())
-		} else {
-			// Fallback to old round-robin
-			var err error
-			base, err = p.pick()
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		u := base + path
-		if len(query) > 0 {
-			u += "?" + query.Encode()
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-		if err != nil {
-			return nil, fmt.Errorf("build request: %w", err)
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-		if clientIP != "" {
-			req.Header.Set("X-Forwarded-For", clientIP)
-			req.Header.Set("X-Real-IP", clientIP)
-		}
-
-		start := time.Now()
-		resp, err := p.client.Do(req)
-		latency := time.Since(start)
-
-		if err != nil {
-			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
-			if selectedMirror != nil {
-				p.mirrorMgr.ReportResult(selectedMirror, latency, err)
-			}
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("upstream %s (try %d) returned %d: %s", path, i+1, resp.StatusCode, string(body))
-			// Report HTTP error as failure to mirror manager
-			if selectedMirror != nil {
-				p.mirrorMgr.ReportResult(selectedMirror, latency, lastErr)
-			}
-			if resp.StatusCode == 404 {
-				return nil, lastErr
-			}
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		// Report success to mirror manager
-		if selectedMirror != nil {
-			p.mirrorMgr.ReportResult(selectedMirror, latency, err)
-		}
-
-		return body, err
-	}
-	return nil, lastErr
-}
 
 // doFetchRawWithInstance performs a GET request to a specific proxy instance (by index).
 // Used for retry logic when 404 errors are encountered.
@@ -330,31 +230,6 @@ func (p *Pool) apiGetWithRetry(ctx context.Context, path string, query url.Value
 	return fmt.Errorf("all %d proxies returned 404 or error for %s: %v", maxRetries, path, lastErr)
 }
 
-// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries.
-// DEPRECATED: use apiGetWithRetry directly.
-func (p *Pool) apiGetOld(ctx context.Context, path string, query url.Values, result interface{}, clientIP string) error {
-	body, err := p.doFetchRaw(ctx, path, query, clientIP)
-	if err != nil {
-		return err
-	}
-
-	// Envelope handling: many hifi-api endpoints wrap data in a top-level JSON
-	var envelope struct {
-		Data json.RawMessage `json:"data"`
-	}
-
-	if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
-		if err := json.Unmarshal(envelope.Data, result); err == nil {
-			return nil
-		}
-	}
-
-	// Fallback: try unmarshaling directly into result
-	if err := json.Unmarshal(body, result); err != nil {
-		return fmt.Errorf("decode result: %w (body: %s)", err, string(body))
-	}
-	return nil
-}
 
 // apiGetRaw returns the raw body as bytes with retries.
 // It now accepts an optional clientIP to set X-Forwarded-For.
@@ -567,9 +442,10 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 	}
 
 	qualities := []string{quality}
-	if quality == "HI_RES_LOSSLESS" {
+	switch quality {
+	case "HI_RES_LOSSLESS":
 		qualities = append(qualities, "LOSSLESS", "HIGH")
-	} else if quality == "LOSSLESS" {
+	case "LOSSLESS":
 		qualities = append(qualities, "HIGH")
 	}
 
@@ -870,19 +746,27 @@ func (p *Pool) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error
 }
 
 func (p *Pool) GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) {
-	var result struct {
-		Items []TidalTrack `json:"items"`
-	}
+	// Our proxy (hifi-api) doesn't have a dedicated /artist/toptracks/ endpoint.
+	// Instead, the /artist/ endpoint with the 'f' parameter returns an aggregate 
+	// response that includes top_tracks.
 	q := url.Values{
-		"id":    {fmt.Sprint(artistID)},
-		"limit": {fmt.Sprint(limit)},
+		"f": {fmt.Sprint(artistID)},
 	}
-	// Many proxies use /artist/toptracks/ or similar.
-	// The most common route in hifi-api derivatives for this is /artist/toptracks/
-	if err := p.apiGet(ctx, "/artist/toptracks/", q, &result, ""); err != nil {
+	
+	var result struct {
+		TopTracks []TidalTrack `json:"top_tracks"`
+	}
+	
+	if err := p.apiGet(ctx, "/artist/", q, &result, ""); err != nil {
 		return nil, err
 	}
-	return result.Items, nil
+	
+	// Apply limit if necessary (proxy returns ~15 by default)
+	if len(result.TopTracks) > limit && limit > 0 {
+		return result.TopTracks[:limit], nil
+	}
+	
+	return result.TopTracks, nil
 }
 
 // GetArtistAlbumCount returns the number of albums for an artist

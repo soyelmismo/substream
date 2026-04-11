@@ -164,19 +164,27 @@ func (db *DB) GetCachedMetadata(key string) []byte {
 
 // SetCachedMetadata stores metadata in SQLite cache
 func (db *DB) SetCachedMetadata(key string, value []byte, ttlSeconds int) error {
-	cache := MetadataCache{
-		Key:        key,
-		Value:      value,
-		FetchedAt:  time.Now(),
-		TTLSeconds: ttlSeconds,
+	now := time.Now()
+	return db.Exec(`INSERT INTO metadata_cache (key, value, fetched_at, ttl_seconds) 
+                   VALUES (?, ?, ?, ?) 
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, fetched_at=excluded.fetched_at, ttl_seconds=excluded.ttl_seconds`, 
+                   key, value, now, ttlSeconds).Error
+}
+
+// SetCachedMetadataBatch stores multiple metadata entries in a single transaction
+func (db *DB) SetCachedMetadataBatch(batch map[string][]byte, ttlSeconds int) error {
+	now := time.Now()
+	tx := db.Begin()
+	for key, value := range batch {
+		if err := tx.Exec(`INSERT INTO metadata_cache (key, value, fetched_at, ttl_seconds) 
+		                   VALUES (?, ?, ?, ?) 
+		                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, fetched_at=excluded.fetched_at, ttl_seconds=excluded.ttl_seconds`, 
+		                   key, value, now, ttlSeconds).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
 	}
-	err := db.Save(&cache).Error
-	if err != nil {
-		log.Printf("[CACHE ERROR] Failed to store %s: %v", key, err)
-	} else {
-		log.Printf("[CACHE STORED] %s (%d bytes)", key, len(value))
-	}
-	return err
+	return tx.Commit().Error
 }
 
 // CleanupExpiredCache removes all expired entries from metadata_cache
