@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"go.senan.xyz/gonic/db"
@@ -309,9 +310,11 @@ func (c *CachedProxy) Close() {
 
 // ClearAll clears all in-memory LRU caches
 func (c *CachedProxy) ClearAll() {
+	log.Printf("[CACHE] Clearing in-memory LRU caches...")
 	c.tracks.Clear()
 	c.albums.Clear()
 	c.artists.Clear()
 	c.albumArt.Clear()
 	c.albumCount.Clear()
+	log.Printf("[CACHE] In-memory LRU caches cleared")
 }

@@ -374,10 +374,18 @@ func (db *DB) GetCacheStats() (total int64, expired int64, oldest time.Time, new
 
 // ClearAllCache removes all entries from the metadata_cache
 func (db *DB) ClearAllCache() error {
+	var count int64
+	db.Raw("SELECT COUNT(*) FROM metadata_cache").Scan(&count)
+	log.Printf("[CACHE] metadata_cache count before delete: %d", count)
+
 	result := db.Exec("DELETE FROM metadata_cache")
 	if result.Error != nil {
 		return result.Error
 	}
 	log.Printf("[CACHE] Cleared all metadata_cache entries: %d deleted", result.RowsAffected)
+
+	var countAfter int64
+	db.Raw("SELECT COUNT(*) FROM metadata_cache").Scan(&countAfter)
+	log.Printf("[CACHE] metadata_cache count after delete: %d", countAfter)
 	return nil
 }
