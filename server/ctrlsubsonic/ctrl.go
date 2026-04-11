@@ -50,6 +50,7 @@ type Controller struct {
 	negCoverCache *cache.Cache[bool] // Negative cache for missing covers
 	settingsCache *cache.Cache[string] // Cache for DB settings (proxy_streams, etc)
 	streamURLCache *cache.Cache[string] // Cache for stream URLs (TTL 30s)
+	hydratedCache  *cache.Cache[bool] // Prevent duplicate background hydrations
 	streamURLLocks sync.Map // dedup concurrent stream URL requests
 	streamLocks    sync.Map // dedup concurrent stream serving per track+client
 	importer       *importer.JobManager // Background playlist import manager
@@ -116,6 +117,12 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 			MaxSize:         100,
 			DefaultTTL:      30 * time.Second, // URLs expire after 30s
 			CleanupInterval: 1 * time.Minute,
+		}),
+		hydratedCache: cache.New[bool](cache.Config{
+			Name:            "hydrated-items",
+			MaxSize:         10000,
+			DefaultTTL:      24 * time.Hour, // 24 hours cooldown
+			CleanupInterval: 1 * time.Hour,
 		}),
 	}
 
@@ -214,6 +221,7 @@ func (c *Controller) Close() {
 	c.genreCountsCache.Stop()
 	c.searchCache.Stop()
 	c.negCoverCache.Stop()
+	c.hydratedCache.Stop()
 }
 
 type (

@@ -51,8 +51,8 @@ func main() {
 	}
 	log.Printf("Database ready at %s", *confDBPath)
 
-	// Start background cache maintenance (cleanup expired/old entries every hour, max 10k entries)
-	dbc.StartCacheMaintenance(1*time.Hour, 10000)
+	// Start background cache maintenance (cleanup expired/old entries every hour, max 100k entries)
+	dbc.StartCacheMaintenance(1*time.Hour, 100000)
 
 	if dbc.UserCount() == 0 {
 		log.Printf("No users found. Creating default 'admin' user with password 'admin'")

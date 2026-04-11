@@ -12,8 +12,8 @@ import (
 	"go.senan.xyz/gonic/internal/cache"
 )
 
-// metadataCacheTTL is the default TTL for persistent metadata cache (24 hours)
-const metadataCacheTTL = 86400
+// metadataCacheTTL is the default TTL for persistent metadata cache (30 days)
+const metadataCacheTTL = 2592000
 
 // CachedProxy wraps TidalProxy with unified LRU+TTL caches + SQLite persistence
 // Keys use the format: td:tr:ID, td:al:ID, td:ar:ID for consistency with metadata_cache
@@ -35,6 +35,9 @@ type CachedProxy struct {
 	artistAlbums    *cache.Cache[[]byte]
 	artistTopTracks *cache.Cache[[]byte]
 	similarArtists  *cache.Cache[[]byte]
+
+	// [New] Stream URL cache (Short-lived, IP-locked)
+	streamURLs *cache.Cache[string]
 }
 
 func NewCachedProxy(base TidalProxy, dbc *db.DB, ttl time.Duration) *CachedProxy {
@@ -89,6 +92,12 @@ func NewCachedProxy(base TidalProxy, dbc *db.DB, ttl time.Duration) *CachedProxy
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
+		streamURLs: cache.New[string](cache.Config{
+			Name:            "tidal-stream-urls",
+			MaxSize:         500,
+			DefaultTTL:      30 * time.Minute, // Safely within 1h Tidal window
+			CleanupInterval: 5 * time.Minute,
+		}),
 		pending: make(map[string][]byte),
 		quit:    make(chan struct{}),
 	}
@@ -135,6 +144,68 @@ func (c *CachedProxy) flushBufferToDisk() {
 	}
 }
 
+// cacheTrackJSON adds a track to both LRU and persistent write-back buffer
+func (c *CachedProxy) cacheTrackJSON(t *TidalTrack) {
+	if t == nil || t.ID == 0 {
+		return
+	}
+	key := fmt.Sprintf("td:tr:%d", t.ID)
+	data, err := json.Marshal(t)
+	if err != nil {
+		return
+	}
+	c.tracks.Set(key, data, 0)
+	if c.db != nil {
+		c.pendingMu.Lock()
+		c.pending[key] = data
+		c.pendingMu.Unlock()
+	}
+	// Also cache album art as side effect
+	if t.Album.ID != 0 && t.Album.Cover != "" {
+		c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
+	}
+}
+
+// cacheAlbumJSON adds an album to both LRU and persistent write-back buffer
+func (c *CachedProxy) cacheAlbumJSON(a *TidalAlbum) {
+	if a == nil || a.ID == 0 {
+		return
+	}
+
+	albumRef := TidalAlbumRef{
+		ID:    a.ID,
+		Title: a.Title,
+		Cover: a.Cover,
+	}
+
+	for i := range a.Items {
+		if a.Items[i].Album.ID == 0 {
+			a.Items[i].Album = albumRef
+		}
+		if len(a.Items[i].Artists) == 0 && len(a.Artists) > 0 {
+			a.Items[i].Artists = a.Artists
+			a.Items[i].Artist = a.Artists[0]
+		}
+		c.cacheTrackJSON(&a.Items[i])
+	}
+
+	key := fmt.Sprintf("td:al:%d", a.ID)
+	data, err := json.Marshal(a)
+	if err != nil {
+		return
+	}
+
+	c.albums.Set(key, data, 0)
+	if c.db != nil {
+		c.pendingMu.Lock()
+		c.pending[key] = data
+		c.pendingMu.Unlock()
+	}
+	if a.Cover != "" {
+		c.albumArt.Set(key, a.Cover, 0)
+	}
+}
+
 func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrack, error) {
 	key := fmt.Sprintf("td:tr:%d", trackID)
 
@@ -171,19 +242,7 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 	// 3. Fetch from API
 	t, err := c.TidalProxy.GetTrackInfo(ctx, trackID)
 	if err == nil && t != nil {
-		// Serialize to JSON
-		if data, err := json.Marshal(t); err == nil {
-			c.tracks.Set(key, data, 0)
-			// Buffer for SQLite write-back (Atomic RAM-first)
-			if c.db != nil {
-				c.pendingMu.Lock()
-				c.pending[key] = data
-				c.pendingMu.Unlock()
-			}
-		}
-		if t.Album.Cover != "" {
-			c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
-		}
+		c.cacheTrackJSON(t)
 	}
 	return t, err
 }
@@ -191,11 +250,21 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error) {
 	key := fmt.Sprintf("td:al:%d", albumID)
 
+	checkCache := func(data []byte) *TidalAlbum {
+		var a TidalAlbum
+		if err := json.Unmarshal(data, &a); err == nil {
+			// Require items for GetAlbumInfo
+			if len(a.Items) > 0 || a.NumberOfTracks == 0 {
+				return &a
+			}
+		}
+		return nil
+	}
+
 	// 1. Check in-memory LRU cache
 	if cached := c.albums.Get(key); cached != nil {
-		var a TidalAlbum
-		if err := json.Unmarshal(cached, &a); err == nil {
-			return &a, nil
+		if a := checkCache(cached); a != nil {
+			return a, nil
 		}
 	}
 
@@ -203,20 +272,19 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 	c.pendingMu.Lock()
 	if data, ok := c.pending[key]; ok {
 		c.pendingMu.Unlock()
-		var a TidalAlbum
-		if err := json.Unmarshal(data, &a); err == nil {
-			return &a, nil
+		if a := checkCache(data); a != nil {
+			return a, nil
 		}
+	} else {
+		c.pendingMu.Unlock()
 	}
-	c.pendingMu.Unlock()
 
 	// 2. Check SQLite persistent cache (if db available)
 	if c.db != nil {
 		if cached := c.db.GetCachedMetadata(key); cached != nil {
-			var a TidalAlbum
-			if err := json.Unmarshal(cached, &a); err == nil {
+			if a := checkCache(cached); a != nil {
 				c.albums.Set(key, cached, 0) // Warm LRU cache
-				return &a, nil
+				return a, nil
 			}
 		}
 	}
@@ -224,20 +292,47 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 	// 3. Fetch from API
 	a, err := c.TidalProxy.GetAlbumInfo(ctx, albumID)
 	if err == nil && a != nil {
-		// Serialize to JSON
-		if data, err := json.Marshal(a); err == nil {
-			c.albums.Set(key, data, 0)
-			// Buffer for SQLite write-back (Atomic RAM-first)
-			if c.db != nil {
-				c.pendingMu.Lock()
-				c.pending[key] = data
-				c.pendingMu.Unlock()
+		c.cacheAlbumJSON(a)
+	}
+	return a, err
+}
+
+func (c *CachedProxy) GetAlbumMetadata(ctx context.Context, albumID int) (*TidalAlbum, error) {
+	key := fmt.Sprintf("td:al:%d", albumID)
+
+	// Accepts partial caches without Items
+	if cached := c.albums.Get(key); cached != nil {
+		var a TidalAlbum
+		if err := json.Unmarshal(cached, &a); err == nil {
+			return &a, nil
+		}
+	}
+
+	c.pendingMu.Lock()
+	if data, ok := c.pending[key]; ok {
+		c.pendingMu.Unlock()
+		var a TidalAlbum
+		if err := json.Unmarshal(data, &a); err == nil {
+			return &a, nil
+		}
+	} else {
+		c.pendingMu.Unlock()
+	}
+
+	if c.db != nil {
+		if cached := c.db.GetCachedMetadata(key); cached != nil {
+			var a TidalAlbum
+			if err := json.Unmarshal(cached, &a); err == nil {
+				c.albums.Set(key, cached, 0)
+				return &a, nil
 			}
 		}
-		// Cache album art with consistent key format
-		if a.Cover != "" {
-			c.albumArt.Set(key, a.Cover, 0)
-		}
+	}
+
+	// Fetch from API
+	a, err := c.TidalProxy.GetAlbumInfo(ctx, albumID)
+	if err == nil && a != nil {
+		c.cacheAlbumJSON(a)
 	}
 	return a, err
 }
@@ -316,9 +411,7 @@ func (c *CachedProxy) SearchAlbums(ctx context.Context, query string, limit, off
 	albums, err := c.TidalProxy.SearchAlbums(ctx, query, limit, offset)
 	if err == nil {
 		for _, a := range albums {
-			if a.Cover != "" {
-				c.albumArt.Set(fmt.Sprintf("td:al:%d", a.ID), a.Cover, 0)
-			}
+			c.cacheAlbumJSON(&a)
 		}
 	}
 	return albums, err
@@ -328,9 +421,7 @@ func (c *CachedProxy) SearchTracks(ctx context.Context, query string, limit, off
 	tracks, err := c.TidalProxy.SearchTracks(ctx, query, limit, offset)
 	if err == nil {
 		for _, t := range tracks {
-			if t.Album.Cover != "" {
-				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
-			}
+			c.cacheTrackJSON(&t)
 		}
 	}
 	return tracks, err
@@ -384,12 +475,15 @@ func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTra
 			}
 		}
 
-		// Cache album art as side effect
+		// Cache results
 		if len(page.Albums.Items) > 0 {
 			for _, a := range page.Albums.Items {
-				if a.Cover != "" {
-					c.albumArt.Set(fmt.Sprintf("td:al:%d", a.ID), a.Cover, 0)
-				}
+				c.cacheAlbumJSON(&a)
+			}
+		}
+		if len(page.Tracks) > 0 {
+			for _, t := range page.Tracks {
+				c.cacheTrackJSON(&t)
 			}
 		}
 	}
@@ -432,6 +526,10 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 	// 4. Fetch from API
 	tracks, err := c.TidalProxy.GetArtistTopTracks(ctx, artistID, limit)
 	if err == nil && tracks != nil {
+		for _, t := range tracks {
+			c.cacheTrackJSON(&t)
+		}
+		// Persist the list itself
 		if data, err := json.Marshal(tracks); err == nil {
 			c.artistTopTracks.Set(key, data, 0)
 			if c.db != nil {
@@ -496,9 +594,7 @@ func (c *CachedProxy) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack
 	tracks, err := c.TidalProxy.GetTopTracks(ctx, limit)
 	if err == nil {
 		for _, t := range tracks {
-			if t.Album.Cover != "" {
-				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
-			}
+			c.cacheTrackJSON(&t)
 		}
 	}
 	return tracks, err
@@ -508,12 +604,23 @@ func (c *CachedProxy) GetRecommendations(ctx context.Context, trackID int) ([]Ti
 	tracks, err := c.TidalProxy.GetRecommendations(ctx, trackID)
 	if err == nil {
 		for _, t := range tracks {
-			if t.Album.Cover != "" {
-				c.albumArt.Set(fmt.Sprintf("td:al:%d", t.Album.ID), t.Album.Cover, 0)
-			}
+			c.cacheTrackJSON(&t)
 		}
 	}
 	return tracks, err
+}
+
+func (c *CachedProxy) GetStreamURL(ctx context.Context, trackID int, quality string, clientIP string) (string, error) {
+	key := fmt.Sprintf("td:st:%d:%s:%s", trackID, quality, clientIP)
+	if url := c.streamURLs.Get(key); url != "" {
+		return url, nil
+	}
+
+	url, err := c.TidalProxy.GetStreamURL(ctx, trackID, quality, clientIP)
+	if err == nil && url != "" {
+		c.streamURLs.Set(key, url, 0)
+	}
+	return url, err
 }
 
 // GetArtistAlbumCount returns cached album count for an artist, fetching if needed
@@ -545,6 +652,7 @@ func (c *CachedProxy) Close() {
 	c.artistAlbums.Stop()
 	c.artistTopTracks.Stop()
 	c.similarArtists.Stop()
+	c.streamURLs.Stop()
 }
 
 // ClearAll clears all in-memory LRU caches
@@ -558,5 +666,6 @@ func (c *CachedProxy) ClearAll() {
 	c.artistAlbums.Clear()
 	c.artistTopTracks.Clear()
 	c.similarArtists.Clear()
+	c.streamURLs.Clear()
 	log.Printf("[CACHE] In-memory LRU caches cleared")
 }

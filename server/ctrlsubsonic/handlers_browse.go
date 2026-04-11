@@ -71,6 +71,15 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 	artistIDs := extractIDsFromURIs(artistURIs)
 
 	artists := c.batchFetchArtists(r, artistIDs)
+	
+	// [Hydrate] Trigger background hydration for any starred artists found here.
+	// This ensures that even if an artist was just added via cache, their discography is fetched.
+	for _, a := range artists {
+		if a.Starred != nil && a.ID != nil {
+			c.hydrateArtistBackground(a.ID.Value())
+		}
+	}
+
 	indexes := c.buildArtistIndexes(artists)
 
 	sub := spec.NewResponse()
@@ -116,18 +125,6 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 	c.applyArtistStar(user.ID, artist)
 
 	items := artistPage.Albums.Items
-	// Deduplicate albums by title+release_date (Tidal API returns same album with different IDs)
-	seenAlbums := make(map[string]bool)
-	var uniqueItems []tidalproxy.TidalAlbum
-	for _, item := range items {
-		key := fmt.Sprintf("%s|%s", item.Title, item.ReleaseDate)
-		if !seenAlbums[key] {
-			seenAlbums[key] = true
-			uniqueItems = append(uniqueItems, item)
-		}
-	}
-	items = uniqueItems
-
 	artist.AlbumCount = len(items)
 	artist.Albums = make([]*spec.Album, len(items))
 	for i := range items {

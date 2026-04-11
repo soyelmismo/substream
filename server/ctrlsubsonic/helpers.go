@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -105,7 +106,7 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 // batchFetchAlbums fetches metadata for multiple tidal album IDs concurrently
 func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.Album {
 	user := r.Context().Value(CtxUser).(*db.User)
-	return batchFetch(r.Context(), c.proxySem, tidalIDs, c.proxy.GetAlbumInfo, func(info *tidalproxy.TidalAlbum, tid int) *spec.Album {
+	return batchFetch(r.Context(), c.proxySem, tidalIDs, c.proxy.GetAlbumMetadata, func(info *tidalproxy.TidalAlbum, tid int) *spec.Album {
 		a := spec.NewAlbumFromTidal(info)
 		c.applyAlbumStar(user.ID, a)
 		a.UserRating = c.getAlbumRating(user.ID, fmt.Sprintf("td:al:%d", tid))
@@ -117,7 +118,6 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 // shared by ServeStream and ServeDownload
 func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID int) (*streamRequest, error) {
 	p := r.Context().Value(CtxParams).(params.Params)
-	var err error
 
 	// 1. Quality
 	bitrate := p.GetOrInt("maxBitRate", 0)
@@ -146,14 +146,24 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 	}
 	clientIP = strings.Trim(clientIP, "[]")
 
-	// 3. Stream URL (with deduplication and caching)
+	// 3 & 4. Fetch Stream URL and Track Info concurrently
+	var url string
+	var track *tidalproxy.TidalTrack
+	var urlErr, trackErr error
+
 	cacheKey := fmt.Sprintf("stream:%d:%s", trackID, quality)
 
-	// fast path: check cache
-	var url string
-	if cached := c.streamURLCache.Get(cacheKey); cached != "" {
-		url = cached
-	} else {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Fetch/Get Stream URL
+	go func() {
+		defer wg.Done()
+		if cached := c.streamURLCache.Get(cacheKey); cached != "" {
+			url = cached
+			return
+		}
+
 		// deduplication: only one request fetches, others wait
 		type lockPair struct {
 			done chan struct{}
@@ -165,32 +175,34 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 
 		if loaded {
 			<-lp.done
-			if lp.err != nil {
-				return nil, lp.err
-			}
-			url = lp.url
+			url, urlErr = lp.url, lp.err
 		} else {
-			url, err = c.proxy.GetStreamURL(ctx, trackID, quality, clientIP)
-			lp.url = url
-			lp.err = err
+			url, urlErr = c.proxy.GetStreamURL(ctx, trackID, quality, clientIP)
+			lp.url, lp.err = url, urlErr
 			close(lp.done)
-			if err == nil && url != "" {
-				c.streamURLCache.Set(cacheKey, url, 30*time.Second)
+			if urlErr == nil && url != "" {
+				c.streamURLCache.Set(cacheKey, url, 30*time.Minute) // Increased to 30m, safe within 1h window
 			}
 			go func() {
 				time.Sleep(100 * time.Millisecond)
 				c.streamURLLocks.Delete(cacheKey)
 			}()
-			if err != nil {
-				return nil, err
-			}
 		}
-	}
+	}()
 
-	// 4. Meta
-	track, err := c.proxy.GetTrackInfo(ctx, trackID)
-	if err != nil {
-		return nil, err
+	// Fetch Track Info
+	go func() {
+		defer wg.Done()
+		track, trackErr = c.proxy.GetTrackInfo(ctx, trackID)
+	}()
+
+	wg.Wait()
+
+	if urlErr != nil {
+		return nil, urlErr
+	}
+	if trackErr != nil {
+		return nil, trackErr
 	}
 
 	// 5. Detection
@@ -214,7 +226,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 
 // batchFetchAlbumsWithContext fetches metadata with custom context (for timeout control)
 func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs []int) []*spec.Album {
-	return batchFetch(ctx, c.proxySem, tidalIDs, c.proxy.GetAlbumInfo, func(info *tidalproxy.TidalAlbum, _ int) *spec.Album {
+	return batchFetch(ctx, c.proxySem, tidalIDs, c.proxy.GetAlbumMetadata, func(info *tidalproxy.TidalAlbum, _ int) *spec.Album {
 		return spec.NewAlbumFromTidal(info)
 	})
 }
@@ -287,4 +299,85 @@ func extractIDFromURI(uri string) int {
 		return id
 	}
 	return 0
+}
+
+func (c *Controller) hydrateTrackBackground(trackID int) {
+	key := fmt.Sprintf("tr:%d", trackID)
+	if c.hydratedCache.Has(key) {
+		return // Already hydrated recently
+	}
+	c.hydratedCache.Set(key, true, 0) // Mark as hydrated with default TTL (24h)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond) // yield
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c.proxy.GetTrackInfo(ctx, trackID)
+	}()
+}
+
+func (c *Controller) hydrateAlbumBackground(albumID int) {
+	key := fmt.Sprintf("al:%d", albumID)
+	if c.hydratedCache.Has(key) {
+		return // Already hydrated recently
+	}
+	c.hydratedCache.Set(key, true, 0)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond) // yield
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		log.Printf("[HYDRATE] Deep hydrating album %d...", albumID)
+		c.proxy.GetAlbumInfo(ctx, albumID) // GetAlbumInfo triggers caching of all its tracks
+	}()
+}
+
+func (c *Controller) hydrateArtistBackground(artistID int) {
+	key := fmt.Sprintf("ar:%d", artistID)
+	if c.hydratedCache.Has(key) {
+		return // Already hydrated recently
+	}
+	c.hydratedCache.Set(key, true, 0)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond) // yield
+		// This might take a while if the artist has many albums
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		log.Printf("[HYDRATE] Deep hydrating artist %d...", artistID)
+
+		// 1. Get Artist Info
+		c.proxy.GetArtistInfo(ctx, artistID)
+
+		// 2. Hydrate Top Tracks
+		c.proxy.GetArtistTopTracks(ctx, artistID, 50)
+
+		// 3. Get Albums list (shallow)
+		page, err := c.proxy.GetArtistAlbums(ctx, artistID, true)
+		if err != nil || page == nil {
+			log.Printf("[HYDRATE] Failed to get albums for artist %d: %v", artistID, err)
+			return
+		}
+
+		// 4. Hydrate each album sequentially to avoid hammering proxy
+		for i, a := range page.Albums.Items {
+			if a.ID == 0 {
+				continue
+			}
+
+			// Sleep slightly between fetches
+			if i > 0 {
+				time.Sleep(300 * time.Millisecond)
+			}
+
+			// Fetching album info automatically caches the album AND all its tracks via cacheAlbumJSON
+			_, err := c.proxy.GetAlbumInfo(ctx, a.ID)
+			if err != nil {
+				log.Printf("[HYDRATE] Failed to hydrate album %d for artist %d: %v", a.ID, artistID, err)
+			}
+		}
+
+		log.Printf("[HYDRATE] Completed deep hydration for artist %d (%d albums)", artistID, len(page.Albums.Items))
+	}()
 }

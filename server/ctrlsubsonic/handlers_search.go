@@ -462,18 +462,22 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 					s = db.TrackStar{UserID: user.ID, URI: uri, Provider: "tidal"}
 				}
 				c.dbc.Create(&s)
+				c.hydrateTrackBackground(id.Value())
 			}
 		case specid.Album:
 			var s db.AlbumStar
 			if c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&s).RecordNotFound() {
 				if t, err := c.proxy.GetAlbumInfo(r.Context(), id.Value()); err == nil {
 					artistName := ""
-					if len(t.Artists) > 0 { artistName = t.Artists[0].Name }
+					if len(t.Artists) > 0 {
+						artistName = t.Artists[0].Name
+					}
 					s = db.AlbumStar{UserID: user.ID, URI: uri, FallbackArtist: artistName, FallbackTitle: t.Title}
 				} else {
 					s = db.AlbumStar{UserID: user.ID, URI: uri}
 				}
 				c.dbc.Create(&s)
+				c.hydrateAlbumBackground(id.Value())
 			}
 		case specid.Artist:
 			var s db.ArtistStar
@@ -484,22 +488,25 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 					s = db.ArtistStar{UserID: user.ID, URI: uri}
 				}
 				c.dbc.Create(&s)
+				c.hydrateArtistBackground(id.Value())
 			}
 		}
 	}
 
-	if id, err := p.GetID("id"); err == nil {
-		starFn(id)
+	if ids, err := p.GetIDList("id"); err == nil {
+		for _, id := range ids {
+			starFn(id)
+		}
 	}
-	if id, err := p.GetID("albumId"); err == nil {
-		starFn(id)
+	if ids, err := p.GetIDList("albumId"); err == nil {
+		for _, id := range ids {
+			starFn(id)
+		}
 	}
-	if id, err := p.GetID("artistId"); err == nil {
-		starFn(id)
-		go func() {
-			c.proxy.GetArtistInfo(r.Context(), id.Value())
-			c.proxy.GetArtistAlbums(r.Context(), id.Value(), true)
-		}()
+	if ids, err := p.GetIDList("artistId"); err == nil {
+		for _, id := range ids {
+			starFn(id)
+		}
 	}
 
 	return spec.NewResponse()
@@ -509,24 +516,30 @@ func (c *Controller) ServeUnstar(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 	p := r.Context().Value(CtxParams).(params.Params)
 
-	if id, err := p.GetID("id"); err == nil {
-		uri := id.String()
-		switch id.Type() {
-		case specid.Track:
-			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.TrackStar{})
-		case specid.Album:
-			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.AlbumStar{})
-		case specid.Artist:
-			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.ArtistStar{})
+	if ids, err := p.GetIDList("id"); err == nil {
+		for _, id := range ids {
+			uri := id.String()
+			switch id.Type() {
+			case specid.Track:
+				c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.TrackStar{})
+			case specid.Album:
+				c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.AlbumStar{})
+			case specid.Artist:
+				c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.ArtistStar{})
+			}
 		}
 	}
-	if id, err := p.GetID("albumId"); err == nil {
-		uri := id.String()
-		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.AlbumStar{})
+	if ids, err := p.GetIDList("albumId"); err == nil {
+		for _, id := range ids {
+			uri := id.String()
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.AlbumStar{})
+		}
 	}
-	if id, err := p.GetID("artistId"); err == nil {
-		uri := id.String()
-		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.ArtistStar{})
+	if ids, err := p.GetIDList("artistId"); err == nil {
+		for _, id := range ids {
+			uri := id.String()
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.ArtistStar{})
+		}
 	}
 
 	return spec.NewResponse()

@@ -35,6 +35,7 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 		AlbumID:     albumID,
 		Artist:      artistName,
 		ArtistID:    artistID,
+		ParentID:    albumID,
 		CoverID:     coverID,
 		TrackNumber: t.TrackNumber,
 		DiscNumber:  t.VolumeNumber,
@@ -97,6 +98,7 @@ func NewAlbumFromTidal(a *tidalproxy.TidalAlbum) *Album {
 
 	return &Album{
 		ID:            albumID,
+		ParentID:      artistID,
 		Name:          a.Title,
 		Artist:        artistName,
 		ArtistID:      artistID,

@@ -120,27 +120,30 @@ func (p *Pool) healthCheck(interval time.Duration) {
 	}
 }
 
-
-
 // doFetchRawWithInstance performs a GET request to a specific proxy instance (by index).
 // Used for retry logic when 404 errors are encountered.
 // Also tracks results with MirrorManager if available.
 func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query url.Values, clientIP string, instanceIdx int) ([]byte, error) {
 	p.mu.RLock()
-	if len(p.instances) == 0 {
-		p.mu.RUnlock()
-		return nil, fmt.Errorf("no hifi-api proxies configured")
-	}
-	// Select proxy based on instanceIdx (round-robin offset)
-	idx := instanceIdx % len(p.instances)
-	base := p.instances[idx].url
-	p.mu.RUnlock()
+	// Select mirror: smart selection for try 0, round-robin for retries
+	var m *Mirror
+	var base string
 
-	// Find corresponding mirror for this instance index
-	var mirror *Mirror
-	if p.mirrorMgr != nil && idx < len(p.mirrorMgr.mirrors) {
-		mirror = p.mirrorMgr.mirrors[idx]
+	if instanceIdx == 0 && p.mirrorMgr != nil {
+		m = p.mirrorMgr.SelectMirror()
+		if m != nil {
+			base = m.URL
+		}
 	}
+
+	if base == "" {
+		idx := instanceIdx % len(p.instances)
+		base = p.instances[idx].url
+		if p.mirrorMgr != nil && idx < len(p.mirrorMgr.mirrors) {
+			m = p.mirrorMgr.mirrors[idx]
+		}
+	}
+	p.mu.RUnlock()
 
 	u := base + path
 	if len(query) > 0 {
@@ -162,8 +165,8 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 	latency := time.Since(start)
 
 	if err != nil {
-		if mirror != nil {
-			p.mirrorMgr.ReportResult(mirror, latency, err)
+		if m != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
 		}
 		return nil, fmt.Errorf("request %s: %w", path, err)
 	}
@@ -172,8 +175,8 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		err := fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
-		if mirror != nil {
-			p.mirrorMgr.ReportResult(mirror, latency, err)
+		if m != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
 		}
 		return nil, err
 	}
@@ -181,8 +184,8 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	if mirror != nil {
-		p.mirrorMgr.ReportResult(mirror, latency, err)
+	if m != nil {
+		p.mirrorMgr.ReportResult(m, latency, err)
 	}
 
 	return body, err
@@ -229,7 +232,6 @@ func (p *Pool) apiGetWithRetry(ctx context.Context, path string, query url.Value
 	}
 	return fmt.Errorf("all %d proxies returned 404 or error for %s: %v", maxRetries, path, lastErr)
 }
-
 
 // apiGetRaw returns the raw body as bytes with retries.
 // It now accepts an optional clientIP to set X-Forwarded-For.
@@ -312,6 +314,11 @@ func (p *Pool) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, erro
 	return &album, nil
 }
 
+func (p *Pool) GetAlbumMetadata(ctx context.Context, albumID int) (*TidalAlbum, error) {
+	// Fallback to GetAlbumInfo if not cached
+	return p.GetAlbumInfo(ctx, albumID)
+}
+
 func (p *Pool) GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error) {
 	body, err := p.apiGetRaw(ctx, "/artist/", url.Values{"id": {fmt.Sprint(artistID)}}, "")
 	if err != nil {
@@ -354,6 +361,19 @@ func (p *Pool) GetArtistAlbums(ctx context.Context, artistID int, skipTracks boo
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("decode artist albums: %w", err)
 	}
+
+	// Deduplicate albums natively at the proxy level
+	seenAlbums := make(map[string]bool)
+	var uniqueItems []TidalAlbum
+	for _, item := range resp.Albums.Items {
+		// Use lowercased title to catch slight casing differences
+		key := fmt.Sprintf("%s|%s", strings.ToLower(strings.TrimSpace(item.Title)), item.ReleaseDate)
+		if !seenAlbums[key] {
+			seenAlbums[key] = true
+			uniqueItems = append(uniqueItems, item)
+		}
+	}
+	resp.Albums.Items = uniqueItems
 
 	return &TidalArtistPage{
 		Albums: resp.Albums,
@@ -423,17 +443,30 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
 		return nil, err
 	}
+	
+	var sourceItems []TidalAlbum
 	if len(result.Albums.Items) > 0 {
-		items := result.Albums.Items
-		if limit > 0 && len(items) > limit {
-			items = items[:limit]
+		sourceItems = result.Albums.Items
+	} else {
+		sourceItems = result.Items
+	}
+
+	// Deduplicate search results too
+	seenAlbums := make(map[string]bool)
+	var uniqueItems []TidalAlbum
+	for _, item := range sourceItems {
+		key := fmt.Sprintf("%s|%s", strings.ToLower(strings.TrimSpace(item.Title)), item.ReleaseDate)
+		if !seenAlbums[key] {
+			seenAlbums[key] = true
+			uniqueItems = append(uniqueItems, item)
 		}
-		return items, nil
 	}
-	if limit > 0 && len(result.Items) > limit {
-		result.Items = result.Items[:limit]
+
+	if limit > 0 && len(uniqueItems) > limit {
+		uniqueItems = uniqueItems[:limit]
 	}
-	return result.Items, nil
+	
+	return uniqueItems, nil
 }
 
 func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, clientIP string) (string, error) {
@@ -450,20 +483,23 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 	}
 
 	var lastErr error
-	previewCount := 0
-	// Strategy: try up to 5 different proxies until we get a FULL track.
-	// For each proxy, try the requested quality and its fallbacks.
-	// Aggressive retry when PREVIEW is detected - try more proxies.
-	maxRetries := 5
+
+	// Reduce retries if we use smart mirror selection
+	maxRetries := 3
 	for try := 0; try < maxRetries; try++ {
 		for _, qStr := range qualities {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
+
+			// Try V2 and V1 in parallel to save time?
+			// No, let's keep it simple but with shorter timeouts for V2
+
 			log.Printf("[TIDAL] GetStreamURL track=%d try=%d/%d quality=%s", trackID, try, maxRetries-1, qStr)
 
 			// 1. Try V2 OpenAPI Manifests first (HLS)
-			v2Ctx, v2Cancel := context.WithTimeout(ctx, 3*time.Second)
+			// Shorter timeout to fail fast and go to V1 or next proxy
+			v2Ctx, v2Cancel := context.WithTimeout(ctx, 2*time.Second)
 			var formats []string
 			switch qStr {
 			case "HI_RES_LOSSLESS":
@@ -496,32 +532,25 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 					} `json:"attributes"`
 				} `json:"data"`
 			}
-			err := p.apiGet(v2Ctx, "/trackManifests/", qV2, &v2Response, clientIP)
+
+			// Pass try directly to use different mirrors in sequence
+			err := p.apiGetWithRetry(v2Ctx, "/trackManifests/", qV2, &v2Response, clientIP, 1) // Only 1 attempt here, outer loop handles retries
 			v2Cancel()
+
 			if err == nil {
 				if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
-					lastErr = fmt.Errorf("proxy returned PREVIEW (V2)")
-					previewCount++
-					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW #%d from V2 API, trying next proxy...", trackID, previewCount)
-					break // try next proxy in outer loop
+					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW (V2) - skipping quality %s", trackID, qStr)
+					continue
 				}
-				// V2 URI is often a manifest URL (manifest.tidal.com), not direct audio.
-				// Only use it if it's a direct audio URL (contains audio file extension or CDN pattern).
 				uri := v2Response.Data.Attributes.URI
 				if uri != "" && !strings.Contains(uri, "manifest.tidal.com") && !strings.Contains(uri, "/manifests/") {
-					log.Printf("[TIDAL] GetStreamURL track=%d got direct URI via V2: %s...", trackID, uri[:min(50, len(uri))])
 					return uri, nil
 				}
-				// If V2 returned a manifest URL, try to download and parse it directly
-				if uri != "" && (strings.Contains(uri, "manifest.tidal.com") || strings.Contains(uri, "/manifests/")) {
-					log.Printf("[TIDAL] GetStreamURL track=%d V2 returned manifest URL, attempting direct download: %s...", trackID, uri[:min(50, len(uri))])
+				if uri != "" {
 					audioURL, err := p.downloadAndParseHLSManifest(ctx, uri, clientIP)
 					if err == nil && audioURL != "" {
-						log.Printf("[TIDAL] GetStreamURL track=%d got audio URL from V2 manifest: %s...", trackID, audioURL[:min(50, len(audioURL))])
 						return audioURL, nil
 					}
-					log.Printf("[TIDAL] GetStreamURL track=%d failed to parse V2 manifest: %v, falling back to V1", trackID, err)
-					log.Printf("[TIDAL] GetStreamURL track=%d V2 manifest parse error or manifest URL: %v", trackID, err)
 				}
 			}
 
@@ -532,30 +561,28 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 				"playbackmode":      {"STREAM"},
 				"assetpresentation": {"FULL"},
 			}
-			log.Printf("[TIDAL] GetStreamURL track=%d calling V1 /track/ with quality=%s", trackID, qStr)
 			var stream TidalStreamInfo
-			if err := p.apiGet(ctx, "/track/", q, &stream, clientIP); err == nil {
+			if err := p.apiGetWithRetry(ctx, "/track/", q, &stream, clientIP, 1); err == nil {
 				if stream.TrackPresentation == "PREVIEW" {
-					lastErr = fmt.Errorf("proxy returned PREVIEW (V1)")
-					previewCount++
-					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW #%d from V1 API, trying next proxy...", trackID, previewCount)
-					break // try next proxy in outer loop
+					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW (V1) - skipping quality %s", trackID, qStr)
+					continue
 				}
 				u, err := parseManifestURL(trackID, "V1", stream.ManifestMimeType, stream.Manifest)
 				if err == nil {
-					log.Printf("[TIDAL] GetStreamURL track=%d got URL via V1 manifest: %s...", trackID, u[:min(50, len(u))])
 					return u, nil
 				}
 				lastErr = err
-				log.Printf("[TIDAL] GetStreamURL track=%d V1 manifest parse error: %v", trackID, err)
 			} else {
 				lastErr = err
-				log.Printf("[TIDAL] GetStreamURL track=%d V1 /track/ error: %v", trackID, err)
 			}
 		}
+
+		// If we reached here, this proxy/mirror didn't work for any quality.
+		// The next iteration of 'try' loop will pick another mirror in doFetchRawWithInstance.
+		log.Printf("[TIDAL] GetStreamURL track=%d try %d failed, will try next mirror", trackID, try)
 	}
 
-	return "", fmt.Errorf("could not get full stream after %d retries (%d PREVIEWs): %v", maxRetries, previewCount, lastErr)
+	return "", fmt.Errorf("could not get full stream after %d mirrors: %v", maxRetries, lastErr)
 }
 
 // downloadAndParseHLSManifest downloads a Tidal manifest and extracts the audio stream URL
@@ -747,25 +774,25 @@ func (p *Pool) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error
 
 func (p *Pool) GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) {
 	// Our proxy (hifi-api) doesn't have a dedicated /artist/toptracks/ endpoint.
-	// Instead, the /artist/ endpoint with the 'f' parameter returns an aggregate 
+	// Instead, the /artist/ endpoint with the 'f' parameter returns an aggregate
 	// response that includes top_tracks.
 	q := url.Values{
 		"f": {fmt.Sprint(artistID)},
 	}
-	
+
 	var result struct {
 		TopTracks []TidalTrack `json:"top_tracks"`
 	}
-	
+
 	if err := p.apiGet(ctx, "/artist/", q, &result, ""); err != nil {
 		return nil, err
 	}
-	
+
 	// Apply limit if necessary (proxy returns ~15 by default)
 	if len(result.TopTracks) > limit && limit > 0 {
 		return result.TopTracks[:limit], nil
 	}
-	
+
 	return result.TopTracks, nil
 }
 

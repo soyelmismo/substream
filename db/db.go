@@ -103,7 +103,7 @@ func (db *DB) GetVirtualLibraryArtistIDs(userID int) []string {
 		UNION
 		SELECT tm.artist_uri FROM playlist_tracks pt JOIN playlists pl ON pt.playlist_id = pl.id JOIN track_metadata tm ON pt.uri = tm.uri WHERE pl.user_id = ?
 		UNION
-		SELECT key FROM metadata_cache WHERE key LIKE 'td:ar:%'
+		SELECT key FROM metadata_cache WHERE key GLOB 'td:ar:[0-9]*'
 	`, userID, userID, userID, userID).Pluck("uri", &uris)
 	return uris
 }
@@ -120,7 +120,7 @@ func (db *DB) GetVirtualLibraryAlbumIDs(userID int) []string {
 		UNION
 		SELECT tm.album_uri FROM playlist_tracks pt JOIN playlists pl ON pt.playlist_id = pl.id JOIN track_metadata tm ON pt.uri = tm.uri WHERE pl.user_id = ?
 		UNION
-		SELECT key FROM metadata_cache WHERE key LIKE 'td:al:%'
+		SELECT key FROM metadata_cache WHERE key GLOB 'td:al:[0-9]*'
 	`, userID, userID, userID, userID).Pluck("uri", &uris)
 	return uris
 }
@@ -135,7 +135,7 @@ func (db *DB) GetVirtualLibraryTrackIDs(userID int) []string {
 		UNION
 		SELECT pt.uri FROM playlist_tracks pt JOIN playlists pl ON pt.playlist_id = pl.id WHERE pl.user_id = ?
 		UNION
-		SELECT key FROM metadata_cache WHERE key LIKE 'td:tr:%'
+		SELECT key FROM metadata_cache WHERE key GLOB 'td:tr:[0-9]*'
 	`, userID, userID, userID).Pluck("uri", &uris)
 	return uris
 }
@@ -223,7 +223,7 @@ func (db *DB) StartCacheMaintenance(interval time.Duration, maxEntries int) {
 		interval = 1 * time.Hour // default
 	}
 	if maxEntries <= 0 {
-		maxEntries = 10000 // default: keep last 10k entries
+		maxEntries = 100000 // default: keep last 100k entries
 	}
 
 	go func() {
