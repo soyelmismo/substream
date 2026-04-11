@@ -11,6 +11,7 @@ import (
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/listenbrainz"
+	"go.senan.xyz/gonic/tidalproxy"
 )
 
 
@@ -326,6 +327,14 @@ func (c *Controller) ServeProxies(r *http.Request) *Response {
 
 	data := &templateData{}
 	data.Proxies = proxies
+	
+	// Get mirror stats from MirrorManager
+	if cachedProxy, ok := c.proxy.(*tidalproxy.CachedProxy); ok {
+		if mgr := cachedProxy.GetMirrorManager(); mgr != nil {
+			data.MirrorStats = mgr.GetStatus()
+		}
+	}
+	
 	return &Response{
 		template: "proxies.tmpl",
 		data:     data,

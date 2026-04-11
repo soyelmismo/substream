@@ -34,6 +34,9 @@ type Pool struct {
 	client    *http.Client
 	quality   string
 	mu        sync.RWMutex
+	
+	// New mirror manager for intelligent selection
+	mirrorMgr *MirrorManager
 }
 
 // NewPool creates a proxy pool from a list of hifi-api base URLs
@@ -58,11 +61,22 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 		quality: cfg.Quality,
 	}
 
+	// Initialize mirror manager for intelligent routing
+	var mirrorConfigs []MirrorConfig
 	for _, u := range urls {
+		mirrorConfigs = append(mirrorConfigs, MirrorConfig{
+			URL:            strings.TrimSuffix(u, "/"),
+			Weight:         100, // Default weight
+			HealthEndpoint: "/info/?id=1", // Lightweight endpoint for health checks
+		})
 		p.instances = append(p.instances, &instance{url: strings.TrimSuffix(u, "/")})
 	}
+	
+	p.mirrorMgr = NewMirrorManager(mirrorConfigs, cfg.HealthInterval)
+	p.mirrorMgr.Start()
+	log.Printf("[POOL] Initialized with %d mirrors using intelligent routing", len(mirrorConfigs))
 
-	go p.healthCheck(cfg.HealthInterval)
+	go p.healthCheck(cfg.HealthInterval) // Keep old health check as backup
 	return p
 }
 
@@ -74,6 +88,16 @@ func (p *Pool) SetInstances(urls []string) {
 	for _, u := range urls {
 		p.instances = append(p.instances, &instance{url: strings.TrimSuffix(u, "/")})
 	}
+	
+	// Update MirrorManager with new mirrors
+	if p.mirrorMgr != nil {
+		p.mirrorMgr.UpdateMirrors(urls)
+	}
+}
+
+// GetMirrorManager returns the mirror manager for status inspection
+func (p *Pool) GetMirrorManager() *MirrorManager {
+	return p.mirrorMgr
 }
 
 func (p *Pool) healthCheck(interval time.Duration) {
@@ -122,10 +146,26 @@ func (p *Pool) pick() (string, error) {
 // It handles proxy selection, URL construction, header injection, and the 3-attempt retry loop.
 func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
 	var lastErr error
+	
 	for i := 0; i < 3; i++ {
-		base, err := p.pick()
-		if err != nil {
-			return nil, err
+		// Use intelligent mirror selection with MirrorManager
+		var base string
+		var selectedMirror *Mirror
+		
+		if p.mirrorMgr != nil {
+			selectedMirror = p.mirrorMgr.SelectMirror()
+		}
+		
+		if selectedMirror != nil {
+			base = selectedMirror.URL
+			log.Printf("[TIDAL] Selected mirror: %s (state=%s)", base, selectedMirror.GetState())
+		} else {
+			// Fallback to old round-robin
+			var err error
+			base, err = p.pick()
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		u := base + path
@@ -143,9 +183,15 @@ func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, cl
 			req.Header.Set("X-Real-IP", clientIP)
 		}
 
+		start := time.Now()
 		resp, err := p.client.Do(req)
+		latency := time.Since(start)
+		
 		if err != nil {
 			lastErr = fmt.Errorf("request %s (try %d): %w", path, i+1, err)
+			if selectedMirror != nil {
+				p.mirrorMgr.ReportResult(selectedMirror, latency, err)
+			}
 			continue
 		}
 
@@ -153,6 +199,10 @@ func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, cl
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s (try %d) returned %d: %s", path, i+1, resp.StatusCode, string(body))
+			// Report HTTP error as failure to mirror manager
+			if selectedMirror != nil {
+				p.mirrorMgr.ReportResult(selectedMirror, latency, lastErr)
+			}
 			if resp.StatusCode == 404 {
 				return nil, lastErr
 			}
@@ -161,6 +211,12 @@ func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, cl
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		
+		// Report success to mirror manager
+		if selectedMirror != nil {
+			p.mirrorMgr.ReportResult(selectedMirror, latency, err)
+		}
+		
 		return body, err
 	}
 	return nil, lastErr
@@ -168,6 +224,7 @@ func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, cl
 
 // doFetchRawWithInstance performs a GET request to a specific proxy instance (by index).
 // Used for retry logic when 404 errors are encountered.
+// Also tracks results with MirrorManager if available.
 func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query url.Values, clientIP string, instanceIdx int) ([]byte, error) {
 	p.mu.RLock()
 	if len(p.instances) == 0 {
@@ -178,6 +235,12 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 	idx := instanceIdx % len(p.instances)
 	base := p.instances[idx].url
 	p.mu.RUnlock()
+
+	// Find corresponding mirror for this instance index
+	var mirror *Mirror
+	if p.mirrorMgr != nil && idx < len(p.mirrorMgr.mirrors) {
+		mirror = p.mirrorMgr.mirrors[idx]
+	}
 
 	u := base + path
 	if len(query) > 0 {
@@ -194,19 +257,34 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		req.Header.Set("X-Real-IP", clientIP)
 	}
 
+	start := time.Now()
 	resp, err := p.client.Do(req)
+	latency := time.Since(start)
+	
 	if err != nil {
+		if mirror != nil {
+			p.mirrorMgr.ReportResult(mirror, latency, err)
+		}
 		return nil, fmt.Errorf("request %s: %w", path, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
+		err := fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
+		if mirror != nil {
+			p.mirrorMgr.ReportResult(mirror, latency, err)
+		}
+		return nil, err
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	
+	if mirror != nil {
+		p.mirrorMgr.ReportResult(mirror, latency, err)
+	}
+	
 	return body, err
 }
 

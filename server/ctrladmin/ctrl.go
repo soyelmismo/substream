@@ -290,7 +290,8 @@ type templateData struct {
 	Avatar []byte
 
 	// proxies
-	Proxies []*db.ProxyInstance
+	Proxies     []*db.ProxyInstance
+	MirrorStats string
 
 	// settings
 	AutoRegister   bool

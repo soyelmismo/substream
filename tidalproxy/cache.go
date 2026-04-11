@@ -96,6 +96,14 @@ func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalAr
 	return t, err
 }
 
+// GetMirrorManager returns the underlying MirrorManager if the base is a Pool
+func (c *CachedProxy) GetMirrorManager() *MirrorManager {
+	if pool, ok := c.TidalProxy.(*Pool); ok {
+		return pool.GetMirrorManager()
+	}
+	return nil
+}
+
 func (c *CachedProxy) GetCoverUUIDForAlbum(ctx context.Context, albumID int) string {
 	key := strconv.Itoa(albumID)
 	if cached := c.albumArt.Get(key); cached != "" {
