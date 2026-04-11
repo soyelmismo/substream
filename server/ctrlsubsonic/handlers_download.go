@@ -42,7 +42,7 @@ func (c *Controller) ServeDownload(w http.ResponseWriter, r *http.Request) *spec
 	}
 }
 
-func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, albumID int, user *db.User) *spec.Response {
+func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, albumID int, _ *db.User) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	// Get album info from Tidal API
@@ -142,12 +142,12 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 	return nil
 }
 
-func (c *Controller) servePlaylistDownload(w http.ResponseWriter, r *http.Request, playlistID int, user *db.User) *spec.Response {
+func (c *Controller) servePlaylistDownload(_ http.ResponseWriter, _ *http.Request, _ int, _ *db.User) *spec.Response {
 	// Playlist download not supported - fall back to single track download
 	return spec.NewError(0, "playlist download not supported")
 }
 
-func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, trackID int, user *db.User) *spec.Response {
+func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, trackID int, _ *db.User) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	// Get track info

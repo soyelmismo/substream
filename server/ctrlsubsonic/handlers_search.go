@@ -1,8 +1,6 @@
 package ctrlsubsonic
 
 import (
-	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -534,110 +532,14 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
 			FirstOrCreate(&db.ArtistStar{UserID: user.ID, URI: uri})
 
-		// Async cache warm-up: pre-fetch artist metadata and index in global library
-		go c.warmArtistCache(r, id.Value())
+		// Async cache warm-up: pre-fetch artist metadata via proxy (automatically caches raw Tidal data)
+		go func() {
+			c.proxy.GetArtistInfo(r.Context(), id.Value())
+			c.proxy.GetArtistAlbums(r.Context(), id.Value(), true)
+		}()
 	}
 
 	return spec.NewResponse()
-}
-
-// warmArtistCache pre-fetches artist metadata and caches albums globally
-// This runs async so the star response is instant, but makes content available in global virtual library
-func (c *Controller) warmArtistCache(r *http.Request, artistID int) {
-	cacheKey := fmt.Sprintf("td:ar:%d", artistID)
-
-	// Fetch artist info
-	info, err := c.proxy.GetArtistInfo(r.Context(), artistID)
-	if err != nil {
-		return
-	}
-
-	artist := spec.NewArtistFromTidal(&info.Artist)
-	artist.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), artistID)
-
-	// Store in persistent cache
-	if cached := c.dbc.GetCachedMetadata(cacheKey); cached == nil {
-		if artistJSON, err := json.Marshal(artist); err == nil {
-			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
-			log.Printf("[CACHE] Warmed artist %d (%s)", artistID, artist.Name)
-		}
-	}
-
-	// Fetch and cache album list for this artist
-	page, err := c.proxy.GetArtistAlbums(r.Context(), artistID, true)
-	if err != nil || page == nil || len(page.Albums.Items) == 0 {
-		return
-	}
-
-	// Cache albums metadata
-	albumsCacheKey := fmt.Sprintf("artist_albums:%d", artistID)
-	if cached := c.dbc.GetCachedMetadata(albumsCacheKey); cached == nil {
-		if albumsJSON, err := json.Marshal(page.Albums.Items); err == nil {
-			c.dbc.SetCachedMetadata(albumsCacheKey, albumsJSON, metadataCacheTTL)
-			log.Printf("[CACHE] Warmed %d albums for artist %d", len(page.Albums.Items), artistID)
-		}
-	}
-
-	// Cache each album individually for virtual library indexing
-	// NOTE: We DON'T warm tracks here to avoid N+1 API calls (one per album)
-	// Tracks are cached on-demand when the user actually opens an album
-	albumsCached := 0
-	for _, album := range page.Albums.Items {
-		albumCacheKey := fmt.Sprintf("td:al:%d", album.ID)
-		if cached := c.dbc.GetCachedMetadata(albumCacheKey); cached == nil {
-			// Create minimal album spec for cache
-			cachedAlbum := map[string]interface{}{
-				"id":    album.ID,
-				"title": album.Title,
-				"artist": func() string {
-					if len(album.Artists) > 0 {
-						return album.Artists[0].Name
-					}
-					return ""
-				}(),
-			}
-			if albumJSON, err := json.Marshal(cachedAlbum); err == nil {
-				c.dbc.SetCachedMetadata(albumCacheKey, albumJSON, metadataCacheTTL)
-				albumsCached++
-			}
-		}
-	}
-
-	log.Printf("[CACHE] Warmed artist %d complete: %d albums indexed (%d new albums cached)", artistID, len(page.Albums.Items), albumsCached)
-}
-
-// warmAlbumTracks fetches and caches all tracks from an album
-func (c *Controller) warmAlbumTracks(r *http.Request, albumID int) {
-	// Get album info (which includes tracks in Items field)
-	info, err := c.proxy.GetAlbumInfo(r.Context(), albumID)
-	if err != nil || info == nil || len(info.Items) == 0 {
-		return
-	}
-
-	// Cache each track
-	for _, track := range info.Items {
-		trackCacheKey := fmt.Sprintf("track:td:tr:%d", track.ID)
-		if cached := c.dbc.GetCachedMetadata(trackCacheKey); cached != nil {
-			continue // Already cached
-		}
-
-		// Create minimal track spec for cache
-		cachedTrack := map[string]interface{}{
-			"id":        track.ID,
-			"title":     track.Title,
-			"artist":    track.Artist.Name,
-			"artist_id": track.Artist.ID,
-			"album_id":  albumID,
-			"duration":  track.Duration,
-			"number":    track.TrackNumber,
-		}
-
-		if trackJSON, err := json.Marshal(cachedTrack); err == nil {
-			c.dbc.SetCachedMetadata(trackCacheKey, trackJSON, metadataCacheTTL)
-		}
-	}
-
-	log.Printf("[CACHE] Warmed %d tracks for album %d", len(info.Items), albumID)
 }
 
 func (c *Controller) ServeUnstar(r *http.Request) *spec.Response {

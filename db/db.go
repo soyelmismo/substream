@@ -374,8 +374,11 @@ func (db *DB) GetCacheStats() (total int64, expired int64, oldest time.Time, new
 
 // ClearAllCache removes all entries from the metadata_cache
 func (db *DB) ClearAllCache() error {
+	// Forzar checkpoint de WAL antes de DELETE para consolidar escrituras previas
+	db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+
 	var count int64
-	db.Raw("SELECT COUNT(*) FROM metadata_cache").Scan(&count)
+	db.Table("metadata_cache").Count(&count)
 	log.Printf("[CACHE] metadata_cache count before delete: %d", count)
 
 	result := db.Exec("DELETE FROM metadata_cache")
@@ -385,7 +388,7 @@ func (db *DB) ClearAllCache() error {
 	log.Printf("[CACHE] Cleared all metadata_cache entries: %d deleted", result.RowsAffected)
 
 	var countAfter int64
-	db.Raw("SELECT COUNT(*) FROM metadata_cache").Scan(&countAfter)
+	db.Table("metadata_cache").Count(&countAfter)
 	log.Printf("[CACHE] metadata_cache count after delete: %d", countAfter)
 	return nil
 }

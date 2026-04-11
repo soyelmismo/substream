@@ -2,7 +2,6 @@ package ctrlsubsonic
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -115,9 +114,6 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 
 	artist := spec.NewArtistFromTidal(&info.Artist)
 	c.applyArtistStar(user.ID, artist)
-
-	// Warm-up cache in background for future syncs
-	go c.warmArtistCacheFromData(artist, artistPage)
 
 	items := artistPage.Albums.Items
 	// Deduplicate albums by title+release_date (Tidal API returns same album with different IDs)
@@ -727,24 +723,6 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 		artistInfo.Similar = append(artistInfo.Similar, sa)
 	}
 
-	// Warm-up cache in background for the main artist
-	go func() {
-		artistID := id.Value()
-		if artistID <= 0 {
-			return
-		}
-		artist := spec.NewArtistFromTidal(&info.Artist)
-		if artist.Name == "" {
-			log.Printf("[CACHE] Skipping warm for artist %d: no name", artistID)
-			return
-		}
-		artist.AlbumCount = c.proxy.GetArtistAlbumCount(context.Background(), artistID)
-		cacheKey := fmt.Sprintf("td:ar:%d", artistID)
-		if artistJSON, err := json.Marshal(artist); err == nil {
-			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
-		}
-	}()
-
 	sub := spec.NewResponse()
 	if strings.Contains(r.URL.Path, "getArtistInfo2") {
 		sub.ArtistInfoTwo = artistInfo
@@ -770,71 +748,4 @@ func (c *Controller) ServeGetAlbumInfoTwo(r *http.Request) *spec.Response {
 	sub := spec.NewResponse()
 	sub.AlbumInfo = albumInfo
 	return sub
-}
-
-// warmArtistCacheFromData caches artist and album data from already-fetched results
-// This is used in background goroutines after ServeGetArtist completes
-func (c *Controller) warmArtistCacheFromData(artist *spec.Artist, artistPage *tidalproxy.TidalArtistPage) {
-	if artist == nil || artistPage == nil {
-		return
-	}
-
-	// Cache artist (artist.ID is *specid.ID)
-	if artist.ID != nil {
-		artistID := artist.ID.Value()
-		// Skip invalid artist IDs
-		if artistID <= 0 {
-			log.Printf("[CACHE] Skipping warm for invalid artist ID: %d", artistID)
-			return
-		}
-		// Skip artists without name
-		if artist.Name == "" {
-			log.Printf("[CACHE] Skipping warm for artist %d: no name", artistID)
-			return
-		}
-
-		cacheKey := fmt.Sprintf("td:ar:%d", artistID)
-		if artistJSON, err := json.Marshal(artist); err == nil {
-			c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
-			log.Printf("[CACHE] Warmed artist %d from getArtist", artistID)
-		}
-
-		// Cache each album individually for virtual library indexing
-		albumsCached := 0
-		for _, album := range artistPage.Albums.Items {
-			if album.ID <= 0 {
-				continue
-			}
-			albumCacheKey := fmt.Sprintf("td:al:%d", album.ID)
-			if cached := c.dbc.GetCachedMetadata(albumCacheKey); cached == nil {
-				// Create minimal album spec for cache
-				cachedAlbum := map[string]interface{}{
-					"id":    album.ID,
-					"title": album.Title,
-					"artist": func() string {
-						if len(album.Artists) > 0 {
-							return album.Artists[0].Name
-						}
-						return ""
-					}(),
-				}
-				if albumJSON, err := json.Marshal(cachedAlbum); err == nil {
-					c.dbc.SetCachedMetadata(albumCacheKey, albumJSON, metadataCacheTTL)
-					albumsCached++
-				}
-			}
-		}
-		if albumsCached > 0 {
-			log.Printf("[CACHE] Warmed %d albums for virtual library from artist %d", albumsCached, artistID)
-		}
-
-		// Cache full album list for quick retrieval
-		if len(artistPage.Albums.Items) > 0 {
-			albumsCacheKey := fmt.Sprintf("artist_albums:%d", artistID)
-			if albumsJSON, err := json.Marshal(artistPage.Albums.Items); err == nil {
-				c.dbc.SetCachedMetadata(albumsCacheKey, albumsJSON, metadataCacheTTL)
-				log.Printf("[CACHE] Warmed %d albums list for artist %d from getArtist", len(artistPage.Albums.Items), artistID)
-			}
-		}
-	}
 }

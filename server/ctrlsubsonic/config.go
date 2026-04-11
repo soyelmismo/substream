@@ -79,9 +79,6 @@ var (
 	// Short timeout ensures quick fallback to local content.
 	genreFetchTimeout = 3 * time.Second
 
-	// genreCountFetchConcurrency is the maximum concurrent requests when fetching genre counts.
-	// Limits rate to avoid overwhelming the API.
-	genreCountFetchConcurrency = 5
 
 	// genreFetchMaxCount is the maximum number of tracks to return per genre request.
 	// Prevents oversized responses.

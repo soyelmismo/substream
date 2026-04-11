@@ -122,7 +122,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 
 	log.Printf("[DOWNLOAD] HLS Media playlist parsed: %d segments found", len(segments))
 	if len(segments) > 0 {
-		log.Printf("[DOWNLOAD] First segment URL: %s", segments[0])
+		log.Printf("[DOWNLOAD] First segment URL: %s", segments[0].url)
 	}
 	if len(segments) == 0 {
 		return fmt.Errorf("no segments found in manifest")

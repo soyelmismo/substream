@@ -51,6 +51,11 @@ func MigrateToURNs(db *gorm.DB) error {
 			return fmt.Errorf("migrate playlist_tracks: %w", err)
 		}
 
+		// MigrateFixPluralizedTables drops tables that were accidentally pluralized by GORM
+		if err := MigrateFixPluralizedTables(tx); err != nil {
+			return fmt.Errorf("migrate fix pluralized tables: %w", err)
+		}
+
 		// Migrate plays table (adds fallback columns too)
 		if err := migratePlaysTable(tx); err != nil {
 			return fmt.Errorf("migrate plays: %w", err)
@@ -76,6 +81,18 @@ func MigrateToURNs(db *gorm.DB) error {
 
 		return nil
 	})
+}
+
+// MigrateFixPluralizedTables drops tables that were accidentally pluralized by GORM
+func MigrateFixPluralizedTables(tx *gorm.DB) error {
+	// Drop old pluralized tables (data will be lost - cache will rebuild naturally)
+	if err := tx.Exec("DROP TABLE IF EXISTS metadata_caches").Error; err != nil {
+		return fmt.Errorf("drop metadata_caches: %w", err)
+	}
+	if err := tx.Exec("DROP TABLE IF EXISTS track_metadatas").Error; err != nil {
+		return fmt.Errorf("drop track_metadatas: %w", err)
+	}
+	return nil
 }
 
 // migrateTable handles the standard migration pattern for tables with TidalID -> URI
@@ -489,6 +506,11 @@ func (db *DB) Migrate() error {
 	// Ensure metadata_cache table exists (for global virtual library)
 	if err := MigrateMetadataCacheTable(db.DB); err != nil {
 		return fmt.Errorf("metadata_cache migration failed: %w", err)
+	}
+
+	// Fix tables that were accidentally pluralized by GORM (drop metadata_caches, track_metadatas)
+	if err := MigrateFixPluralizedTables(db.DB); err != nil {
+		log.Printf("[MIGRATION] Pluralized tables fix warning: %v", err)
 	}
 
 	// Clean up old format cache keys

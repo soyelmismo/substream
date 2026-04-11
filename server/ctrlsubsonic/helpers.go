@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,8 +16,6 @@ import (
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
-// metadataCacheTTL is the default TTL for persistent metadata cache (24 hours)
-const metadataCacheTTL = 86400
 
 // batchFetchTracks fetches metadata for multiple tidal track IDs concurrently
 // with a semaphore to limit parallelism. Failed fetches are silently skipped.
@@ -42,16 +39,6 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 		go func(idx, tid int) {
 			defer wg.Done()
 
-			// Check persistent cache first
-			cacheKey := fmt.Sprintf("td:tr:%d", tid)
-			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
-				var track spec.TrackChild
-				if err := json.Unmarshal(cached, &track); err == nil {
-					results <- result{idx: idx, track: &track}
-					return
-				}
-			}
-
 			c.proxySem <- struct{}{}
 			defer func() { <-c.proxySem }()
 
@@ -60,12 +47,6 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 				return
 			}
 			tc := spec.NewTrackFromTidal(track)
-
-			// Store in persistent cache
-			if trackJSON, err := json.Marshal(tc); err == nil {
-				c.dbc.SetCachedMetadata(cacheKey, trackJSON, metadataCacheTTL)
-			}
-
 			results <- result{idx: idx, track: tc}
 		}(i, id)
 	}
@@ -115,16 +96,6 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 		go func(idx, tid int) {
 			defer wg.Done()
 
-			// Check persistent cache first
-			cacheKey := fmt.Sprintf("td:al:%d", tid)
-			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
-				var album spec.Album
-				if err := json.Unmarshal(cached, &album); err == nil {
-					results <- result{idx: idx, album: &album}
-					return
-				}
-			}
-
 			c.proxySem <- struct{}{}
 			defer func() { <-c.proxySem }()
 
@@ -133,12 +104,6 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 				return
 			}
 			a := spec.NewAlbumFromTidal(info)
-
-			// Store in persistent cache
-			if albumJSON, err := json.Marshal(a); err == nil {
-				c.dbc.SetCachedMetadata(cacheKey, albumJSON, metadataCacheTTL)
-			}
-
 			results <- result{idx: idx, album: a}
 		}(i, id)
 	}
@@ -216,15 +181,6 @@ func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs [
 	return albums
 }
 
-// getTrackPlayCount returns the play count for a track from local DB
-// Note: Now accepts URI string instead of numeric tidalID
-func (c *Controller) getTrackPlayCount(userID int, uri string) int {
-	var play db.Play
-	if c.dbc.Where("user_id=? AND uri=?", userID, uri).First(&play).Error == nil {
-		return play.Count
-	}
-	return 0
-}
 
 // batchFetchArtists fetches metadata for multiple tidal artist IDs concurrently
 // includes album count for each artist
@@ -247,16 +203,6 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 		go func(idx, tid int) {
 			defer wg.Done()
 
-			// Check persistent cache first
-			cacheKey := fmt.Sprintf("td:ar:%d", tid)
-			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
-				var artist spec.Artist
-				if err := json.Unmarshal(cached, &artist); err == nil {
-					results <- result{idx: idx, artist: &artist}
-					return
-				}
-			}
-
 			c.proxySem <- struct{}{}
 			defer func() { <-c.proxySem }()
 
@@ -269,15 +215,6 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 
 			// Get album count from cache (avoids extra API call)
 			a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
-
-			// Store in persistent cache only if artist has name
-			if a.Name != "" {
-				if artistJSON, err := json.Marshal(a); err == nil {
-					c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
-				}
-			} else {
-				log.Printf("[CACHE] Skipping cache for artist %d: no name", tid)
-			}
 
 			results <- result{idx: idx, artist: a}
 		}(i, id)
@@ -303,21 +240,6 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 	return artists
 }
 
-// parseTidalIDs parses a JSON array string of tidal IDs
-func parseTidalIDs(jsonStr string) []int {
-	var ids []int
-	_ = json.Unmarshal([]byte(jsonStr), &ids)
-	return ids
-}
-
-// encodeTidalIDs encodes a slice of tidal IDs to JSON
-func encodeTidalIDs(ids []int) string {
-	if len(ids) == 0 {
-		return "[]"
-	}
-	data, _ := json.Marshal(ids)
-	return string(data)
-}
 
 // scrobbleTrackFromTidal converts a TidalTrack to a scrobble.Track
 func scrobbleTrackFromTidal(t *tidalproxy.TidalTrack) scrobble.Track {
