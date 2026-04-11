@@ -4,7 +4,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"time"
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
@@ -38,6 +37,10 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	var artists []spec.Artist
 	var albums []spec.Album
 	var fromCache bool
+
+	var favTracks []*spec.TrackChild
+	var favArtists []*spec.Artist
+	var favAlbums []*spec.Album
 
 	// Check cache
 	if cached := c.searchCache.Get(query); len(cached.tracks) > 0 || len(cached.artists) > 0 || len(cached.albums) > 0 {
@@ -181,156 +184,99 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		}()
 	}
 
-	// 2. Parallel Favorites Search
-	favTracksCh := make(chan []spec.TrackChild, 1)
-	favArtistsCh := make(chan []spec.Artist, 1)
-	favAlbumsCh := make(chan []spec.Album, 1)
-
+	// 2. Optimized Favorites Search via SQL (Favorites-First)
 	user := r.Context().Value(CtxUser).(*db.User)
 	if !fromCache && len(query) >= 3 && (songOffset == 0 || albumOffset == 0 || artistOffset == 0) {
-		queryLower := strings.ToLower(query)
+		q := "%" + query + "%"
 
-		go func() {
-			if albumOffset != 0 {
-				favAlbumsCh <- nil
-				return
-			}
-			var stars []db.AlbumStar
-			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
-			starIDs := make([]int, len(stars))
-			for i, s := range stars {
-				starIDs[i] = extractIDFromURI(s.URI)
-			}
-
-			starredMeta := c.batchFetchAlbums(r, starIDs)
-			var matches []spec.Album
-			for _, a := range starredMeta {
-				if strings.Contains(strings.ToLower(a.Name), queryLower) || strings.Contains(strings.ToLower(a.Artist), queryLower) {
-					matches = append(matches, *a)
-				}
-			}
-			favAlbumsCh <- matches
-		}()
-
-		go func() {
-			if artistOffset != 0 {
-				favArtistsCh <- nil
-				return
-			}
-			var stars []db.ArtistStar
-			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
-			starIDs := make([]int, len(stars))
-			for i, s := range stars {
-				starIDs[i] = extractIDFromURI(s.URI)
-			}
-
-			starredMeta := c.batchFetchArtists(r, starIDs)
-			var matches []spec.Artist
-			for _, a := range starredMeta {
-				if strings.Contains(strings.ToLower(a.Name), queryLower) {
-					matches = append(matches, *a)
-				}
-			}
-			favArtistsCh <- matches
-		}()
-
-		go func() {
-			if songOffset != 0 {
-				favTracksCh <- nil
-				return
-			}
+		if songOffset == 0 {
 			var stars []db.TrackStar
-			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
-			starIDs := make([]int, len(stars))
-			for i, s := range stars {
-				starIDs[i] = extractIDFromURI(s.URI)
-			}
-
-			starredMeta := c.batchFetchTracks(r, starIDs)
-			var matches []spec.TrackChild
-			for _, t := range starredMeta {
-				if strings.Contains(strings.ToLower(t.Title), queryLower) || strings.Contains(strings.ToLower(t.Artist), queryLower) || strings.Contains(strings.ToLower(t.Album), queryLower) {
-					matches = append(matches, *t)
+			c.dbc.Where("user_id = ? AND (fallback_title LIKE ? OR fallback_artist LIKE ?)", user.ID, q, q).Limit(20).Find(&stars)
+			if len(stars) > 0 {
+				ids := make([]int, len(stars))
+				for i, s := range stars {
+					ids[i] = extractIDFromURI(s.URI)
 				}
+				favTracks = c.batchFetchTracks(r, ids)
 			}
-			favTracksCh <- matches
-		}()
-	} else {
-		favTracksCh <- nil
-		favArtistsCh <- nil
-		favAlbumsCh <- nil
-	}
+		}
 
-	log.Printf("[SUBS] Awaiting search results for query %q (cache=%v)", query, fromCache)
-	tracks = <-tracksCh
-	artists = <-artistsCh
-	albums = <-albumsCh
+		if albumOffset == 0 {
+			var stars []db.AlbumStar
+			c.dbc.Where("user_id = ? AND (fallback_title LIKE ? OR fallback_artist LIKE ?)", user.ID, q, q).Limit(20).Find(&stars)
+			if len(stars) > 0 {
+				ids := make([]int, len(stars))
+				for i, s := range stars {
+					ids[i] = extractIDFromURI(s.URI)
+				}
+				favAlbums = c.batchFetchAlbums(r, ids)
+			}
+		}
 
-	// implement "Favorites First" logic merge with timeout
-	var favTracks []spec.TrackChild
-	var favArtists []spec.Artist
-	var favAlbums []spec.Album
-
-	waitForFavs := time.NewTimer(3 * time.Second)
-	defer waitForFavs.Stop()
-
-favLoop:
-	for i := 0; i < 3; i++ {
-		select {
-		case favTracks = <-favTracksCh:
-		case favArtists = <-favArtistsCh:
-		case favAlbums = <-favAlbumsCh:
-		case <-waitForFavs.C:
-			log.Printf("[SUBS] Favorites search for %q timed out", query)
-			break favLoop
-		case <-r.Context().Done():
-			return nil
+		if artistOffset == 0 {
+			var stars []db.ArtistStar
+			c.dbc.Where("user_id = ? AND fallback_name LIKE ?", user.ID, q).Limit(20).Find(&stars)
+			if len(stars) > 0 {
+				ids := make([]int, len(stars))
+				for i, s := range stars {
+					ids[i] = extractIDFromURI(s.URI)
+				}
+				favArtists = c.batchFetchArtists(r, ids)
+			}
 		}
 	}
 
 	if len(favAlbums) > 0 {
-		newAlbums := favAlbums
 		seenIDs := make(map[int]bool)
-		for _, m := range favAlbums {
-			seenIDs[m.ID.Value()] = true
+		var combined []*spec.Album
+		for _, v := range favAlbums {
+			combined = append(combined, v)
+			seenIDs[v.ID.Value()] = true
 		}
-		for _, a := range albums {
-			if !seenIDs[a.ID.Value()] {
-				newAlbums = append(newAlbums, a)
-				seenIDs[a.ID.Value()] = true
+		for i := range albums {
+			if !seenIDs[albums[i].ID.Value()] {
+				combined = append(combined, &albums[i])
 			}
 		}
-		albums = newAlbums
+		results.Albums = combined
+	} else {
+		for i := range albums {
+			results.Albums = append(results.Albums, &albums[i])
+		}
 	}
 
 	if len(favArtists) > 0 {
-		newArtists := favArtists
 		seenIDs := make(map[int]bool)
-		for _, m := range favArtists {
-			seenIDs[m.ID.Value()] = true
+		var combined []*spec.Artist
+		for _, v := range favArtists {
+			combined = append(combined, v)
+			seenIDs[v.ID.Value()] = true
 		}
-		for _, a := range artists {
-			if !seenIDs[a.ID.Value()] {
-				newArtists = append(newArtists, a)
-				seenIDs[a.ID.Value()] = true
+		for i := range artists {
+			if !seenIDs[artists[i].ID.Value()] {
+				combined = append(combined, &artists[i])
 			}
 		}
-		artists = newArtists
+		results.Artists = combined
+	} else {
+		for i := range artists { results.Artists = append(results.Artists, &artists[i]) }
 	}
 
 	if len(favTracks) > 0 {
-		newTracks := favTracks
 		seenIDs := make(map[int]bool)
-		for _, m := range favTracks {
-			seenIDs[m.ID.Value()] = true
+		var combined []*spec.TrackChild
+		for _, v := range favTracks {
+			combined = append(combined, v)
+			seenIDs[v.ID.Value()] = true
 		}
-		for _, t := range tracks {
-			if !seenIDs[t.ID.Value()] {
-				newTracks = append(newTracks, t)
-				seenIDs[t.ID.Value()] = true
+		for i := range tracks {
+			if !seenIDs[tracks[i].ID.Value()] {
+				combined = append(combined, &tracks[i])
 			}
 		}
-		tracks = newTracks
+		results.Tracks = combined
+	} else {
+		for i := range tracks { results.Tracks = append(results.Tracks, &tracks[i]) }
 	}
 
 	if !fromCache && (len(tracks) > 0 || len(artists) > 0 || len(albums) > 0) {
@@ -348,17 +294,14 @@ favLoop:
 		return nil
 	}
 
-	for i := range tracks {
-		results.Tracks = append(results.Tracks, &tracks[i])
-		c.applyTrackStar(user.ID, &tracks[i])
+	for _, t := range results.Tracks {
+		c.applyTrackStar(user.ID, t)
 	}
-	for i := range artists {
-		results.Artists = append(results.Artists, &artists[i])
-		c.applyArtistStar(user.ID, &artists[i])
+	for _, a := range results.Artists {
+		c.applyArtistStar(user.ID, a)
 	}
-	for i := range albums {
-		results.Albums = append(results.Albums, &albums[i])
-		c.applyAlbumStar(user.ID, &albums[i])
+	for _, a := range results.Albums {
+		c.applyAlbumStar(user.ID, a)
 	}
 
 	sub := spec.NewResponse()
@@ -507,32 +450,52 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 	p := r.Context().Value(CtxParams).(params.Params)
 
-	// star supports id, albumId, artistId
-	if id, err := p.GetID("id"); err == nil {
+	starFn := func(id specid.ID) {
 		uri := id.String()
 		switch id.Type() {
 		case specid.Track:
-			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
-				FirstOrCreate(&db.TrackStar{UserID: user.ID, URI: uri, Provider: "tidal"})
+			var s db.TrackStar
+			if c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&s).RecordNotFound() {
+				if t, err := c.proxy.GetTrackInfo(r.Context(), id.Value()); err == nil {
+					s = db.TrackStar{UserID: user.ID, URI: uri, Provider: "tidal", FallbackArtist: t.Artist.Name, FallbackTitle: t.Title}
+				} else {
+					s = db.TrackStar{UserID: user.ID, URI: uri, Provider: "tidal"}
+				}
+				c.dbc.Create(&s)
+			}
 		case specid.Album:
-			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
-				FirstOrCreate(&db.AlbumStar{UserID: user.ID, URI: uri})
+			var s db.AlbumStar
+			if c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&s).RecordNotFound() {
+				if t, err := c.proxy.GetAlbumInfo(r.Context(), id.Value()); err == nil {
+					artistName := ""
+					if len(t.Artists) > 0 { artistName = t.Artists[0].Name }
+					s = db.AlbumStar{UserID: user.ID, URI: uri, FallbackArtist: artistName, FallbackTitle: t.Title}
+				} else {
+					s = db.AlbumStar{UserID: user.ID, URI: uri}
+				}
+				c.dbc.Create(&s)
+			}
 		case specid.Artist:
-			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
-				FirstOrCreate(&db.ArtistStar{UserID: user.ID, URI: uri})
+			var s db.ArtistStar
+			if c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&s).RecordNotFound() {
+				if t, err := c.proxy.GetArtistInfo(r.Context(), id.Value()); err == nil {
+					s = db.ArtistStar{UserID: user.ID, URI: uri, FallbackName: t.Artist.Name}
+				} else {
+					s = db.ArtistStar{UserID: user.ID, URI: uri}
+				}
+				c.dbc.Create(&s)
+			}
 		}
 	}
+
+	if id, err := p.GetID("id"); err == nil {
+		starFn(id)
+	}
 	if id, err := p.GetID("albumId"); err == nil {
-		uri := id.String()
-		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
-			FirstOrCreate(&db.AlbumStar{UserID: user.ID, URI: uri})
+		starFn(id)
 	}
 	if id, err := p.GetID("artistId"); err == nil {
-		uri := id.String()
-		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
-			FirstOrCreate(&db.ArtistStar{UserID: user.ID, URI: uri})
-
-		// Async cache warm-up: pre-fetch artist metadata via proxy (automatically caches raw Tidal data)
+		starFn(id)
 		go func() {
 			c.proxy.GetArtistInfo(r.Context(), id.Value())
 			c.proxy.GetArtistAlbums(r.Context(), id.Value(), true)

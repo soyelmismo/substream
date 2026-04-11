@@ -443,6 +443,29 @@ func MigrateDropTidalID(db *gorm.DB) error {
 	return nil
 }
 
+// MigrateAddFallbackColumnsToStars adds search fallback columns to album_stars and artist_stars
+func MigrateAddFallbackColumnsToStars(db *gorm.DB) error {
+	// Add format: ALTER TABLE table ADD COLUMN col TEXT
+	tables := map[string][]string{
+		"album_stars":  {"fallback_artist", "fallback_title"},
+		"artist_stars": {"fallback_name"},
+	}
+
+	for table, cols := range tables {
+		for _, col := range cols {
+			if err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT`, table, col)).Error; err != nil {
+				if !isDuplicateColumnError(err) {
+					// tableExists check in case table is not yet created
+					if tableExists(db, table) {
+						return fmt.Errorf("add column %s to %s: %w", col, table, err)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // MigrateCleanupOldCacheKeys removes metadata_cache entries with old key formats
 // Old formats: "artist:td:ar:12345", "album:td:al:12345", "track:td:tr:12345" (with type prefix)
 //
@@ -516,6 +539,11 @@ func (db *DB) Migrate() error {
 	// Clean up old format cache keys
 	if err := MigrateCleanupOldCacheKeys(db.DB); err != nil {
 		log.Printf("[MIGRATION] Cache key cleanup warning: %v", err)
+	}
+
+	// Add fallback columns to stars for search optimization
+	if err := MigrateAddFallbackColumnsToStars(db.DB); err != nil {
+		log.Printf("[MIGRATION] Fallback columns migration warning: %v", err)
 	}
 
 	return db.AutoMigrate(

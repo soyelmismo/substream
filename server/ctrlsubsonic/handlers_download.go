@@ -148,59 +148,24 @@ func (c *Controller) servePlaylistDownload(_ http.ResponseWriter, _ *http.Reques
 }
 
 func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, trackID int, _ *db.User) *spec.Response {
-	p := r.Context().Value(CtxParams).(params.Params)
-
-	// Get track info
-	track, err := c.proxy.GetTrackInfo(r.Context(), trackID)
+	prep, err := c.prepareStream(r.Context(), r, trackID)
 	if err != nil {
-		return spec.NewError(70, "track not found: %v", err)
-	}
-
-	// Get quality preference from request
-	bitrate := p.GetOrInt("maxBitRate", 0)
-	tidalQuality := "LOSSLESS"
-	switch {
-	case bitrate == 0:
-		tidalQuality = "LOSSLESS"
-	case bitrate <= 128:
-		tidalQuality = "LOW"
-	case bitrate <= 320:
-		tidalQuality = "HIGH"
-	case bitrate >= 900:
-		tidalQuality = "HI_RES_LOSSLESS"
-	default:
-		tidalQuality = "LOSSLESS"
-	}
-
-	// Get stream URL
-	ctx := r.Context()
-	streamURL, err := c.proxy.GetStreamURL(ctx, trackID, tidalQuality, getClientIP(r))
-	if err != nil {
-		return spec.NewError(0, "error getting stream URL: %v", err)
-	}
-
-	// Determine extension based on quality
-	ext := "m4a"
-	switch tidalQuality {
-	case "LOSSLESS", "HI_RES_LOSSLESS":
-		ext = "flac"
-	case "LOW", "HIGH":
-		ext = "m4a"
+		return spec.NewError(0, "error preparing download: %v", err)
 	}
 
 	// Create filename
-	filename := fmt.Sprintf("%s - %s.%s", track.Artist.Name, track.Title, ext)
+	filename := fmt.Sprintf("%s - %s.%s", prep.Track.Artist.Name, prep.Track.Title, prep.Ext)
 	filename = sanitizeFilename(filename)
 
 	// Set headers for download
-	w.Header().Set("Content-Type", "audio/"+ext)
+	w.Header().Set("Content-Type", "audio/"+prep.Ext)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	w.Header().Set("Cache-Control", "no-cache")
 
-	log.Printf("[DOWNLOAD] Starting single track download: track=%d artist=%q title=%q quality=%s", trackID, track.Artist.Name, track.Title, tidalQuality)
+	log.Printf("[DOWNLOAD] Starting single track download: track=%d artist=%q title=%q quality=%s", trackID, prep.Track.Artist.Name, prep.Track.Title, prep.Quality)
 
 	// Download and stream the track
-	if err := c.downloadAndAddToZip(ctx, streamURL, w, getClientIP(r)); err != nil {
+	if err := c.downloadAndAddToZip(r.Context(), prep.StreamURL, w, prep.ClientIP); err != nil {
 		log.Printf("[DOWNLOAD] Error downloading track %d: %v", trackID, err)
 		return spec.NewError(0, "download failed: %v", err)
 	}

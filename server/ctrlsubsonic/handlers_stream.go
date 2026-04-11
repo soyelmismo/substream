@@ -19,213 +19,60 @@ import (
 )
 
 func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.Response {
-	start := time.Now()
 	p := r.Context().Value(CtxParams).(params.Params)
-
 	id, err := p.GetID("id")
 	if err != nil || id.Type() != specid.Track {
-		log.Printf("[STREAM] ERROR: invalid track id: %v", err)
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
 
-	// Log raw request details for debugging
-	rawID := p.GetOr("id", "")
-	client := p.GetOr("c", "unknown")
-	rangeHdr := r.Header.Get("Range")
-	log.Printf("[STREAM] REQUEST: client=%s raw_id=%s parsed_track_id=%d range=%q", client, rawID, id.Value(), rangeHdr)
-
-	// Get client IP for proxy requests
-	clientIP := r.Header.Get("X-Forwarded-For")
-	if clientIP == "" {
-		clientIP = r.Header.Get("X-Real-IP")
-	}
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-	}
-
-	bitrate := p.GetOrInt("maxBitRate", 0)
-	offset := p.GetOrInt("timeOffset", 0) // Time-based seeking offset in seconds
-	log.Printf("[STREAM] bitRate=%d offset=%ds", bitrate, offset)
-	tidalQuality := ""
-	switch {
-	case bitrate == 0:
-		// Default to LOSSLESS (CD Quality FLAC) instead of HI_RES
-		// because HI_RES often uses DASH containers which break clients.
-		tidalQuality = "LOSSLESS"
-	case bitrate <= 128:
-		tidalQuality = "LOW"
-	case bitrate <= 320:
-		tidalQuality = "HIGH"
-	case bitrate >= 900:
-		tidalQuality = "HI_RES_LOSSLESS"
-	default:
-		tidalQuality = "LOSSLESS"
-	}
-
-	// Use a detached context with timeout for upstream API fetching so
-	// we don't spam if client disconnects quickly.
-	// The download itself will use r.Context() to stop if client aborts.
-	metaCtx, metaCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer metaCancel()
-
-	// clientIP already determined above for deduplication
-	// Clean up port if present for API calls
-	if pos := strings.LastIndex(clientIP, ":"); pos != -1 {
-		clientIP = clientIP[:pos]
-	}
-	clientIP = strings.Trim(clientIP, "[]")
-
-	proxyStart := time.Now()
-	streamURL, err := c.getStreamURLWithCache(metaCtx, id.Value(), tidalQuality, clientIP)
-	proxyDuration := time.Since(proxyStart)
+	prep, err := c.prepareStream(r.Context(), r, id.Value())
 	if err != nil {
-		log.Printf("[STREAM] ERROR: GetStreamURL failed for track %d after %v: %v", id.Value(), proxyDuration, err)
-		return spec.NewError(0, "error getting stream URL: %v", err)
+		log.Printf("[STREAM] ERROR: prepare failed: %v", err)
+		return spec.NewError(0, "error preparing stream: %v", err)
 	}
 
-	// Log stream URL hash for debugging (to identify if same URL is returned for different tracks)
-	urlHash := ""
-	if len(streamURL) > 20 {
-		urlHash = streamURL[:20] + "..." + streamURL[len(streamURL)-10:]
-	}
-	log.Printf("[STREAM] URL: track=%d quality=%s url_hash=%s", id.Value(), tidalQuality, urlHash)
+	// 1. Ingest metadata for virtual library
+	user := r.Context().Value(CtxUser).(*db.User)
+	trackURI := fmt.Sprintf("td:tr:%d", id.Value())
+	c.dbc.Exec(`INSERT OR REPLACE INTO track_metadata (uri, album_uri, artist_uri, updated_at) VALUES (?, ?, ?, ?)`,
+		trackURI, fmt.Sprintf("td:al:%d", prep.Track.Album.ID), fmt.Sprintf("td:ar:%d", prep.Track.Artist.ID), time.Now())
+	c.dbc.Exec(`INSERT INTO plays (user_id, uri, provider, played_at, count) VALUES (?, ?, 'tidal', ?, 1) ON CONFLICT(user_id, uri) DO UPDATE SET count=count+1, played_at=?`,
+		user.ID, trackURI, time.Now(), time.Now())
 
-	// Debug: log full URL if it looks suspicious (no query params or very short)
-	if len(streamURL) < 50 || !strings.Contains(streamURL, "?") {
-		log.Printf("[STREAM] DEBUG: track=%d full_url=%q", id.Value(), streamURL)
-	}
-
-	// Determine content type and extensions early to check if we need proxy
-	ext := "flac"
-	if strings.Contains(streamURL, ".m4a") || strings.Contains(tidalQuality, "HIGH") || strings.Contains(tidalQuality, "LOW") {
-		ext = "m4a"
-	}
-
-	// Force proxy for HLS/DASH manifests - clients can't play manifests directly
-	isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
-	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
-
-	// Check if we should proxy or redirect based on settings (cached)
-	settingStart := time.Now()
+	// 2. Redirect if not proxying
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
-	// Force proxy for HLS/DASH streams regardless of setting
-	if isHLS || isDASH {
-		proxyStreams = "true"
-	}
-	settingDuration := time.Since(settingStart)
-	if proxyStreams != "true" {
-		// Redirect directly to tidal CDN - better performance but may cause CORS issues
-		if streamURL == "" {
-			log.Printf("[STREAM] track %d → error: empty stream URL for redirect", id.Value())
-			return spec.NewError(0, "empty stream URL from tidal")
-		}
-		totalDuration := time.Since(start)
-		log.Printf("[STREAM] REDIRECT: track=%d → 302 to CDN (proxy=%s) total=%v proxy=%v setting=%v url=%s",
-			id.Value(), proxyStreams, totalDuration, proxyDuration, settingDuration, urlHash)
-		http.Redirect(w, r, streamURL, http.StatusFound) // 302 redirect, no body
+	if proxyStreams != "true" && !prep.IsHLS && !prep.IsDASH {
+		http.Redirect(w, r, prep.StreamURL, http.StatusFound)
 		return nil
 	}
 
-	// Use a proxy instead of redirect to avoid CORS issues for web clients
-	// and certificate issues for clients using self-signed certs.
-
-	// Determine content type and extensions
-	track, err := c.proxy.GetTrackInfo(metaCtx, id.Value())
-	if err != nil {
-		return spec.NewError(0, "error fetching track meta: %v", err)
-	}
-
-	// Auto-ingest: Record track metadata for virtual library
-	// This allows us to infer artist/album from track plays
-	user := r.Context().Value(CtxUser).(*db.User)
-	trackURI := fmt.Sprintf("td:tr:%d", id.Value())
-	albumURI := fmt.Sprintf("td:al:%d", track.Album.ID)
-	artistURI := fmt.Sprintf("td:ar:%d", track.Artist.ID)
-
-	// Insert or update track_metadata
-	c.dbc.Exec(`
-		INSERT OR REPLACE INTO track_metadata (uri, album_uri, artist_uri, updated_at)
-		VALUES (?, ?, ?, ?)
-	`, trackURI, albumURI, artistURI, time.Now())
-
-	// Insert or update play count
-	c.dbc.Exec(`
-		INSERT INTO plays (user_id, uri, provider, played_at, count)
-		VALUES (?, ?, 'tidal', ?, 1)
-		ON CONFLICT(user_id, uri) DO UPDATE SET
-			count = count + 1,
-			played_at = ?
-	`, user.ID, trackURI, time.Now(), time.Now())
-
+	// 3. Proxy stream
 	contentType := "audio/flac"
-	if ext == "m4a" {
-		contentType = "audio/mp4"
-	}
-
-	filename := fmt.Sprintf("%s - %s.%s", track.Artist.Name, track.Title, ext)
-	filename = strings.ReplaceAll(filename, "/", "_") // basic sanitization
-
-	streamType := "direct"
-	if isHLS {
-		streamType = "HLS"
-	} else if isDASH {
-		streamType = "DASH"
-	}
-	log.Printf("[STREAM] PROXY: track=%d type=%s format=%s artist=%q title=%q", id.Value(), streamType, contentType, track.Artist.Name, track.Title)
-
+	if prep.Ext == "m4a" { contentType = "audio/mp4" }
 	w.Header().Set("Content-Type", contentType)
-	
-	// Only advertise Accept-Ranges for direct streams (FLAC/MP3)
-	// HLS/DASH stitcheado doesn't support byte-range seeking
-	if !isHLS && !isDASH {
-		w.Header().Set("Accept-Ranges", "bytes")
-	}
+	if !prep.IsHLS && !prep.IsDASH { w.Header().Set("Accept-Ranges", "bytes") }
 	if strings.Contains(r.URL.Path, "download") {
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+		cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s.%s", prep.Track.Artist.Name, prep.Track.Title, prep.Ext), "/", "_")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName))
 	}
 
-	var stitchErr error
-	if isHLS {
-		stitchErr = c.downloadAndStitchHLS(r.Context(), streamURL, w, clientIP, track, float64(offset))
-	} else if isDASH {
-		stitchErr = c.downloadAndStitchDASH(r.Context(), streamURL, w, clientIP, track)
+	if prep.IsHLS {
+		err = c.downloadAndStitchHLS(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track, p.GetOrFloat("timeOffset", 0))
+	} else if prep.IsDASH {
+		err = c.downloadAndStitchDASH(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track)
 	} else {
-		// Forward Range headers for seeking support in web players
-		req, _ := http.NewRequestWithContext(r.Context(), "GET", streamURL, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
-			req.Header.Set("Range", rangeHdr)
-		}
-		if clientIP != "" {
-			req.Header.Set("X-Forwarded-For", clientIP)
-		}
-
+		req, _ := http.NewRequestWithContext(r.Context(), "GET", prep.StreamURL, nil)
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" { req.Header.Set("Range", rangeHdr) }
+		req.Header.Set("X-Forwarded-For", prep.ClientIP)
 		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			defer resp.Body.Close()
-
-			// Forward important headers back to client
-			w.Header().Set("Accept-Ranges", "bytes")
-			if ct := resp.Header.Get("Content-Type"); ct != "" {
-				w.Header().Set("Content-Type", ct)
-			}
-			if cr := resp.Header.Get("Content-Range"); cr != "" {
-				w.Header().Set("Content-Range", cr)
-			}
-			if cl := resp.Header.Get("Content-Length"); cl != "" {
-				w.Header().Set("Content-Length", cl)
-			}
-			w.WriteHeader(resp.StatusCode)
-			_, stitchErr = io.Copy(w, resp.Body)
-		} else {
-			stitchErr = err
+		if err != nil {
+			log.Printf("[STREAM] ERROR: direct fetch failed: %v", err)
+			return nil
 		}
-	}
-
-	if stitchErr != nil {
-		log.Printf("[STREAM] ERROR: proxy failed for track %d: %v", id.Value(), stitchErr)
-	} else {
-		log.Printf("[STREAM] COMPLETE: track=%d type=%s", id.Value(), streamType)
+		defer resp.Body.Close()
+		for k, v := range resp.Header { w.Header()[k] = v }
+		w.WriteHeader(resp.StatusCode)
+		_, err = io.Copy(w, resp.Body)
 	}
 	return nil
 }
@@ -241,56 +88,6 @@ func (c *Controller) getCachedSetting(key, defaultVal string) string {
 	return val
 }
 
-// streamURLLockPair is used for deduplicating concurrent stream URL requests
-type streamURLLockPair struct {
-	done chan struct{}
-	url  string
-	err  error
-}
-
-// getStreamURLWithCache retrieves stream URL with caching and deduplication.
-// If multiple requests ask for the same track simultaneously, only one calls Tidal API.
-func (c *Controller) getStreamURLWithCache(ctx context.Context, trackID int, quality, clientIP string) (string, error) {
-	cacheKey := fmt.Sprintf("stream:%d:%s", trackID, quality)
-
-	// Fast path: check cache
-	if cached := c.streamURLCache.Get(cacheKey); cached != "" {
-		return cached, nil
-	}
-
-	// Deduplication: only one request fetches, others wait
-	lockVal, loaded := c.streamURLLocks.LoadOrStore(cacheKey, &streamURLLockPair{done: make(chan struct{})})
-	lp := lockVal.(*streamURLLockPair)
-
-	if loaded {
-		// Another request is in flight, wait for it
-		<-lp.done
-		if lp.err != nil {
-			return "", lp.err
-		}
-		return lp.url, nil
-	}
-
-	// We are the fetcher - do the work
-	url, err := c.proxy.GetStreamURL(ctx, trackID, quality, clientIP)
-
-	lp.url = url
-	lp.err = err
-	close(lp.done)
-
-	// Cache successful result
-	if err == nil && url != "" {
-		c.streamURLCache.Set(cacheKey, url, 30*time.Second)
-	}
-
-	// Cleanup lock after brief delay
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		c.streamURLLocks.Delete(cacheKey)
-	}()
-
-	return url, err
-}
 
 func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)

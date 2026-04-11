@@ -12,42 +12,62 @@ import (
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/scrobble"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
+// streamRequest bundle for unified stream preparation
+type streamRequest struct {
+	Quality   string
+	ClientIP  string
+	StreamURL string
+	Track     *tidalproxy.TidalTrack
+	Ext       string
+	IsHLS     bool
+	IsDASH    bool
+}
 
-// batchFetchTracks fetches metadata for multiple tidal track IDs concurrently
-// with a semaphore to limit parallelism. Failed fetches are silently skipped.
-func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.TrackChild {
-	user := r.Context().Value(CtxUser).(*db.User)
-
-	if len(tidalIDs) == 0 {
+// batchFetch is a generic concurrent fetcher with rate limiting and order preservation.
+func batchFetch[T any, R any](
+	ctx context.Context,
+	sem chan struct{},
+	ids []int,
+	fetchFn func(context.Context, int) (*T, error),
+	mapFn func(*T, int) *R,
+) []*R {
+	if len(ids) == 0 {
 		return nil
 	}
 
 	type result struct {
-		idx   int
-		track *spec.TrackChild
+		idx  int
+		data *R
 	}
 
-	results := make(chan result, len(tidalIDs))
+	results := make(chan result, len(ids))
 	var wg sync.WaitGroup
 
-	for i, id := range tidalIDs {
+	for i, id := range ids {
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
 
-			c.proxySem <- struct{}{}
-			defer func() { <-c.proxySem }()
-
-			track, err := c.proxy.GetTrackInfo(r.Context(), tid)
-			if err != nil {
+			// Block on semaphore
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results <- result{idx: idx, data: nil}
 				return
 			}
-			tc := spec.NewTrackFromTidal(track)
-			results <- result{idx: idx, track: tc}
+
+			data, err := fetchFn(ctx, tid)
+			if err == nil && data != nil {
+				results <- result{idx: idx, data: mapFn(data, tid)}
+			} else {
+				results <- result{idx: idx, data: nil}
+			}
 		}(i, id)
 	}
 
@@ -56,190 +76,161 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 		close(results)
 	}()
 
-	// collect results preserving order
-	ordered := make([]*spec.TrackChild, len(tidalIDs))
+	ordered := make([]*R, len(ids))
 	for r := range results {
-		ordered[r.idx] = r.track
+		ordered[r.idx] = r.data
 	}
 
-	// filter out nils (failed fetches)
-	var tracks []*spec.TrackChild
-	for i, t := range ordered {
-		if t != nil {
-			c.applyTrackStar(user.ID, t)
-			c.applyTrackPlayCount(user.ID, t)
-			uri := fmt.Sprintf("td:tr:%d", tidalIDs[i])
-			t.UserRating = c.getTrackRating(user.ID, uri)
-			tracks = append(tracks, t)
+	var final []*R
+	for _, item := range ordered {
+		if item != nil {
+			final = append(final, item)
 		}
 	}
-	return tracks
+	return final
+}
+
+// batchFetchTracks fetches metadata for multiple tidal track IDs concurrently
+func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.TrackChild {
+	user := r.Context().Value(CtxUser).(*db.User)
+	return batchFetch(r.Context(), c.proxySem, tidalIDs, c.proxy.GetTrackInfo, func(t *tidalproxy.TidalTrack, tid int) *spec.TrackChild {
+		tc := spec.NewTrackFromTidal(t)
+		c.applyTrackStar(user.ID, tc)
+		c.applyTrackPlayCount(user.ID, tc)
+		tc.UserRating = c.getTrackRating(user.ID, fmt.Sprintf("td:tr:%d", tid))
+		return tc
+	})
 }
 
 // batchFetchAlbums fetches metadata for multiple tidal album IDs concurrently
 func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.Album {
 	user := r.Context().Value(CtxUser).(*db.User)
-	if len(tidalIDs) == 0 {
-		return nil
+	return batchFetch(r.Context(), c.proxySem, tidalIDs, c.proxy.GetAlbumInfo, func(info *tidalproxy.TidalAlbum, tid int) *spec.Album {
+		a := spec.NewAlbumFromTidal(info)
+		c.applyAlbumStar(user.ID, a)
+		a.UserRating = c.getAlbumRating(user.ID, fmt.Sprintf("td:al:%d", tid))
+		return a
+	})
+}
+
+// prepareStream centralizes the logic for preparing a stream (quality, IP, URL, meta)
+// shared by ServeStream and ServeDownload
+func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID int) (*streamRequest, error) {
+	p := r.Context().Value(CtxParams).(params.Params)
+	var err error
+
+	// 1. Quality
+	bitrate := p.GetOrInt("maxBitRate", 0)
+	quality := "LOSSLESS"
+	switch {
+	case bitrate == 0:
+		quality = "LOSSLESS"
+	case bitrate <= 128:
+		quality = "LOW"
+	case bitrate <= 320:
+		quality = "HIGH"
+	case bitrate >= 900:
+		quality = "HI_RES_LOSSLESS"
 	}
 
-	type result struct {
-		idx   int
-		album *spec.Album
+	// 2. Client IP
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		clientIP = r.Header.Get("X-Real-IP")
 	}
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	if pos := strings.LastIndex(clientIP, ":"); pos != -1 {
+		clientIP = clientIP[:pos]
+	}
+	clientIP = strings.Trim(clientIP, "[]")
 
-	results := make(chan result, len(tidalIDs))
-	var wg sync.WaitGroup
+	// 3. Stream URL (with deduplication and caching)
+	cacheKey := fmt.Sprintf("stream:%d:%s", trackID, quality)
 
-	for i, id := range tidalIDs {
-		wg.Add(1)
-		go func(idx, tid int) {
-			defer wg.Done()
+	// fast path: check cache
+	var url string
+	if cached := c.streamURLCache.Get(cacheKey); cached != "" {
+		url = cached
+	} else {
+		// deduplication: only one request fetches, others wait
+		type lockPair struct {
+			done chan struct{}
+			url  string
+			err  error
+		}
+		lockVal, loaded := c.streamURLLocks.LoadOrStore(cacheKey, &lockPair{done: make(chan struct{})})
+		lp := lockVal.(*lockPair)
 
-			c.proxySem <- struct{}{}
-			defer func() { <-c.proxySem }()
-
-			info, err := c.proxy.GetAlbumInfo(r.Context(), tid)
-			if err != nil {
-				return
+		if loaded {
+			<-lp.done
+			if lp.err != nil {
+				return nil, lp.err
 			}
-			a := spec.NewAlbumFromTidal(info)
-			results <- result{idx: idx, album: a}
-		}(i, id)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	ordered := make([]*spec.Album, len(tidalIDs))
-	for r := range results {
-		ordered[r.idx] = r.album
-	}
-
-	var albums []*spec.Album
-	for i, a := range ordered {
-		if a != nil {
-			c.applyAlbumStar(user.ID, a)
-			uri := fmt.Sprintf("td:al:%d", tidalIDs[i])
-			a.UserRating = c.getAlbumRating(user.ID, uri)
-			albums = append(albums, a)
+			url = lp.url
+		} else {
+			url, err = c.proxy.GetStreamURL(ctx, trackID, quality, clientIP)
+			lp.url = url
+			lp.err = err
+			close(lp.done)
+			if err == nil && url != "" {
+				c.streamURLCache.Set(cacheKey, url, 30*time.Second)
+			}
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				c.streamURLLocks.Delete(cacheKey)
+			}()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-	return albums
+
+	// 4. Meta
+	track, err := c.proxy.GetTrackInfo(ctx, trackID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 5. Detection
+	isHLS := strings.Contains(url, ".m3u8") || strings.Contains(url, "manifestType=HLS")
+	isDASH := strings.Contains(url, ".mpd") || strings.Contains(url, "manifestType=MPEG_DASH")
+	ext := "flac"
+	if strings.Contains(url, ".m4a") || quality == "HIGH" || quality == "LOW" {
+		ext = "m4a"
+	}
+
+	return &streamRequest{
+		Quality:   quality,
+		ClientIP:  clientIP,
+		StreamURL: url,
+		Track:     track,
+		Ext:       ext,
+		IsHLS:     isHLS,
+		IsDASH:    isDASH,
+	}, nil
 }
 
 // batchFetchAlbumsWithContext fetches metadata with custom context (for timeout control)
 func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs []int) []*spec.Album {
-	if len(tidalIDs) == 0 {
-		return nil
-	}
-
-	type result struct {
-		idx   int
-		album *spec.Album
-	}
-
-	results := make(chan result, len(tidalIDs))
-	var wg sync.WaitGroup
-
-	for i, id := range tidalIDs {
-		wg.Add(1)
-		go func(idx, tid int) {
-			defer wg.Done()
-
-			// Check persistent cache first (note: we need r.Context() but this function has ctx)
-			// Since we don't have access to DB here, skip cache for this variant
-			// The main batchFetchAlbums uses cache; this is for timeout-controlled contexts
-
-			info, err := c.proxy.GetAlbumInfo(ctx, tid)
-			if err != nil {
-				return
-			}
-			a := spec.NewAlbumFromTidal(info)
-			results <- result{idx: idx, album: a}
-		}(i, id)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	ordered := make([]*spec.Album, len(tidalIDs))
-	for r := range results {
-		ordered[r.idx] = r.album
-	}
-
-	var albums []*spec.Album
-	for _, a := range ordered {
-		if a != nil {
-			albums = append(albums, a)
-		}
-	}
-	return albums
+	return batchFetch(ctx, c.proxySem, tidalIDs, c.proxy.GetAlbumInfo, func(info *tidalproxy.TidalAlbum, _ int) *spec.Album {
+		return spec.NewAlbumFromTidal(info)
+	})
 }
-
 
 // batchFetchArtists fetches metadata for multiple tidal artist IDs concurrently
-// includes album count for each artist
 func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.Artist {
 	user := r.Context().Value(CtxUser).(*db.User)
-	if len(tidalIDs) == 0 {
-		return nil
-	}
-
-	type result struct {
-		idx    int
-		artist *spec.Artist
-	}
-
-	results := make(chan result, len(tidalIDs))
-	var wg sync.WaitGroup
-
-	for i, id := range tidalIDs {
-		wg.Add(1)
-		go func(idx, tid int) {
-			defer wg.Done()
-
-			c.proxySem <- struct{}{}
-			defer func() { <-c.proxySem }()
-
-			// Get artist info
-			info, err := c.proxy.GetArtistInfo(r.Context(), tid)
-			if err != nil {
-				return
-			}
-			a := spec.NewArtistFromTidal(&info.Artist)
-
-			// Get album count from cache (avoids extra API call)
-			a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
-
-			results <- result{idx: idx, artist: a}
-		}(i, id)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	ordered := make([]*spec.Artist, len(tidalIDs))
-	for r := range results {
-		ordered[r.idx] = r.artist
-	}
-
-	var artists []*spec.Artist
-	for _, a := range ordered {
-		if a != nil {
-			c.applyArtistStar(user.ID, a)
-			artists = append(artists, a)
-		}
-	}
-	return artists
+	return batchFetch(r.Context(), c.proxySem, tidalIDs, func(ctx context.Context, id int) (*tidalproxy.TidalArtistDetail, error) {
+		return c.proxy.GetArtistInfo(ctx, id)
+	}, func(info *tidalproxy.TidalArtistDetail, tid int) *spec.Artist {
+		a := spec.NewArtistFromTidal(&info.Artist)
+		a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
+		c.applyArtistStar(user.ID, a)
+		return a
+	})
 }
-
 
 // scrobbleTrackFromTidal converts a TidalTrack to a scrobble.Track
 func scrobbleTrackFromTidal(t *tidalproxy.TidalTrack) scrobble.Track {

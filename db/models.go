@@ -27,17 +27,20 @@ type TrackStar struct {
 }
 
 type AlbumStar struct {
-	UserID     int       `gorm:"primary_key; auto_increment:false" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
-	URI        string    `gorm:"primary_key; auto_increment:false; index:idx_album_star_uri"` // URN format: td:al:12345
-	StarDate   time.Time `sql:"DEFAULT:current_timestamp"`
-	LastPlayed time.Time `sql:"DEFAULT:NULL"` // last time any track from this album was played
-	PlayCount  int       `sql:"DEFAULT:0"`    // aggregated play count for this album
+	UserID         int       `gorm:"primary_key; auto_increment:false" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
+	URI            string    `gorm:"primary_key; auto_increment:false; index:idx_album_star_uri"` // URN format: td:al:12345
+	FallbackArtist string    // Artist name for searching
+	FallbackTitle  string    // Album title for searching
+	StarDate       time.Time `sql:"DEFAULT:current_timestamp"`
+	LastPlayed     time.Time `sql:"DEFAULT:NULL"` // last time any track from this album was played
+	PlayCount      int       `sql:"DEFAULT:0"`    // aggregated play count for this album
 }
 
 type ArtistStar struct {
-	UserID   int       `gorm:"primary_key; auto_increment:false" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
-	URI      string    `gorm:"primary_key; auto_increment:false; index:idx_artist_star_uri"` // URN format: td:ar:12345
-	StarDate time.Time `sql:"DEFAULT:current_timestamp"`
+	UserID       int       `gorm:"primary_key; auto_increment:false" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
+	URI          string    `gorm:"primary_key; auto_increment:false; index:idx_artist_star_uri"` // URN format: td:ar:12345
+	FallbackName string    // Artist name for searching
+	StarDate     time.Time `sql:"DEFAULT:current_timestamp"`
 }
 
 type TrackRating struct {

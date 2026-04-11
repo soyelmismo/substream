@@ -92,172 +92,52 @@ func (db *DB) SetSetting(key string, value string) error {
 }
 
 // GetVirtualLibraryArtistIDs returns all artist URIs that the user has interacted with.
-// This includes: artist_stars, and artists inferred from track_stars/plays/playlist_tracks via track_metadata.
 func (db *DB) GetVirtualLibraryArtistIDs(userID int) []string {
 	var uris []string
-
-	// Direct artist stars
-	db.Table("artist_stars").Where("user_id = ?", userID).Pluck("uri", &uris)
-
-	// Artists inferred from track stars (via track_metadata)
-	var trackStarURIs []string
-	db.Table("track_stars").Where("user_id = ?", userID).Pluck("uri", &trackStarURIs)
-	for _, trackURI := range trackStarURIs {
-		var tm TrackMetadata
-		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
-			uris = appendUniqueURI(uris, tm.ArtistURI)
-		}
-	}
-
-	// Artists inferred from plays (via track_metadata)
-	var playURIs []string
-	db.Table("plays").Where("user_id = ?", userID).Pluck("uri", &playURIs)
-	for _, trackURI := range playURIs {
-		var tm TrackMetadata
-		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
-			uris = appendUniqueURI(uris, tm.ArtistURI)
-		}
-	}
-
-	// Artists inferred from playlist tracks (via track_metadata)
-	var playlistTrackURIs []string
 	db.Raw(`
-		SELECT DISTINCT pt.uri 
-		FROM playlist_tracks pt
-		JOIN playlists p ON pt.playlist_id = p.id
-		WHERE p.user_id = ?
-	`, userID).Pluck("uri", &playlistTrackURIs)
-	for _, trackURI := range playlistTrackURIs {
-		var tm TrackMetadata
-		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
-			uris = appendUniqueURI(uris, tm.ArtistURI)
-		}
-	}
-
-	// GLOBAL CACHE: Include all artists that have been cached by any user
-	// This makes the virtual library a shared exploration space
-	var cachedArtists []MetadataCache
-	if err := db.Where("key LIKE ?", "td:ar:%").Find(&cachedArtists).Error; err != nil {
-		log.Printf("[CACHE ERROR] Failed to query artist cache: %v", err)
-	} else {
-		log.Printf("[CACHE DEBUG] Found %d cached artists", len(cachedArtists))
-	}
-	for _, cache := range cachedArtists {
-		// Key is already in URI format: "td:ar:12345"
-		uris = appendUniqueURI(uris, cache.Key)
-	}
-
+		SELECT uri FROM artist_stars WHERE user_id = ?
+		UNION
+		SELECT tm.artist_uri FROM track_stars ts JOIN track_metadata tm ON ts.uri = tm.uri WHERE ts.user_id = ?
+		UNION
+		SELECT tm.artist_uri FROM plays p JOIN track_metadata tm ON p.uri = tm.uri WHERE p.user_id = ?
+		UNION
+		SELECT tm.artist_uri FROM playlist_tracks pt JOIN playlists pl ON pt.playlist_id = pl.id JOIN track_metadata tm ON pt.uri = tm.uri WHERE pl.user_id = ?
+		UNION
+		SELECT key FROM metadata_cache WHERE key LIKE 'td:ar:%'
+	`, userID, userID, userID, userID).Pluck("uri", &uris)
 	return uris
 }
 
 // GetVirtualLibraryAlbumIDs returns all album URIs that the user has interacted with.
-// This includes: album_stars, and albums inferred from track_stars/plays/playlist_tracks via track_metadata.
 func (db *DB) GetVirtualLibraryAlbumIDs(userID int) []string {
 	var uris []string
-
-	// Direct album stars
-	db.Table("album_stars").Where("user_id = ?", userID).Pluck("uri", &uris)
-
-	// Albums inferred from track stars (via track_metadata)
-	var trackStarURIs []string
-	db.Table("track_stars").Where("user_id = ?", userID).Pluck("uri", &trackStarURIs)
-	for _, trackURI := range trackStarURIs {
-		var tm TrackMetadata
-		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
-			uris = appendUniqueURI(uris, tm.AlbumURI)
-		}
-	}
-
-	// Albums inferred from plays (via track_metadata)
-	var playURIs []string
-	db.Table("plays").Where("user_id = ?", userID).Pluck("uri", &playURIs)
-	for _, trackURI := range playURIs {
-		var tm TrackMetadata
-		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
-			uris = appendUniqueURI(uris, tm.AlbumURI)
-		}
-	}
-
-	// Albums inferred from playlist tracks (via track_metadata)
-	var playlistTrackURIs []string
 	db.Raw(`
-		SELECT DISTINCT pt.uri 
-		FROM playlist_tracks pt
-		JOIN playlists p ON pt.playlist_id = p.id
-		WHERE p.user_id = ?
-	`, userID).Pluck("uri", &playlistTrackURIs)
-	for _, trackURI := range playlistTrackURIs {
-		var tm TrackMetadata
-		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
-			uris = appendUniqueURI(uris, tm.AlbumURI)
-		}
-	}
-
-	// GLOBAL CACHE: Include all albums that have been cached by any user
-	var cachedAlbums []MetadataCache
-	if err := db.Where("key LIKE ?", "td:al:%").Find(&cachedAlbums).Error; err != nil {
-		log.Printf("[CACHE ERROR] Failed to query album cache: %v", err)
-	} else {
-		log.Printf("[CACHE DEBUG] Found %d cached albums", len(cachedAlbums))
-	}
-	for _, cache := range cachedAlbums {
-		// Key is already in URI format: "td:al:12345"
-		uris = appendUniqueURI(uris, cache.Key)
-	}
-
+		SELECT uri FROM album_stars WHERE user_id = ?
+		UNION
+		SELECT tm.album_uri FROM track_stars ts JOIN track_metadata tm ON ts.uri = tm.uri WHERE ts.user_id = ?
+		UNION
+		SELECT tm.album_uri FROM plays p JOIN track_metadata tm ON p.uri = tm.uri WHERE p.user_id = ?
+		UNION
+		SELECT tm.album_uri FROM playlist_tracks pt JOIN playlists pl ON pt.playlist_id = pl.id JOIN track_metadata tm ON pt.uri = tm.uri WHERE pl.user_id = ?
+		UNION
+		SELECT key FROM metadata_cache WHERE key LIKE 'td:al:%'
+	`, userID, userID, userID, userID).Pluck("uri", &uris)
 	return uris
 }
 
 // GetVirtualLibraryTrackIDs returns all track URIs that the user has interacted with.
-// This includes: track_stars, plays, and playlist_tracks.
 func (db *DB) GetVirtualLibraryTrackIDs(userID int) []string {
 	var uris []string
-
-	// Track stars
-	db.Table("track_stars").Where("user_id = ?", userID).Pluck("uri", &uris)
-
-	// Plays
-	var playURIs []string
-	db.Table("plays").Where("user_id = ?", userID).Pluck("uri", &playURIs)
-	for _, uri := range playURIs {
-		uris = appendUniqueURI(uris, uri)
-	}
-
-	// Playlist tracks
-	var playlistTrackURIs []string
 	db.Raw(`
-		SELECT DISTINCT pt.uri 
-		FROM playlist_tracks pt
-		JOIN playlists p ON pt.playlist_id = p.id
-		WHERE p.user_id = ?
-	`, userID).Pluck("uri", &playlistTrackURIs)
-	for _, uri := range playlistTrackURIs {
-		uris = appendUniqueURI(uris, uri)
-	}
-
-	// GLOBAL CACHE: Include all tracks that have been cached by any user
-	var cachedTracks []MetadataCache
-	if err := db.Where("key LIKE ?", "td:tr:%").Find(&cachedTracks).Error; err != nil {
-		log.Printf("[CACHE ERROR] Failed to query track cache: %v", err)
-	} else {
-		log.Printf("[CACHE DEBUG] Found %d cached tracks", len(cachedTracks))
-	}
-	for _, cache := range cachedTracks {
-		// Key is already in URI format: "td:tr:12345"
-		uris = appendUniqueURI(uris, cache.Key)
-	}
-
+		SELECT uri FROM track_stars WHERE user_id = ?
+		UNION
+		SELECT uri FROM plays WHERE user_id = ?
+		UNION
+		SELECT pt.uri FROM playlist_tracks pt JOIN playlists pl ON pt.playlist_id = pl.id WHERE pl.user_id = ?
+		UNION
+		SELECT key FROM metadata_cache WHERE key LIKE 'td:tr:%'
+	`, userID, userID, userID).Pluck("uri", &uris)
 	return uris
-}
-
-// appendUniqueURI appends a URI to a slice if it doesn't already exist
-func appendUniqueURI(slice []string, uri string) []string {
-	for _, s := range slice {
-		if s == uri {
-			return slice
-		}
-	}
-	return append(slice, uri)
 }
 
 // GetCachedMetadata retrieves cached metadata from SQLite
