@@ -87,9 +87,23 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		log.Printf("[STREAM] DEBUG: track=%d full_url=%q", id.Value, streamURL)
 	}
 
+	// Determine content type and extensions early to check if we need proxy
+	ext := "flac"
+	if strings.Contains(streamURL, ".m4a") || strings.Contains(tidalQuality, "HIGH") || strings.Contains(tidalQuality, "LOW") {
+		ext = "m4a"
+	}
+
+	// Force proxy for HLS/DASH manifests - clients can't play manifests directly
+	isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
+	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
+
 	// Check if we should proxy or redirect based on settings (cached)
 	settingStart := time.Now()
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
+	// Force proxy for HLS/DASH streams regardless of setting
+	if isHLS || isDASH {
+		proxyStreams = "true"
+	}
 	settingDuration := time.Since(settingStart)
 	if proxyStreams != "true" {
 		// Redirect directly to tidal CDN - better performance but may cause CORS issues
@@ -113,18 +127,13 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		return spec.NewError(0, "error fetching track meta: %v", err)
 	}
 
-	ext := "flac"
 	contentType := "audio/flac"
-	if strings.Contains(streamURL, ".m4a") || strings.Contains(tidalQuality, "HIGH") || strings.Contains(tidalQuality, "LOW") {
-		ext = "m4a"
+	if ext == "m4a" {
 		contentType = "audio/mp4"
 	}
 
 	filename := fmt.Sprintf("%s - %s.%s", track.Artist.Name, track.Title, ext)
 	filename = strings.ReplaceAll(filename, "/", "_") // basic sanitization
-
-	isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
-	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
 
 	streamType := "direct"
 	if isHLS {

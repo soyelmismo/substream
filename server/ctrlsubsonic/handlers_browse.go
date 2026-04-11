@@ -123,6 +123,18 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 	c.applyArtistStar(user.ID, artist)
 
 	items := artistPage.Albums.Items
+	// Deduplicate albums by title+release_date (Tidal API returns same album with different IDs)
+	seenAlbums := make(map[string]bool)
+	var uniqueItems []tidalproxy.TidalAlbum
+	for _, item := range items {
+		key := fmt.Sprintf("%s|%s", item.Title, item.ReleaseDate)
+		if !seenAlbums[key] {
+			seenAlbums[key] = true
+			uniqueItems = append(uniqueItems, item)
+		}
+	}
+	items = uniqueItems
+
 	artist.AlbumCount = len(items)
 	artist.Albums = make([]*spec.Album, len(items))
 	for i := range items {

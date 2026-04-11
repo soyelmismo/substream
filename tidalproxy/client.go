@@ -166,9 +166,95 @@ func (p *Pool) doFetchRaw(ctx context.Context, path string, query url.Values, cl
 	return nil, lastErr
 }
 
+// doFetchRawWithInstance performs a GET request to a specific proxy instance (by index).
+// Used for retry logic when 404 errors are encountered.
+func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query url.Values, clientIP string, instanceIdx int) ([]byte, error) {
+	p.mu.RLock()
+	if len(p.instances) == 0 {
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("no hifi-api proxies configured")
+	}
+	// Select proxy based on instanceIdx (round-robin offset)
+	idx := instanceIdx % len(p.instances)
+	base := p.instances[idx].url
+	p.mu.RUnlock()
+
+	u := base + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+		req.Header.Set("X-Real-IP", clientIP)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request %s: %w", path, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return body, err
+}
+
 // apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries.
 // It now accepts an optional clientIP to set X-Forwarded-For for Tidal's IP-locked streaming.
 func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result interface{}, clientIP string) error {
+	return p.apiGetWithRetry(ctx, path, query, result, clientIP, 3) // Default 3 retries
+}
+
+// apiGetWithRetry attempts the request with multiple proxies on 404 errors.
+// This handles Tidal API inconsistency where an artist exists on some proxies but not others.
+func (p *Pool) apiGetWithRetry(ctx context.Context, path string, query url.Values, result interface{}, clientIP string, maxRetries int) error {
+	var lastErr error
+	for try := 0; try < maxRetries; try++ {
+		body, err := p.doFetchRawWithInstance(ctx, path, query, clientIP, try)
+		if err != nil {
+			lastErr = err
+			// Check if it's a 404 error
+			if strings.Contains(err.Error(), "404") {
+				log.Printf("[TIDAL] apiGet 404 on try %d/%d for %s, retrying with next proxy...", try+1, maxRetries, path)
+				continue // Try next proxy
+			}
+			return err // Non-404 error, fail fast
+		}
+
+		// Envelope handling: many hifi-api endpoints wrap data in a top-level JSON
+		var envelope struct {
+			Data json.RawMessage `json:"data"`
+		}
+
+		if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+			if err := json.Unmarshal(envelope.Data, result); err == nil {
+				return nil
+			}
+		}
+
+		// Fallback: try unmarshaling directly into result
+		if err := json.Unmarshal(body, result); err != nil {
+			return fmt.Errorf("decode result: %w (body: %s)", err, string(body))
+		}
+		return nil
+	}
+	return fmt.Errorf("all %d proxies returned 404 or error for %s: %v", maxRetries, path, lastErr)
+}
+
+// apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries.
+// DEPRECATED: use apiGetWithRetry directly.
+func (p *Pool) apiGetOld(ctx context.Context, path string, query url.Values, result interface{}, clientIP string) error {
 	body, err := p.doFetchRaw(ctx, path, query, clientIP)
 	if err != nil {
 		return err
@@ -195,7 +281,25 @@ func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result
 // apiGetRaw returns the raw body as bytes with retries.
 // It now accepts an optional clientIP to set X-Forwarded-For.
 func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values, clientIP string) ([]byte, error) {
-	return p.doFetchRaw(ctx, path, query, clientIP)
+	return p.apiGetRawWithRetry(ctx, path, query, clientIP, 3)
+}
+
+// apiGetRawWithRetry attempts the request with multiple proxies on 404 errors.
+func (p *Pool) apiGetRawWithRetry(ctx context.Context, path string, query url.Values, clientIP string, maxRetries int) ([]byte, error) {
+	var lastErr error
+	for try := 0; try < maxRetries; try++ {
+		body, err := p.doFetchRawWithInstance(ctx, path, query, clientIP, try)
+		if err != nil {
+			lastErr = err
+			if strings.Contains(err.Error(), "404") {
+				log.Printf("[TIDAL] apiGetRaw 404 on try %d/%d for %s, retrying with next proxy...", try+1, maxRetries, path)
+				continue
+			}
+			return nil, err
+		}
+		return body, nil
+	}
+	return nil, fmt.Errorf("all %d proxies returned 404 or error for %s: %v", maxRetries, path, lastErr)
 }
 
 // =====================================================================
@@ -454,14 +558,15 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 					log.Printf("[TIDAL] GetStreamURL track=%d got direct URI via V2: %s...", trackID, uri[:min(50, len(uri))])
 					return uri, nil
 				}
-				if uri != "" {
-					log.Printf("[TIDAL] GetStreamURL track=%d V2 URI is manifest URL, skipping to V1: %s...", trackID, uri[:min(50, len(uri))])
-				}
-				if v2Response.Data.Attributes.Manifest != "" {
-					u, err := parseManifestURL(trackID, "V2", v2Response.Data.Attributes.ManifestMimeType, v2Response.Data.Attributes.Manifest)
-					if err == nil && u != "" && !strings.Contains(u, "manifest.tidal.com") {
-						return u, nil
+				// If V2 returned a manifest URL, try to download and parse it directly
+				if uri != "" && (strings.Contains(uri, "manifest.tidal.com") || strings.Contains(uri, "/manifests/")) {
+					log.Printf("[TIDAL] GetStreamURL track=%d V2 returned manifest URL, attempting direct download: %s...", trackID, uri[:min(50, len(uri))])
+					audioURL, err := p.downloadAndParseHLSManifest(ctx, uri, clientIP)
+					if err == nil && audioURL != "" {
+						log.Printf("[TIDAL] GetStreamURL track=%d got audio URL from V2 manifest: %s...", trackID, audioURL[:min(50, len(audioURL))])
+						return audioURL, nil
 					}
+					log.Printf("[TIDAL] GetStreamURL track=%d failed to parse V2 manifest: %v, falling back to V1", trackID, err)
 					log.Printf("[TIDAL] GetStreamURL track=%d V2 manifest parse error or manifest URL: %v", trackID, err)
 				}
 			}
@@ -473,6 +578,7 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 				"playbackmode":      {"STREAM"},
 				"assetpresentation": {"FULL"},
 			}
+			log.Printf("[TIDAL] GetStreamURL track=%d calling V1 /track/ with quality=%s", trackID, qStr)
 			var stream TidalStreamInfo
 			if err := p.apiGet(ctx, "/track/", q, &stream, clientIP); err == nil {
 				if stream.TrackPresentation == "PREVIEW" {
@@ -490,11 +596,108 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 				log.Printf("[TIDAL] GetStreamURL track=%d V1 manifest parse error: %v", trackID, err)
 			} else {
 				lastErr = err
+				log.Printf("[TIDAL] GetStreamURL track=%d V1 /track/ error: %v", trackID, err)
 			}
 		}
 	}
 
 	return "", fmt.Errorf("could not get full stream after %d retries (%d PREVIEWs): %v", maxRetries, previewCount, lastErr)
+}
+
+// downloadAndParseHLSManifest downloads a Tidal manifest and extracts the audio stream URL
+// Tidal V2 manifests are BTS (Base64 encoded) or MPD (MPEG-DASH) format
+func (p *Pool) downloadAndParseHLSManifest(ctx context.Context, manifestURL string, clientIP string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("manifest fetch failed: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read manifest body: %w", err)
+	}
+
+	bodyStr := string(body)
+	log.Printf("[TIDAL] Manifest content type: %s, size: %d bytes", resp.Header.Get("Content-Type"), len(body))
+	log.Printf("[TIDAL] Manifest preview (first 200 chars): %s", bodyStr[:min(200, len(bodyStr))])
+
+	// Tidal V2 manifests are often Base64-encoded BTS format
+	// Try to decode base64
+	decoded, err := base64.StdEncoding.DecodeString(bodyStr)
+	if err == nil && len(decoded) > 0 {
+		log.Printf("[TIDAL] Manifest is Base64 encoded, decoded size: %d bytes", len(decoded))
+		bodyStr = string(decoded)
+	}
+
+	// Try to parse as JSON
+	var manifest struct {
+		URLs []string `json:"urls"`
+		URL  string   `json:"url"`
+	}
+	if err := json.Unmarshal([]byte(bodyStr), &manifest); err == nil {
+		if len(manifest.URLs) > 0 {
+			log.Printf("[TIDAL] Found audio URL in JSON manifest: %s...", manifest.URLs[0][:min(50, len(manifest.URLs[0]))])
+			return manifest.URLs[0], nil
+		}
+		if manifest.URL != "" {
+			log.Printf("[TIDAL] Found audio URL in JSON manifest: %s...", manifest.URL[:min(50, len(manifest.URL))])
+			return manifest.URL, nil
+		}
+	}
+
+	// Look for MPD (MPEG-DASH) BaseURL or SegmentURL
+	if strings.Contains(bodyStr, "BaseURL") {
+		// Extract BaseURL from MPD
+		start := strings.Index(bodyStr, "<BaseURL>")
+		end := strings.Index(bodyStr, "</BaseURL>")
+		if start != -1 && end != -1 && end > start+9 {
+			url := bodyStr[start+9 : end]
+			log.Printf("[TIDAL] Found BaseURL in MPD manifest: %s...", url[:min(50, len(url))])
+			return url, nil
+		}
+	}
+
+	// Parse HLS M3U8 manifest - look for variant streams after #EXT-X-STREAM-INF
+	lines := strings.Split(bodyStr, "\n")
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		// Skip comments and empty lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// This is a URL line (either variant URL in master playlist or segment URL)
+		if strings.HasPrefix(line, "http") {
+			log.Printf("[TIDAL] Found stream URL in HLS manifest: %s...", line[:min(50, len(line))])
+			return line, nil
+		}
+		// Check if next line after STREAM-INF is a relative URL
+		if i > 0 && strings.HasPrefix(lines[i-1], "#EXT-X-STREAM-INF") && !strings.HasPrefix(line, "#") {
+			// Relative URL, construct absolute
+			baseURL := manifestURL
+			if lastSlash := strings.LastIndex(baseURL, "/"); lastSlash != -1 {
+				baseURL = baseURL[:lastSlash+1]
+			}
+			absoluteURL := baseURL + line
+			log.Printf("[TIDAL] Found relative stream URL in HLS manifest: %s...", absoluteURL[:min(50, len(absoluteURL))])
+			return absoluteURL, nil
+		}
+	}
+
+	return "", fmt.Errorf("no audio URL found in manifest")
 }
 
 func min(a, b int) int {
