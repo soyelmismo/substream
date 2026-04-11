@@ -71,8 +71,8 @@ type PlaylistTrack struct {
 
 type Play struct {
 	ID             int       `gorm:"primary_key"`
-	UserID         int       `gorm:"not null; index:idx_plays_user_time; index:idx_plays_user_count" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
-	URI            string    `gorm:"not null; index:idx_plays_uri"`               // URN format: td:tr:12345
+	UserID         int       `gorm:"not null; index:idx_plays_user_time; index:idx_plays_user_count; unique_index:idx_plays_user_uri" sql:"type:int REFERENCES users(id) ON DELETE CASCADE"`
+	URI            string    `gorm:"not null; index:idx_plays_uri; unique_index:idx_plays_user_uri"`               // URN format: td:tr:12345
 	Provider       string    `gorm:"default:'tidal'"`                             // Provider for this track
 	ISRC           string    `gorm:"index:idx_plays_isrc"`                        // For cross-provider matching
 	FallbackArtist string    // Artist name for cross-matching
@@ -117,6 +117,25 @@ type ProxyInstance struct {
 	IsHealthy bool      `sql:"DEFAULT: true"`
 	Source    string    `sql:"DEFAULT: 'manual'"`
 	CreatedAt time.Time `sql:"DEFAULT:current_timestamp"`
+}
+
+// TrackMetadata stores the mapping between tracks and their album/artist.
+// This is essential for the virtual library feature - it allows us to infer
+// which artists and albums a user has interacted with based on track plays/stars.
+type TrackMetadata struct {
+	URI        string    `gorm:"primary_key"` // URN format: td:tr:12345
+	AlbumURI   string    `gorm:"not null; index"` // URN format: td:al:12345
+	ArtistURI  string    `gorm:"not null; index"` // URN format: td:ar:12345
+	UpdatedAt  time.Time `sql:"DEFAULT:current_timestamp"`
+}
+
+// MetadataCache stores cached metadata from Tidal/hot.monochrome to avoid cold-start issues.
+// Used for persistent caching of artist/album/track metadata.
+type MetadataCache struct {
+	Key         string    `gorm:"primary_key"` // e.g., "artist:12345" or "album:67890"
+	Value       []byte    `gorm:"not null"`     // JSON serialized metadata
+	FetchedAt   time.Time `gorm:"not null"`
+	TTLSeconds  int       `gorm:"default:86400"` // 24h default
 }
 
 

@@ -27,6 +27,14 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		return spec.NewError(10, "please provide a `query` parameter")
 	}
 
+	// SYMFONIUM SYNC DETECTION: Empty query means "enumerate my library"
+	// Return virtual library content only (NOT full Tidal catalog) to prevent infinite loops
+	trimmedQuery := strings.TrimSpace(query)
+	if trimmedQuery == "" || trimmedQuery == `""` || trimmedQuery == `''` {
+		log.Printf("[SUBS] Empty query detected - returning virtual library only (Symfonium sync)")
+		return c.searchVirtualLibrary(r)
+	}
+
 	var tracks []spec.TrackChild
 	var artists []spec.Artist
 	var albums []spec.Album
@@ -346,6 +354,78 @@ favLoop:
 		results.Albums = append(results.Albums, &albums[i])
 		c.applyAlbumStar(user.ID, &albums[i])
 	}
+
+	sub := spec.NewResponse()
+	sub.SearchResultThree = results
+	return sub
+}
+
+// searchVirtualLibrary returns only the user's local library content (stars, plays, playlists)
+// This is used for empty query searches where Symfonium is trying to enumerate the library
+func (c *Controller) searchVirtualLibrary(r *http.Request) *spec.Response {
+	user := r.Context().Value(CtxUser).(*db.User)
+	p := r.Context().Value(CtxParams).(params.Params)
+
+	// Get pagination params
+	artistCount := p.GetOrInt("artistCount", 0)
+	albumCount := p.GetOrInt("albumCount", 0)
+	songCount := p.GetOrInt("songCount", 0)
+	artistOffset := p.GetOrInt("artistOffset", 0)
+	albumOffset := p.GetOrInt("albumOffset", 0)
+	songOffset := p.GetOrInt("songOffset", 0)
+
+	results := &spec.SearchResultThree{
+		Artists: []*spec.Artist{},
+		Albums:  []*spec.Album{},
+		Tracks:  []*spec.TrackChild{},
+	}
+
+	// Get virtual library IDs
+	artistURIs := c.dbc.GetVirtualLibraryArtistIDs(user.ID)
+	albumURIs := c.dbc.GetVirtualLibraryAlbumIDs(user.ID)
+	trackURIs := c.dbc.GetVirtualLibraryTrackIDs(user.ID)
+
+	// Apply pagination and fetch artists
+	if artistCount > 0 && artistOffset < len(artistURIs) {
+		end := artistOffset + artistCount
+		if end > len(artistURIs) {
+			end = len(artistURIs)
+		}
+		artistIDs := extractIDsFromURIs(artistURIs[artistOffset:end])
+		artists := c.batchFetchArtists(r, artistIDs)
+		for _, a := range artists {
+			results.Artists = append(results.Artists, a)
+		}
+	}
+
+	// Apply pagination and fetch albums
+	if albumCount > 0 && albumOffset < len(albumURIs) {
+		end := albumOffset + albumCount
+		if end > len(albumURIs) {
+			end = len(albumURIs)
+		}
+		albumIDs := extractIDsFromURIs(albumURIs[albumOffset:end])
+		albums := c.batchFetchAlbums(r, albumIDs)
+		for _, a := range albums {
+			results.Albums = append(results.Albums, a)
+		}
+	}
+
+	// Apply pagination and fetch tracks
+	if songCount > 0 && songOffset < len(trackURIs) {
+		end := songOffset + songCount
+		if end > len(trackURIs) {
+			end = len(trackURIs)
+		}
+		trackIDs := extractIDsFromURIs(trackURIs[songOffset:end])
+		tracks := c.batchFetchTracks(r, trackIDs)
+		for _, t := range tracks {
+			results.Tracks = append(results.Tracks, t)
+		}
+	}
+
+	log.Printf("[SUBS] Virtual library search: artists=%d/%d, albums=%d/%d, tracks=%d/%d",
+		len(results.Artists), len(artistURIs), len(results.Albums), len(albumURIs), len(results.Tracks), len(trackURIs))
 
 	sub := spec.NewResponse()
 	sub.SearchResultThree = results

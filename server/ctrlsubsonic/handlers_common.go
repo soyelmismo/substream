@@ -24,7 +24,11 @@ func (c *Controller) ServeGetLicence(_ *http.Request) *spec.Response {
 
 func (c *Controller) ServeGetMusicFolders(_ *http.Request) *spec.Response {
 	sub := spec.NewResponse()
-	sub.MusicFolders = &spec.MusicFolders{}
+	sub.MusicFolders = &spec.MusicFolders{
+		List: []*spec.MusicFolder{
+			{ID: 1, Name: "My Library"},
+		},
+	}
 	return sub
 }
 
@@ -91,6 +95,20 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 	log.Printf("[SCROBBLE] track=%s user=%s submission=%s isSubmission=%v", uri, user.Name, submissionStr, isSubmission)
 
 	if isSubmission {
+		// Auto-ingest: Record track metadata for virtual library (same as ServeStream)
+		track, _ := c.proxy.GetTrackInfo(r.Context(), trackID)
+		if track != nil {
+			albumURI := fmt.Sprintf("td:al:%d", track.Album.ID)
+			artistURI := fmt.Sprintf("td:ar:%d", track.Artist.ID)
+
+			// Insert or update track_metadata
+			c.dbc.Exec(`
+				INSERT OR REPLACE INTO track_metadata (uri, album_uri, artist_uri, updated_at)
+				VALUES (?, ?, ?, ?)
+			`, uri, albumURI, artistURI, time.Now())
+			log.Printf("[SCROBBLE] Recorded track_metadata for %s -> album=%s artist=%s", uri, albumURI, artistURI)
+		}
+
 		// record play in local DB
 		var play db.Play
 		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&play)
@@ -114,7 +132,6 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 		}
 
 		// Update album play stats if album is favorited
-		track, _ := c.proxy.GetTrackInfo(r.Context(), trackID)
 		if track != nil && track.Album.ID != 0 {
 			var albumStar db.AlbumStar
 			albumURI := fmt.Sprintf("td:al:%d", track.Album.ID)

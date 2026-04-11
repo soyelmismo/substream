@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/sqlite"
@@ -89,6 +90,177 @@ func (db *DB) SetSetting(key string, value string) error {
 	}
 	setting.Value = value
 	return db.Save(&setting).Error
+}
+
+// GetVirtualLibraryArtistIDs returns all artist URIs that the user has interacted with.
+// This includes: artist_stars, and artists inferred from track_stars/plays/playlist_tracks via track_metadata.
+func (db *DB) GetVirtualLibraryArtistIDs(userID int) []string {
+	var uris []string
+
+	// Direct artist stars
+	db.Table("artist_stars").Where("user_id = ?", userID).Pluck("uri", &uris)
+
+	// Artists inferred from track stars (via track_metadata)
+	var trackStarURIs []string
+	db.Table("track_stars").Where("user_id = ?", userID).Pluck("uri", &trackStarURIs)
+	for _, trackURI := range trackStarURIs {
+		var tm TrackMetadata
+		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
+			uris = appendUniqueURI(uris, tm.ArtistURI)
+		}
+	}
+
+	// Artists inferred from plays (via track_metadata)
+	var playURIs []string
+	db.Table("plays").Where("user_id = ?", userID).Pluck("uri", &playURIs)
+	for _, trackURI := range playURIs {
+		var tm TrackMetadata
+		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
+			uris = appendUniqueURI(uris, tm.ArtistURI)
+		}
+	}
+
+	// Artists inferred from playlist tracks (via track_metadata)
+	var playlistTrackURIs []string
+	db.Raw(`
+		SELECT DISTINCT pt.uri 
+		FROM playlist_tracks pt
+		JOIN playlists p ON pt.playlist_id = p.id
+		WHERE p.user_id = ?
+	`, userID).Pluck("uri", &playlistTrackURIs)
+	for _, trackURI := range playlistTrackURIs {
+		var tm TrackMetadata
+		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
+			uris = appendUniqueURI(uris, tm.ArtistURI)
+		}
+	}
+
+	return uris
+}
+
+// GetVirtualLibraryAlbumIDs returns all album URIs that the user has interacted with.
+// This includes: album_stars, and albums inferred from track_stars/plays/playlist_tracks via track_metadata.
+func (db *DB) GetVirtualLibraryAlbumIDs(userID int) []string {
+	var uris []string
+
+	// Direct album stars
+	db.Table("album_stars").Where("user_id = ?", userID).Pluck("uri", &uris)
+
+	// Albums inferred from track stars (via track_metadata)
+	var trackStarURIs []string
+	db.Table("track_stars").Where("user_id = ?", userID).Pluck("uri", &trackStarURIs)
+	for _, trackURI := range trackStarURIs {
+		var tm TrackMetadata
+		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
+			uris = appendUniqueURI(uris, tm.AlbumURI)
+		}
+	}
+
+	// Albums inferred from plays (via track_metadata)
+	var playURIs []string
+	db.Table("plays").Where("user_id = ?", userID).Pluck("uri", &playURIs)
+	for _, trackURI := range playURIs {
+		var tm TrackMetadata
+		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
+			uris = appendUniqueURI(uris, tm.AlbumURI)
+		}
+	}
+
+	// Albums inferred from playlist tracks (via track_metadata)
+	var playlistTrackURIs []string
+	db.Raw(`
+		SELECT DISTINCT pt.uri 
+		FROM playlist_tracks pt
+		JOIN playlists p ON pt.playlist_id = p.id
+		WHERE p.user_id = ?
+	`, userID).Pluck("uri", &playlistTrackURIs)
+	for _, trackURI := range playlistTrackURIs {
+		var tm TrackMetadata
+		if db.Where("uri = ?", trackURI).First(&tm).Error == nil {
+			uris = appendUniqueURI(uris, tm.AlbumURI)
+		}
+	}
+
+	return uris
+}
+
+// GetVirtualLibraryTrackIDs returns all track URIs that the user has interacted with.
+// This includes: track_stars, plays, and playlist_tracks.
+func (db *DB) GetVirtualLibraryTrackIDs(userID int) []string {
+	var uris []string
+
+	// Track stars
+	db.Table("track_stars").Where("user_id = ?", userID).Pluck("uri", &uris)
+
+	// Plays
+	var playURIs []string
+	db.Table("plays").Where("user_id = ?", userID).Pluck("uri", &playURIs)
+	for _, uri := range playURIs {
+		uris = appendUniqueURI(uris, uri)
+	}
+
+	// Playlist tracks
+	var playlistTrackURIs []string
+	db.Raw(`
+		SELECT DISTINCT pt.uri 
+		FROM playlist_tracks pt
+		JOIN playlists p ON pt.playlist_id = p.id
+		WHERE p.user_id = ?
+	`, userID).Pluck("uri", &playlistTrackURIs)
+	for _, uri := range playlistTrackURIs {
+		uris = appendUniqueURI(uris, uri)
+	}
+
+	return uris
+}
+
+// appendUniqueURI appends a URI to a slice if it doesn't already exist
+func appendUniqueURI(slice []string, uri string) []string {
+	for _, s := range slice {
+		if s == uri {
+			return slice
+		}
+	}
+	return append(slice, uri)
+}
+
+// GetCachedMetadata retrieves cached metadata from SQLite
+// Returns nil if not found or expired
+func (db *DB) GetCachedMetadata(key string) []byte {
+	var cache MetadataCache
+	err := db.Where("key = ?", key).First(&cache).Error
+	if err != nil {
+		return nil
+	}
+
+	// Check if expired
+	if cache.TTLSeconds > 0 {
+		expiry := cache.FetchedAt.Add(time.Duration(cache.TTLSeconds) * time.Second)
+		if time.Now().After(expiry) {
+			// Delete expired entry
+			db.Where("key = ?", key).Delete(&MetadataCache{})
+			return nil
+		}
+	}
+
+	return cache.Value
+}
+
+// SetCachedMetadata stores metadata in SQLite cache
+func (db *DB) SetCachedMetadata(key string, value []byte, ttlSeconds int) error {
+	cache := MetadataCache{
+		Key:        key,
+		Value:      value,
+		FetchedAt:  time.Now(),
+		TTLSeconds: ttlSeconds,
+	}
+	return db.Save(&cache).Error
+}
+
+// CleanupExpiredCache removes all expired entries from metadata_cache
+// This is optional but recommended for maintenance
+func (db *DB) CleanupExpiredCache() error {
+	return db.Where("fetched_at < datetime('now', '-' || ttl_seconds || ' seconds')").Delete(&MetadataCache{}).Error
 }
 
 

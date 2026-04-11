@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -133,6 +134,28 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	if err != nil {
 		return spec.NewError(0, "error fetching track meta: %v", err)
 	}
+
+	// Auto-ingest: Record track metadata for virtual library
+	// This allows us to infer artist/album from track plays
+	user := r.Context().Value(CtxUser).(*db.User)
+	trackURI := fmt.Sprintf("td:tr:%d", id.Value())
+	albumURI := fmt.Sprintf("td:al:%d", track.Album.ID)
+	artistURI := fmt.Sprintf("td:ar:%d", track.Artist.ID)
+
+	// Insert or update track_metadata
+	c.dbc.Exec(`
+		INSERT OR REPLACE INTO track_metadata (uri, album_uri, artist_uri, updated_at)
+		VALUES (?, ?, ?, ?)
+	`, trackURI, albumURI, artistURI, time.Now())
+
+	// Insert or update play count
+	c.dbc.Exec(`
+		INSERT INTO plays (user_id, uri, provider, played_at, count)
+		VALUES (?, ?, 'tidal', ?, 1)
+		ON CONFLICT(user_id, uri) DO UPDATE SET
+			count = count + 1,
+			played_at = ?
+	`, user.ID, trackURI, time.Now(), time.Now())
 
 	contentType := "audio/flac"
 	if ext == "m4a" {

@@ -25,15 +25,11 @@ func init() {
 func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 
-	var stars []db.ArtistStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&stars)
+	// Use virtual library: artists from stars + inferred from plays/playlist_tracks
+	artistURIs := c.dbc.GetVirtualLibraryArtistIDs(user.ID)
+	artistIDs := extractIDsFromURIs(artistURIs)
 
-	starIDs := make([]int, len(stars))
-	for i, s := range stars {
-		starIDs[i] = extractIDFromURI(s.URI)
-	}
-
-	artists := c.batchFetchArtists(r, starIDs)
+	artists := c.batchFetchArtists(r, artistIDs)
 	indexes := c.buildArtistIndexes(artists)
 
 	sub := spec.NewResponse()
@@ -70,15 +66,11 @@ func (c *Controller) buildArtistIndexes(artists []*spec.Artist) []*spec.Index {
 func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 
-	var stars []db.ArtistStar
-	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Find(&stars)
+	// Use virtual library: artists from stars + inferred from plays/playlist_tracks
+	artistURIs := c.dbc.GetVirtualLibraryArtistIDs(user.ID)
+	artistIDs := extractIDsFromURIs(artistURIs)
 
-	starIDs := make([]int, len(stars))
-	for i, s := range stars {
-		starIDs[i] = extractIDFromURI(s.URI)
-	}
-
-	artists := c.batchFetchArtists(r, starIDs)
+	artists := c.batchFetchArtists(r, artistIDs)
 	indexes := c.buildArtistIndexes(artists)
 
 	sub := spec.NewResponse()
@@ -214,6 +206,22 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		offset = ((offset / size) + 1) * size
 	}
 
+	// Hard limit for discovery endpoints to prevent infinite sync loops
+	// These endpoints call external APIs (hot.monochrome/Tidal) and should be capped
+	discoveryTypes := map[string]bool{
+		"newest":    true,
+		"random":    true,
+		"recent":    true,
+		"frequent":  true,
+		"byGenre":   true,
+	}
+	if discoveryTypes[listType] && offset >= 200 {
+		log.Printf("[BROWSE] Hard limit reached for discovery type %s at offset %d", listType, offset)
+		sub := spec.NewResponse()
+		sub.AlbumsTwo = &spec.Albums{List: []*spec.Album{}}
+		return sub
+	}
+
 	var albumIDs []int
 
 	switch listType {
@@ -258,21 +266,15 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		}
 
 	case "alphabeticalByName", "alphabeticalByArtist":
-		// Get all starred albums
-		var stars []db.AlbumStar
-		c.dbc.Where("user_id=?", user.ID).
-			Order("star_date DESC").
-			Find(&stars)
+		// Use virtual library: albums from stars + inferred from plays/playlist_tracks
+		albumURIs := c.dbc.GetVirtualLibraryAlbumIDs(user.ID)
 
-		if len(stars) == 0 {
+		if len(albumURIs) == 0 {
 			break
 		}
 
 		// Fetch all album metadata to sort properly
-		allAlbumIDs := make([]int, len(stars))
-		for i, s := range stars {
-			allAlbumIDs[i] = extractIDFromURI(s.URI)
-		}
+		allAlbumIDs := extractIDsFromURIs(albumURIs)
 
 		// Use fast fetch with timeout
 		ctx, cancel := context.WithTimeout(r.Context(), hotFetchTimeout)

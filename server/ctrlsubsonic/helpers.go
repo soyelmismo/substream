@@ -16,6 +16,9 @@ import (
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
+// metadataCacheTTL is the default TTL for persistent metadata cache (24 hours)
+const metadataCacheTTL = 86400
+
 // batchFetchTracks fetches metadata for multiple tidal track IDs concurrently
 // with a semaphore to limit parallelism. Failed fetches are silently skipped.
 func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.TrackChild {
@@ -37,6 +40,17 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
+
+			// Check persistent cache first
+			cacheKey := fmt.Sprintf("track:%d", tid)
+			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
+				var track spec.TrackChild
+				if err := json.Unmarshal(cached, &track); err == nil {
+					results <- result{idx: idx, track: &track}
+					return
+				}
+			}
+
 			c.proxySem <- struct{}{}
 			defer func() { <-c.proxySem }()
 
@@ -44,7 +58,14 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 			if err != nil {
 				return
 			}
-			results <- result{idx: idx, track: spec.NewTrackFromTidal(track)}
+			tc := spec.NewTrackFromTidal(track)
+
+			// Store in persistent cache
+			if trackJSON, err := json.Marshal(tc); err == nil {
+				c.dbc.SetCachedMetadata(cacheKey, trackJSON, metadataCacheTTL)
+			}
+
+			results <- result{idx: idx, track: tc}
 		}(i, id)
 	}
 
@@ -92,6 +113,17 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
+
+			// Check persistent cache first
+			cacheKey := fmt.Sprintf("album:%d", tid)
+			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
+				var album spec.Album
+				if err := json.Unmarshal(cached, &album); err == nil {
+					results <- result{idx: idx, album: &album}
+					return
+				}
+			}
+
 			c.proxySem <- struct{}{}
 			defer func() { <-c.proxySem }()
 
@@ -100,6 +132,12 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 				return
 			}
 			a := spec.NewAlbumFromTidal(info)
+
+			// Store in persistent cache
+			if albumJSON, err := json.Marshal(a); err == nil {
+				c.dbc.SetCachedMetadata(cacheKey, albumJSON, metadataCacheTTL)
+			}
+
 			results <- result{idx: idx, album: a}
 		}(i, id)
 	}
@@ -144,7 +182,11 @@ func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs [
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
-			
+
+			// Check persistent cache first (note: we need r.Context() but this function has ctx)
+			// Since we don't have access to DB here, skip cache for this variant
+			// The main batchFetchAlbums uses cache; this is for timeout-controlled contexts
+
 			info, err := c.proxy.GetAlbumInfo(ctx, tid)
 			if err != nil {
 				return
@@ -203,6 +245,17 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 		wg.Add(1)
 		go func(idx, tid int) {
 			defer wg.Done()
+
+			// Check persistent cache first
+			cacheKey := fmt.Sprintf("artist:%d", tid)
+			if cached := c.dbc.GetCachedMetadata(cacheKey); cached != nil {
+				var artist spec.Artist
+				if err := json.Unmarshal(cached, &artist); err == nil {
+					results <- result{idx: idx, artist: &artist}
+					return
+				}
+			}
+
 			c.proxySem <- struct{}{}
 			defer func() { <-c.proxySem }()
 
@@ -215,6 +268,11 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 
 			// Get album count from cache (avoids extra API call)
 			a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
+
+			// Store in persistent cache
+			if artistJSON, err := json.Marshal(a); err == nil {
+				c.dbc.SetCachedMetadata(cacheKey, artistJSON, metadataCacheTTL)
+			}
 
 			results <- result{idx: idx, artist: a}
 		}(i, id)

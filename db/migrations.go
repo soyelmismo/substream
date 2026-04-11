@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/jinzhu/gorm"
@@ -149,6 +150,69 @@ func migratePlaysTable(tx *gorm.DB) error {
 		return fmt.Errorf("populate uri: %w", err)
 	}
 
+	// Drop tidal_id column by recreating the table (SQLite doesn't support DROP COLUMN)
+	if err := dropPlaysTidalIDColumn(tx); err != nil {
+		return fmt.Errorf("drop tidal_id column: %w", err)
+	}
+
+	return nil
+}
+
+// dropPlaysTidalIDColumn recreates the plays table without tidal_id column
+// This is necessary because SQLite doesn't support DROP COLUMN
+func dropPlaysTidalIDColumn(tx *gorm.DB) error {
+	// Check if tidal_id column exists
+	var count int
+	err := tx.Raw(`
+		SELECT COUNT(*) FROM pragma_table_info('plays') WHERE name = 'tidal_id'
+	`).Scan(&count).Error
+	if err != nil {
+		return fmt.Errorf("check tidal_id column exists: %w", err)
+	}
+	if count == 0 {
+		// Column doesn't exist, nothing to do
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Dropping tidal_id column from plays table...")
+
+	// Disable foreign keys temporarily to allow table recreation
+	if err := tx.Exec(`PRAGMA foreign_keys = OFF`).Error; err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer tx.Exec(`PRAGMA foreign_keys = ON`)
+
+	// Recreate table without tidal_id
+	steps := []string{
+		`CREATE TABLE plays_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			uri TEXT NOT NULL,
+			provider TEXT DEFAULT 'tidal',
+			isrc TEXT,
+			fallback_artist TEXT,
+			fallback_title TEXT,
+			played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			count INTEGER NOT NULL DEFAULT 1,
+			UNIQUE(user_id, uri)
+		)`,
+		`INSERT INTO plays_new (id, user_id, uri, provider, isrc, fallback_artist, fallback_title, played_at, count)
+		 SELECT id, user_id, uri, provider, isrc, fallback_artist, fallback_title, played_at, count FROM plays`,
+		`DROP TABLE plays`,
+		`ALTER TABLE plays_new RENAME TO plays`,
+		`CREATE INDEX idx_plays_user_time ON plays(user_id, played_at)`,
+		`CREATE INDEX idx_plays_user_count ON plays(user_id, count)`,
+		`CREATE INDEX idx_plays_uri ON plays(uri)`,
+		`CREATE INDEX idx_plays_isrc ON plays(isrc)`,
+	}
+
+	for i, step := range steps {
+		if err := tx.Exec(step).Error; err != nil {
+			return fmt.Errorf("migration step %d failed: %w", i, err)
+		}
+	}
+
+	log.Printf("[MIGRATION] Successfully dropped tidal_id column from plays table")
 	return nil
 }
 
@@ -253,10 +317,97 @@ func containsInternal(s, substr string) bool {
 	return false
 }
 
+// MigrateDropTidalID drops the tidal_id column from plays table
+// This is a separate migration because it must run after URN migration is complete
+func MigrateDropTidalID(db *gorm.DB) error {
+	// Check if migration has already been run
+	var setting Setting
+	err := db.Where("key = ?", "drop_tidal_id_completed").First(&setting).Error
+	if err == nil && setting.Value == "true" {
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Starting tidal_id column removal...")
+
+	// Check if tidal_id column exists in plays table
+	type columnInfo struct {
+		Name string
+	}
+	var columns []columnInfo
+	err = db.Raw(`
+		SELECT name FROM pragma_table_info('plays') WHERE name = 'tidal_id'
+	`).Scan(&columns).Error
+	if err != nil {
+		return fmt.Errorf("check tidal_id column: %w", err)
+	}
+
+	if len(columns) == 0 {
+		log.Printf("[MIGRATION] tidal_id column already removed, marking complete")
+		// Mark as completed
+		db.Exec(`
+			INSERT INTO settings (key, value) VALUES ('drop_tidal_id_completed', 'true')
+			ON CONFLICT(key) DO UPDATE SET value = 'true'
+		`)
+		return nil
+	}
+
+	// Disable foreign keys temporarily
+	if err := db.Exec(`PRAGMA foreign_keys = OFF`).Error; err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer db.Exec(`PRAGMA foreign_keys = ON`)
+
+	// Recreate table without tidal_id
+	steps := []string{
+		`CREATE TABLE plays_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			uri TEXT NOT NULL,
+			provider TEXT DEFAULT 'tidal',
+			isrc TEXT,
+			fallback_artist TEXT,
+			fallback_title TEXT,
+			played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			count INTEGER NOT NULL DEFAULT 1,
+			UNIQUE(user_id, uri)
+		)`,
+		`INSERT INTO plays_new (id, user_id, uri, provider, isrc, fallback_artist, fallback_title, played_at, count)
+		 SELECT id, user_id, uri, provider, isrc, fallback_artist, fallback_title, played_at, count FROM plays`,
+		`DROP TABLE plays`,
+		`ALTER TABLE plays_new RENAME TO plays`,
+		`CREATE INDEX idx_plays_user_time ON plays(user_id, played_at)`,
+		`CREATE INDEX idx_plays_user_count ON plays(user_id, count)`,
+		`CREATE INDEX idx_plays_uri ON plays(uri)`,
+		`CREATE INDEX idx_plays_isrc ON plays(isrc)`,
+	}
+
+	for i, step := range steps {
+		if err := db.Exec(step).Error; err != nil {
+			return fmt.Errorf("migration step %d failed: %w", i, err)
+		}
+	}
+
+	// Mark migration as completed
+	if err := db.Exec(`
+		INSERT INTO settings (key, value) VALUES ('drop_tidal_id_completed', 'true')
+		ON CONFLICT(key) DO UPDATE SET value = 'true'
+	`).Error; err != nil {
+		return fmt.Errorf("mark migration complete: %w", err)
+	}
+
+	log.Printf("[MIGRATION] Successfully removed tidal_id column from plays table")
+	return nil
+}
+
 func (db *DB) Migrate() error {
 	// Run URN migration before AutoMigrate
 	if err := MigrateToURNs(db.DB); err != nil {
 		return fmt.Errorf("urn migration failed: %w", err)
+	}
+
+	// Run tidal_id column drop migration
+	if err := MigrateDropTidalID(db.DB); err != nil {
+		return fmt.Errorf("drop tidal_id migration failed: %w", err)
 	}
 
 	return db.AutoMigrate(
@@ -273,6 +424,8 @@ func (db *DB) Migrate() error {
 		&Setting{},
 		&Bookmark{},
 		&ProxyInstance{},
+		&TrackMetadata{},
+		&MetadataCache{},
 	).Error
 }
 
