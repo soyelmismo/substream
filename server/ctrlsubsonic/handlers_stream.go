@@ -22,7 +22,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Track {
+	if err != nil || id.Type() != specid.Track {
 		log.Printf("[STREAM] ERROR: invalid track id: %v", err)
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
@@ -31,7 +31,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	rawID := p.GetOr("id", "")
 	client := p.GetOr("c", "unknown")
 	rangeHdr := r.Header.Get("Range")
-	log.Printf("[STREAM] REQUEST: client=%s raw_id=%s parsed_track_id=%d range=%q", client, rawID, id.Value, rangeHdr)
+	log.Printf("[STREAM] REQUEST: client=%s raw_id=%s parsed_track_id=%d range=%q", client, rawID, id.Value(), rangeHdr)
 
 	// Get client IP for proxy requests
 	clientIP := r.Header.Get("X-Forwarded-For")
@@ -75,10 +75,10 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	clientIP = strings.Trim(clientIP, "[]")
 
 	proxyStart := time.Now()
-	streamURL, err := c.getStreamURLWithCache(metaCtx, id.Value, tidalQuality, clientIP)
+	streamURL, err := c.getStreamURLWithCache(metaCtx, id.Value(), tidalQuality, clientIP)
 	proxyDuration := time.Since(proxyStart)
 	if err != nil {
-		log.Printf("[STREAM] ERROR: GetStreamURL failed for track %d after %v: %v", id.Value, proxyDuration, err)
+		log.Printf("[STREAM] ERROR: GetStreamURL failed for track %d after %v: %v", id.Value(), proxyDuration, err)
 		return spec.NewError(0, "error getting stream URL: %v", err)
 	}
 
@@ -87,11 +87,11 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	if len(streamURL) > 20 {
 		urlHash = streamURL[:20] + "..." + streamURL[len(streamURL)-10:]
 	}
-	log.Printf("[STREAM] URL: track=%d quality=%s url_hash=%s", id.Value, tidalQuality, urlHash)
+	log.Printf("[STREAM] URL: track=%d quality=%s url_hash=%s", id.Value(), tidalQuality, urlHash)
 
 	// Debug: log full URL if it looks suspicious (no query params or very short)
 	if len(streamURL) < 50 || !strings.Contains(streamURL, "?") {
-		log.Printf("[STREAM] DEBUG: track=%d full_url=%q", id.Value, streamURL)
+		log.Printf("[STREAM] DEBUG: track=%d full_url=%q", id.Value(), streamURL)
 	}
 
 	// Determine content type and extensions early to check if we need proxy
@@ -115,12 +115,12 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	if proxyStreams != "true" {
 		// Redirect directly to tidal CDN - better performance but may cause CORS issues
 		if streamURL == "" {
-			log.Printf("[STREAM] track %d → error: empty stream URL for redirect", id.Value)
+			log.Printf("[STREAM] track %d → error: empty stream URL for redirect", id.Value())
 			return spec.NewError(0, "empty stream URL from tidal")
 		}
 		totalDuration := time.Since(start)
 		log.Printf("[STREAM] REDIRECT: track=%d → 302 to CDN (proxy=%s) total=%v proxy=%v setting=%v url=%s",
-			id.Value, proxyStreams, totalDuration, proxyDuration, settingDuration, urlHash)
+			id.Value(), proxyStreams, totalDuration, proxyDuration, settingDuration, urlHash)
 		http.Redirect(w, r, streamURL, http.StatusFound) // 302 redirect, no body
 		return nil
 	}
@@ -129,7 +129,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// and certificate issues for clients using self-signed certs.
 
 	// Determine content type and extensions
-	track, err := c.proxy.GetTrackInfo(metaCtx, id.Value)
+	track, err := c.proxy.GetTrackInfo(metaCtx, id.Value())
 	if err != nil {
 		return spec.NewError(0, "error fetching track meta: %v", err)
 	}
@@ -148,7 +148,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	} else if isDASH {
 		streamType = "DASH"
 	}
-	log.Printf("[STREAM] PROXY: track=%d type=%s format=%s artist=%q title=%q", id.Value, streamType, contentType, track.Artist.Name, track.Title)
+	log.Printf("[STREAM] PROXY: track=%d type=%s format=%s artist=%q title=%q", id.Value(), streamType, contentType, track.Artist.Name, track.Title)
 
 	w.Header().Set("Content-Type", contentType)
 	
@@ -200,9 +200,9 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	}
 
 	if stitchErr != nil {
-		log.Printf("[STREAM] ERROR: proxy failed for track %d: %v", id.Value, stitchErr)
+		log.Printf("[STREAM] ERROR: proxy failed for track %d: %v", id.Value(), stitchErr)
 	} else {
-		log.Printf("[STREAM] COMPLETE: track=%d type=%s", id.Value, streamType)
+		log.Printf("[STREAM] COMPLETE: track=%d type=%s", id.Value(), streamType)
 	}
 	return nil
 }
@@ -280,7 +280,7 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	}
 
 	size := p.GetOrInt("size", 600)
-	if id.Type == specid.Artist {
+	if id.Type() == specid.Artist {
 		switch {
 		case size <= 160:
 			size = 160
@@ -308,7 +308,7 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		}
 	}
 
-	cacheKey := fmt.Sprintf("%s-%d-%d", id.Type, id.Value, size)
+	cacheKey := fmt.Sprintf("%s-%d-%d", id.Type(), id.Value(), size)
 	cachePath := filepath.Join(c.cachePath, cacheKey+".jpg")
 
 	// check disk cache first (fast path)
@@ -320,7 +320,7 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	}
 
 	// negative cache: avoid re-fetching covers we know are missing
-	negKey := fmt.Sprintf("neg-%s-%d", id.Type, id.Value)
+	negKey := fmt.Sprintf("neg-%s-%d", id.Type(), id.Value())
 	if c.negCoverCache.Get(negKey) {
 		w.Header().Set("Content-Type", "image/gif")
 		w.Header().Set("Cache-Control", "public, max-age=3600")
@@ -392,16 +392,16 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 func (c *Controller) fetchAndCacheCover(ctx context.Context, id *specid.ID, size int, cachePath, negKey string) ([]byte, error) {
 	// resolve cover UUID
 	var coverUUID string
-	switch id.Type {
+	switch id.Type() {
 	case specid.Album:
-		coverUUID = c.proxy.GetCoverUUIDForAlbum(ctx, id.Value)
+		coverUUID = c.proxy.GetCoverUUIDForAlbum(ctx, id.Value())
 	case specid.Artist:
-		info, err := c.proxy.GetArtistInfo(ctx, id.Value)
+		info, err := c.proxy.GetArtistInfo(ctx, id.Value())
 		if err == nil {
 			coverUUID = info.Artist.Picture
 		}
 	case specid.Track:
-		track, err := c.proxy.GetTrackInfo(ctx, id.Value)
+		track, err := c.proxy.GetTrackInfo(ctx, id.Value())
 		if err == nil {
 			coverUUID = track.Album.Cover
 		}

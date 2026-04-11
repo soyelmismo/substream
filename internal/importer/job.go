@@ -564,7 +564,7 @@ func (jm *JobManager) processTracksConcurrent(ctx context.Context, tracks []Impo
 func (jm *JobManager) addTrack(playlistID, tidalID, position int) error {
 	pt := db.PlaylistTrack{
 		PlaylistID: playlistID,
-		TidalID:    tidalID,
+		URI:        fmt.Sprintf("td:tr:%d", tidalID),
 		Position:   position,
 	}
 	return jm.db.Create(&pt).Error

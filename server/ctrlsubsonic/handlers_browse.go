@@ -30,7 +30,7 @@ func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
 
 	starIDs := make([]int, len(stars))
 	for i, s := range stars {
-		starIDs[i] = s.TidalID
+		starIDs[i] = extractIDFromURI(s.URI)
 	}
 
 	artists := c.batchFetchArtists(r, starIDs)
@@ -75,7 +75,7 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 
 	starIDs := make([]int, len(stars))
 	for i, s := range stars {
-		starIDs[i] = s.TidalID
+		starIDs[i] = extractIDFromURI(s.URI)
 	}
 
 	artists := c.batchFetchArtists(r, starIDs)
@@ -91,7 +91,7 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Artist {
+	if err != nil || id.Type() != specid.Artist {
 		return spec.NewError(10, "please provide an artist `id` parameter")
 	}
 
@@ -99,13 +99,14 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 	var artistPage *tidalproxy.TidalArtistPage
 	var errInfo, errPage error
 
+	artistID := id.Value()
 	done := make(chan struct{}, 2)
 	go func() {
-		info, errInfo = c.proxy.GetArtistInfo(r.Context(), id.Value)
+		info, errInfo = c.proxy.GetArtistInfo(r.Context(), artistID)
 		done <- struct{}{}
 	}()
 	go func() {
-		artistPage, errPage = c.proxy.GetArtistAlbums(r.Context(), id.Value, true)
+		artistPage, errPage = c.proxy.GetArtistAlbums(r.Context(), artistID, true)
 		done <- struct{}{}
 	}()
 
@@ -152,11 +153,11 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Album {
+	if err != nil || id.Type() != specid.Album {
 		return spec.NewError(10, "please provide an album `id` parameter")
 	}
 
-	album, err := c.proxy.GetAlbumInfo(r.Context(), id.Value)
+	album, err := c.proxy.GetAlbumInfo(r.Context(), id.Value())
 	if err != nil {
 		return spec.NewError(0, "error fetching album: %v", err)
 	}
@@ -176,7 +177,8 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 			tc.AlbumID = a.ID
 		}
 		c.applyTrackStar(user.ID, tc)
-		tc.UserRating = c.getTrackRating(user.ID, album.Items[i].ID)
+		uri := fmt.Sprintf("td:tr:%d", album.Items[i].ID)
+		tc.UserRating = c.getTrackRating(user.ID, uri)
 		c.applyTrackPlayCount(user.ID, tc)
 		a.Tracks[i] = tc
 		totalDuration += tc.Duration
@@ -186,7 +188,8 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 	}
 
 	c.applyAlbumStar(user.ID, a)
-	a.UserRating = c.getAlbumRating(user.ID, id.Value)
+	albumURI := id.String()
+	a.UserRating = c.getAlbumRating(user.ID, albumURI)
 
 	sub := spec.NewResponse()
 	sub.Album = a
@@ -221,7 +224,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, s.TidalID)
+			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
 		}
 
 	case "recent":
@@ -232,7 +235,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, s.TidalID)
+			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
 		}
 		// Fallback to hot new releases if less than threshold local albums
 		if len(albumIDs) < hotFallbackThresholdRecent {
@@ -247,7 +250,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, s.TidalID)
+			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
 		}
 		// Fallback to hot trending if less than threshold local albums
 		if len(albumIDs) < hotFallbackThresholdRecent {
@@ -268,7 +271,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		// Fetch all album metadata to sort properly
 		allAlbumIDs := make([]int, len(stars))
 		for i, s := range stars {
-			allAlbumIDs[i] = s.TidalID
+			allAlbumIDs[i] = extractIDFromURI(s.URI)
 		}
 
 		// Use fast fetch with timeout
@@ -298,7 +301,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			}
 			for _, a := range allAlbums[start:end] {
 				if a.ID != nil {
-					albumIDs = append(albumIDs, a.ID.Value)
+					albumIDs = append(albumIDs, a.ID.Value())
 				}
 			}
 		}
@@ -311,7 +314,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, s.TidalID)
+			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
 		}
 		// Fallback to hot popular albums if less than threshold local albums
 		if len(albumIDs) < hotFallbackThresholdRandom {
@@ -325,7 +328,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&ratings)
 		for _, r := range ratings {
-			albumIDs = append(albumIDs, r.TidalID)
+			albumIDs = append(albumIDs, extractIDFromURI(r.URI))
 		}
 
 	case "byYear":
@@ -347,7 +350,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		// Fetch album metadata to get years
 		allAlbumIDs := make([]int, len(stars))
 		for i, s := range stars {
-			allAlbumIDs[i] = s.TidalID
+			allAlbumIDs[i] = extractIDFromURI(s.URI)
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), hotFetchTimeout)
 		allAlbums := c.batchFetchAlbumsWithContext(ctx, allAlbumIDs)
@@ -379,7 +382,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			}
 			for _, a := range filtered[start:end] {
 				if a.ID != nil {
-					albumIDs = append(albumIDs, a.ID.Value)
+					albumIDs = append(albumIDs, a.ID.Value())
 				}
 			}
 		}
@@ -469,7 +472,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, s.TidalID)
+			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
 		}
 	}
 
@@ -486,18 +489,19 @@ func (c *Controller) ServeGetSong(r *http.Request) *spec.Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Track {
+	if err != nil || id.Type() != specid.Track {
 		return spec.NewError(10, "please provide a track `id` parameter")
 	}
 
-	track, err := c.proxy.GetTrackInfo(r.Context(), id.Value)
+	track, err := c.proxy.GetTrackInfo(r.Context(), id.Value())
 	if err != nil {
 		return spec.NewError(0, "error fetching track: %v", err)
 	}
 
 	tc := spec.NewTrackFromTidal(track)
 	c.applyTrackStar(user.ID, tc)
-	tc.UserRating = c.getTrackRating(user.ID, id.Value)
+	uri := id.String()
+	tc.UserRating = c.getTrackRating(user.ID, uri)
 
 	sub := spec.NewResponse()
 	sub.Track = tc
@@ -691,16 +695,16 @@ func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, fi
 func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Artist {
+	if err != nil || id.Type() != specid.Artist {
 		return spec.NewError(10, "please provide an artist `id` parameter")
 	}
 
-	info, err := c.proxy.GetArtistInfo(r.Context(), id.Value)
+	info, err := c.proxy.GetArtistInfo(r.Context(), id.Value())
 	if err != nil {
 		return spec.NewError(0, "error fetching artist info")
 	}
 
-	similar, _ := c.proxy.GetSimilarArtists(r.Context(), id.Value)
+	similar, _ := c.proxy.GetSimilarArtists(r.Context(), id.Value())
 
 	artistInfo := &spec.ArtistInfo{
 		Biography:      "",
@@ -729,7 +733,7 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 func (c *Controller) ServeGetAlbumInfoTwo(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Album {
+	if err != nil || id.Type() != specid.Album {
 		return spec.NewError(10, "please provide an album `id` parameter")
 	}
 

@@ -2,6 +2,7 @@ package ctrlsubsonic
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -35,7 +36,7 @@ func (c *Controller) ServeGetPlaylists(r *http.Request) *spec.Response {
 		c.dbc.Where("id=?", pl.UserID).First(&owner)
 
 		sub.Playlists.List[i] = &spec.Playlist{
-			ID:        specid.ID{Type: specid.Playlist, StringValue: strconv.Itoa(pl.ID)},
+			ID:        specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
 			Name:      pl.Name,
 			Comment:   pl.Comment,
 			Owner:     owner.Name,
@@ -58,9 +59,9 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 		return spec.NewError(10, "provide an `id` parameter")
 	}
 
-	playlistID, _ := strconv.Atoi(id.StringValue)
+	playlistID, _ := strconv.Atoi(id.String())
 	if playlistID == 0 {
-		playlistID = id.Value
+		playlistID = id.Value()
 	}
 
 	var pl db.Playlist
@@ -78,7 +79,8 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 
 	tidalIDs := make([]int, len(tracks))
 	for i, t := range tracks {
-		tidalIDs[i] = t.TidalID
+		// Extract numeric ID from URI (td:tr:12345 -> 12345)
+		tidalIDs[i] = extractIDFromURI(t.URI)
 	}
 
 	// get owner name
@@ -94,7 +96,7 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 
 	sub := spec.NewResponse()
 	sub.Playlist = &spec.Playlist{
-		ID:        specid.ID{Type: specid.Playlist, StringValue: strconv.Itoa(pl.ID)},
+		ID:        specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
 		Name:      pl.Name,
 		Comment:   pl.Comment,
 		Owner:     owner.Name,
@@ -122,9 +124,9 @@ func (c *Controller) ServeCreatePlaylist(r *http.Request) *spec.Response {
 
 	// if playlistId is provided, this is an update
 	if plID, err := p.GetID("playlistId"); err == nil {
-		playlistID, _ := strconv.Atoi(plID.StringValue)
+		playlistID, _ := strconv.Atoi(plID.String())
 		if playlistID == 0 {
-			playlistID = plID.Value
+			playlistID = plID.Value()
 		}
 
 		var pl db.Playlist
@@ -137,10 +139,10 @@ func (c *Controller) ServeCreatePlaylist(r *http.Request) *spec.Response {
 			if songIDs, err := p.GetIDList("songId"); err == nil {
 				c.dbc.Where("playlist_id=?", pl.ID).Delete(&db.PlaylistTrack{})
 				for i, sid := range songIDs {
-					if sid.Type == specid.Track {
+					if sid.Type() == specid.Track {
 						c.dbc.Create(&db.PlaylistTrack{
 							PlaylistID: pl.ID,
-							TidalID:    sid.Value,
+							URI:        fmt.Sprintf("td:tr:%d", sid.Value()),
 							Position:   i,
 						})
 					}
@@ -163,10 +165,10 @@ func (c *Controller) ServeCreatePlaylist(r *http.Request) *spec.Response {
 	// add tracks if songId provided
 	if songIDs, err := p.GetIDList("songId"); err == nil {
 		for i, sid := range songIDs {
-			if sid.Type == specid.Track {
+			if sid.Type() == specid.Track {
 				c.dbc.Create(&db.PlaylistTrack{
 					PlaylistID: pl.ID,
-					TidalID:    sid.Value,
+					URI:        sid.String(),
 					Position:   i,
 				})
 			}
@@ -175,7 +177,7 @@ func (c *Controller) ServeCreatePlaylist(r *http.Request) *spec.Response {
 
 	sub := spec.NewResponse()
 	sub.Playlist = &spec.Playlist{
-		ID:      specid.ID{Type: specid.Playlist, StringValue: strconv.Itoa(pl.ID)},
+		ID:      specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
 		Name:    pl.Name,
 		Owner:   user.Name,
 		Created: pl.CreatedAt,
@@ -195,7 +197,7 @@ func (c *Controller) handleImportPlaylist(ctx context.Context, user *db.User, so
 	// Return the placeholder playlist immediately
 	sub := spec.NewResponse()
 	sub.Playlist = &spec.Playlist{
-		ID:      specid.ID{Type: specid.Playlist, StringValue: strconv.Itoa(pl.ID)},
+		ID:      specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
 		Name:    pl.Name,
 		Comment: pl.Comment,
 		Owner:   user.Name,
@@ -218,9 +220,9 @@ func (c *Controller) ServeUpdatePlaylist(r *http.Request) *spec.Response {
 		return spec.NewError(10, "provide a `playlistId` parameter")
 	}
 
-	playlistID, _ := strconv.Atoi(plID.StringValue)
+	playlistID, _ := strconv.Atoi(plID.String())
 	if playlistID == 0 {
-		playlistID = plID.Value
+		playlistID = plID.Value()
 	}
 
 	var pl db.Playlist
@@ -244,10 +246,10 @@ func (c *Controller) ServeUpdatePlaylist(r *http.Request) *spec.Response {
 		c.dbc.Model(&db.PlaylistTrack{}).Where("playlist_id=?", pl.ID).
 			Select("COALESCE(MAX(position), -1)").Row().Scan(&maxPos)
 		for i, sid := range songIDsToAdd {
-			if sid.Type == specid.Track {
+			if sid.Type() == specid.Track {
 				c.dbc.Create(&db.PlaylistTrack{
 					PlaylistID: pl.ID,
-					TidalID:    sid.Value,
+					URI:        sid.String(),
 					Position:   maxPos + 1 + i,
 				})
 			}
@@ -287,9 +289,9 @@ func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {
 		return spec.NewError(10, "provide an `id` parameter")
 	}
 
-	playlistID, _ := strconv.Atoi(id.StringValue)
+	playlistID, _ := strconv.Atoi(id.String())
 	if playlistID == 0 {
-		playlistID = id.Value
+		playlistID = id.Value()
 	}
 
 	var pl db.Playlist

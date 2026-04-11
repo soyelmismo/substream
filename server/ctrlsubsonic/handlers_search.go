@@ -182,7 +182,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
 			starIDs := make([]int, len(stars))
 			for i, s := range stars {
-				starIDs[i] = s.TidalID
+				starIDs[i] = extractIDFromURI(s.URI)
 			}
 
 			starredMeta := c.batchFetchAlbums(r, starIDs)
@@ -204,7 +204,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
 			starIDs := make([]int, len(stars))
 			for i, s := range stars {
-				starIDs[i] = s.TidalID
+				starIDs[i] = extractIDFromURI(s.URI)
 			}
 
 			starredMeta := c.batchFetchArtists(r, starIDs)
@@ -226,7 +226,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&stars)
 			starIDs := make([]int, len(stars))
 			for i, s := range stars {
-				starIDs[i] = s.TidalID
+				starIDs[i] = extractIDFromURI(s.URI)
 			}
 
 			starredMeta := c.batchFetchTracks(r, starIDs)
@@ -275,12 +275,12 @@ favLoop:
 		newAlbums := favAlbums
 		seenIDs := make(map[int]bool)
 		for _, m := range favAlbums {
-			seenIDs[m.ID.Value] = true
+			seenIDs[m.ID.Value()] = true
 		}
 		for _, a := range albums {
-			if !seenIDs[a.ID.Value] {
+			if !seenIDs[a.ID.Value()] {
 				newAlbums = append(newAlbums, a)
-				seenIDs[a.ID.Value] = true
+				seenIDs[a.ID.Value()] = true
 			}
 		}
 		albums = newAlbums
@@ -290,12 +290,12 @@ favLoop:
 		newArtists := favArtists
 		seenIDs := make(map[int]bool)
 		for _, m := range favArtists {
-			seenIDs[m.ID.Value] = true
+			seenIDs[m.ID.Value()] = true
 		}
 		for _, a := range artists {
-			if !seenIDs[a.ID.Value] {
+			if !seenIDs[a.ID.Value()] {
 				newArtists = append(newArtists, a)
-				seenIDs[a.ID.Value] = true
+				seenIDs[a.ID.Value()] = true
 			}
 		}
 		artists = newArtists
@@ -305,12 +305,12 @@ favLoop:
 		newTracks := favTracks
 		seenIDs := make(map[int]bool)
 		for _, m := range favTracks {
-			seenIDs[m.ID.Value] = true
+			seenIDs[m.ID.Value()] = true
 		}
 		for _, t := range tracks {
-			if !seenIDs[t.ID.Value] {
+			if !seenIDs[t.ID.Value()] {
 				newTracks = append(newTracks, t)
-				seenIDs[t.ID.Value] = true
+				seenIDs[t.ID.Value()] = true
 			}
 		}
 		tracks = newTracks
@@ -358,7 +358,7 @@ func (c *Controller) applyTrackStar(userID int, tc *spec.TrackChild) {
 		return
 	}
 	var star db.TrackStar
-	if c.dbc.Where("user_id=? AND tidal_id=?", userID, tc.ID.Value).First(&star).Error == nil {
+	if c.dbc.Where("user_id=? AND uri=?", userID, tc.ID.String()).First(&star).Error == nil {
 		tc.Starred = &star.StarDate
 	}
 }
@@ -369,7 +369,7 @@ func (c *Controller) applyTrackPlayCount(userID int, tc *spec.TrackChild) {
 		return
 	}
 	var play db.Play
-	if c.dbc.Where("user_id=? AND tidal_id=?", userID, tc.ID.Value).First(&play).Error == nil {
+	if c.dbc.Where("user_id=? AND uri=?", userID, tc.ID.String()).First(&play).Error == nil {
 		tc.PlayCount = play.Count
 	}
 }
@@ -380,7 +380,7 @@ func (c *Controller) applyAlbumStar(userID int, a *spec.Album) {
 		return
 	}
 	var star db.AlbumStar
-	if c.dbc.Where("user_id=? AND tidal_id=?", userID, a.ID.Value).First(&star).Error == nil {
+	if c.dbc.Where("user_id=? AND uri=?", userID, a.ID.String()).First(&star).Error == nil {
 		a.Starred = &star.StarDate
 	}
 }
@@ -391,23 +391,23 @@ func (c *Controller) applyArtistStar(userID int, a *spec.Artist) {
 		return
 	}
 	var star db.ArtistStar
-	if c.dbc.Where("user_id=? AND tidal_id=?", userID, a.ID.Value).First(&star).Error == nil {
+	if c.dbc.Where("user_id=? AND uri=?", userID, a.ID.String()).First(&star).Error == nil {
 		a.Starred = &star.StarDate
 	}
 }
 
 // star helpers for rating
-func (c *Controller) getTrackRating(userID, tidalID int) int {
+func (c *Controller) getTrackRating(userID int, uri string) int {
 	var rating db.TrackRating
-	if c.dbc.Where("user_id=? AND tidal_id=?", userID, tidalID).First(&rating).Error == nil {
+	if c.dbc.Where("user_id=? AND uri=?", userID, uri).First(&rating).Error == nil {
 		return rating.Rating
 	}
 	return 0
 }
 
-func (c *Controller) getAlbumRating(userID, tidalID int) int {
+func (c *Controller) getAlbumRating(userID int, uri string) int {
 	var rating db.AlbumRating
-	if c.dbc.Where("user_id=? AND tidal_id=?", userID, tidalID).First(&rating).Error == nil {
+	if c.dbc.Where("user_id=? AND uri=?", userID, uri).First(&rating).Error == nil {
 		return rating.Rating
 	}
 	return 0
@@ -423,25 +423,28 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 
 	// star supports id, albumId, artistId
 	if id, err := p.GetID("id"); err == nil {
-		switch id.Type {
+		uri := id.String()
+		switch id.Type() {
 		case specid.Track:
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).
-				FirstOrCreate(&db.TrackStar{UserID: user.ID, TidalID: id.Value})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
+				FirstOrCreate(&db.TrackStar{UserID: user.ID, URI: uri, Provider: "tidal"})
 		case specid.Album:
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).
-				FirstOrCreate(&db.AlbumStar{UserID: user.ID, TidalID: id.Value})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
+				FirstOrCreate(&db.AlbumStar{UserID: user.ID, URI: uri})
 		case specid.Artist:
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).
-				FirstOrCreate(&db.ArtistStar{UserID: user.ID, TidalID: id.Value})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
+				FirstOrCreate(&db.ArtistStar{UserID: user.ID, URI: uri})
 		}
 	}
 	if id, err := p.GetID("albumId"); err == nil {
-		c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).
-			FirstOrCreate(&db.AlbumStar{UserID: user.ID, TidalID: id.Value})
+		uri := id.String()
+		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
+			FirstOrCreate(&db.AlbumStar{UserID: user.ID, URI: uri})
 	}
 	if id, err := p.GetID("artistId"); err == nil {
-		c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).
-			FirstOrCreate(&db.ArtistStar{UserID: user.ID, TidalID: id.Value})
+		uri := id.String()
+		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
+			FirstOrCreate(&db.ArtistStar{UserID: user.ID, URI: uri})
 	}
 
 	return spec.NewResponse()
@@ -452,20 +455,23 @@ func (c *Controller) ServeUnstar(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	if id, err := p.GetID("id"); err == nil {
-		switch id.Type {
+		uri := id.String()
+		switch id.Type() {
 		case specid.Track:
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.TrackStar{})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.TrackStar{})
 		case specid.Album:
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.AlbumStar{})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.AlbumStar{})
 		case specid.Artist:
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.ArtistStar{})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.ArtistStar{})
 		}
 	}
 	if id, err := p.GetID("albumId"); err == nil {
-		c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.AlbumStar{})
+		uri := id.String()
+		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.AlbumStar{})
 	}
 	if id, err := p.GetID("artistId"); err == nil {
-		c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.ArtistStar{})
+		uri := id.String()
+		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.ArtistStar{})
 	}
 
 	return spec.NewResponse()
@@ -483,27 +489,28 @@ func (c *Controller) ServeSetRating(r *http.Request) *spec.Response {
 	if err != nil {
 		return spec.NewError(10, "provide a `rating` parameter")
 	}
+	uri := id.String()
 
-	switch id.Type {
+	switch id.Type() {
 	case specid.Track:
 		if rating == 0 {
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.TrackRating{})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.TrackRating{})
 		} else {
 			var existing db.TrackRating
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).First(&existing)
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&existing)
 			existing.UserID = user.ID
-			existing.TidalID = id.Value
+			existing.URI = uri
 			existing.Rating = rating
 			c.dbc.Save(&existing)
 		}
 	case specid.Album:
 		if rating == 0 {
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.AlbumRating{})
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.AlbumRating{})
 		} else {
 			var existing db.AlbumRating
-			c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).First(&existing)
+			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&existing)
 			existing.UserID = user.ID
-			existing.TidalID = id.Value
+			existing.URI = uri
 			existing.Rating = rating
 			c.dbc.Save(&existing)
 		}
@@ -523,7 +530,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	
 	trackIDs := make([]int, len(trackStars))
 	for i, s := range trackStars {
-		trackIDs[i] = s.TidalID
+		trackIDs[i] = extractIDFromURI(s.URI)
 	}
 	tracks := c.batchFetchTracks(r, trackIDs)
 
@@ -536,7 +543,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&albumStars)
 	albumIDs := make([]int, len(albumStars))
 	for i, s := range albumStars {
-		albumIDs[i] = s.TidalID
+		albumIDs[i] = extractIDFromURI(s.URI)
 	}
 	results.Albums = c.batchFetchAlbums(r, albumIDs)
 
@@ -545,7 +552,7 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&artistStars)
 	artistIDs := make([]int, len(artistStars))
 	for i, s := range artistStars {
-		artistIDs[i] = s.TidalID
+		artistIDs[i] = extractIDFromURI(s.URI)
 	}
 	results.Artists = c.batchFetchArtists(r, artistIDs)
 

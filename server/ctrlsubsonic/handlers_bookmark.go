@@ -16,9 +16,10 @@ func (c *Controller) ServeGetBookmarks(r *http.Request) *spec.Response {
 	var bookmarks []db.Bookmark
 	c.dbc.Where("user_id=?", user.ID).Order("updated_at DESC").Find(&bookmarks)
 
+	// Extract IDs from URIs for fetching track metadata
 	tidalIDs := make([]int, len(bookmarks))
 	for i, bm := range bookmarks {
-		tidalIDs[i] = bm.TidalID
+		tidalIDs[i] = extractIDFromURI(bm.URI)
 	}
 	tracks := c.batchFetchTracks(r, tidalIDs)
 
@@ -49,16 +50,17 @@ func (c *Controller) ServeCreateBookmark(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Track {
+	if err != nil || id.Type() != specid.Track {
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
 
 	position := p.GetOrInt("position", 0)
 	comment := p.GetOr("comment", "")
+	uri := id.String()
 
-	c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).
+	c.dbc.Where("user_id=? AND uri=?", user.ID, uri).
 		Assign(db.Bookmark{Position: position, Comment: comment, UpdatedAt: time.Now()}).
-		FirstOrCreate(&db.Bookmark{UserID: user.ID, TidalID: id.Value})
+		FirstOrCreate(&db.Bookmark{UserID: user.ID, URI: uri, Provider: "tidal"})
 
 	return spec.NewResponse()
 }
@@ -68,11 +70,12 @@ func (c *Controller) ServeDeleteBookmark(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Track {
+	if err != nil || id.Type() != specid.Track {
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
 
-	c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).Delete(&db.Bookmark{})
+	uri := id.String()
+	c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.Bookmark{})
 
 	return spec.NewResponse()
 }

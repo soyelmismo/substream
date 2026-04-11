@@ -29,14 +29,14 @@ func (c *Controller) ServeDownload(w http.ResponseWriter, r *http.Request) *spec
 	user := r.Context().Value(CtxUser).(*db.User)
 
 	// Determine what type of entity we're downloading
-	switch id.Type {
+	switch id.Type() {
 	case specid.Album:
-		return c.serveAlbumDownload(w, r, id.Value, user)
+		return c.serveAlbumDownload(w, r, id.Value(), user)
 	case specid.Playlist:
-		return c.servePlaylistDownload(w, r, id.Value, user)
+		return c.servePlaylistDownload(w, r, id.Value(), user)
 	case specid.Track:
 		// For single tracks, download with proper filename
-		return c.serveTrackDownload(w, r, id.Value, user)
+		return c.serveTrackDownload(w, r, id.Value(), user)
 	default:
 		return spec.NewError(10, "unsupported id type for download")
 	}

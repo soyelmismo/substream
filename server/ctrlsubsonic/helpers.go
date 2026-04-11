@@ -3,7 +3,10 @@ package ctrlsubsonic
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,10 +63,10 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 	var tracks []*spec.TrackChild
 	for i, t := range ordered {
 		if t != nil {
-			tid := tidalIDs[i]
 			c.applyTrackStar(user.ID, t)
 			c.applyTrackPlayCount(user.ID, t)
-			t.UserRating = c.getTrackRating(user.ID, tid)
+			uri := fmt.Sprintf("td:tr:%d", tidalIDs[i])
+			t.UserRating = c.getTrackRating(user.ID, uri)
 			tracks = append(tracks, t)
 		}
 	}
@@ -114,9 +117,9 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 	var albums []*spec.Album
 	for i, a := range ordered {
 		if a != nil {
-			tid := tidalIDs[i]
 			c.applyAlbumStar(user.ID, a)
-			a.UserRating = c.getAlbumRating(user.ID, tid)
+			uri := fmt.Sprintf("td:al:%d", tidalIDs[i])
+			a.UserRating = c.getAlbumRating(user.ID, uri)
 			albums = append(albums, a)
 		}
 	}
@@ -171,9 +174,10 @@ func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs [
 }
 
 // getTrackPlayCount returns the play count for a track from local DB
-func (c *Controller) getTrackPlayCount(userID, tidalID int) int {
+// Note: Now accepts URI string instead of numeric tidalID
+func (c *Controller) getTrackPlayCount(userID int, uri string) int {
 	var play db.Play
-	if c.dbc.Where("user_id=? AND tidal_id=?", userID, tidalID).First(&play).Error == nil {
+	if c.dbc.Where("user_id=? AND uri=?", userID, uri).First(&play).Error == nil {
 		return play.Count
 	}
 	return 0
@@ -266,4 +270,45 @@ func scrobbleTrackFromTidal(t *tidalproxy.TidalTrack) scrobble.Track {
 		TrackNumber: uint(t.TrackNumber),
 		Duration:    time.Duration(t.Duration) * time.Second,
 	}
+}
+
+// parseURIList parses a JSON array string of URIs
+func parseURIList(jsonStr string) []string {
+	var uris []string
+	_ = json.Unmarshal([]byte(jsonStr), &uris)
+	return uris
+}
+
+// encodeURIs encodes a slice of URIs to JSON
+func encodeURIs(uris []string) string {
+	if len(uris) == 0 {
+		return "[]"
+	}
+	data, _ := json.Marshal(uris)
+	return string(data)
+}
+
+// extractIDsFromURIs extracts numeric IDs from a slice of URIs (e.g., ["td:tr:123"] -> [123])
+func extractIDsFromURIs(uris []string) []int {
+	ids := make([]int, 0, len(uris))
+	for _, uri := range uris {
+		id := extractIDFromURI(uri)
+		if id > 0 {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// extractIDFromURI extracts the numeric ID from a URI string (e.g., "td:tr:12345" -> 12345)
+func extractIDFromURI(uri string) int {
+	if uri == "" {
+		return 0
+	}
+	parts := strings.Split(uri, ":")
+	if len(parts) >= 3 {
+		id, _ := strconv.Atoi(parts[2])
+		return id
+	}
+	return 0
 }

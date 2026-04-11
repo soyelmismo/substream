@@ -46,7 +46,7 @@ func (c *Controller) ServeGetRandomSongs(r *http.Request) *spec.Response {
 	c.dbc.Where("user_id=?", user.ID).Order("RANDOM()").Limit(favSize).Find(&stars)
 
 	for _, s := range stars {
-		tidalIDs = appendUnique(tidalIDs, s.TidalID)
+		tidalIDs = appendUnique(tidalIDs, extractIDFromURI(s.URI))
 	}
 
 	// 2. Get some from Discovery (Tidal Top Tracks)
@@ -221,13 +221,13 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 	}
 
 	var trackID int
-	switch id.Type {
+	switch id.Type() {
 	case specid.Track:
-		trackID = id.Value
+		trackID = id.Value()
 	case specid.Artist:
 		// fast timeout for artist
 		ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
-		page, err := c.proxy.GetArtistAlbums(ctx, id.Value, false)
+		page, err := c.proxy.GetArtistAlbums(ctx, id.Value(), false)
 		cancel()
 		if err != nil || page == nil || len(page.Tracks) == 0 {
 			return c.ServeGetRandomSongs(r)
@@ -271,23 +271,24 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 	}
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Track {
+	if err != nil || id.Type() != specid.Track {
 		// Only works with tracks - fallback to random songs
 		return c.ServeGetRandomSongs(r)
 	}
+	trackID := id.Value()
 
 	// Try recommendations with short timeout
 	ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
-	recs, err := c.proxy.GetRecommendations(ctx, id.Value)
+	recs, err := c.proxy.GetRecommendations(ctx, trackID)
 	cancel()
 
 	// If failed or empty, fallback to random songs quickly
 	if err != nil {
-		log.Printf("[DISC] GetRecommendations ERROR for track %d: %v", id.Value, err)
+		log.Printf("[DISC] GetRecommendations ERROR for track %d: %v", trackID, err)
 		return c.ServeGetRandomSongs(r)
 	}
 	if len(recs) == 0 {
-		log.Printf("[DISC] GetRecommendations EMPTY for track %d", id.Value)
+		log.Printf("[DISC] GetRecommendations EMPTY for track %d", trackID)
 		return c.ServeGetRandomSongs(r)
 	}
 

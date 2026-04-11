@@ -17,16 +17,16 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 		artistName = t.Artists[0].Name
 	}
 
-	trackID := &specid.ID{Type: specid.Track, Value: t.ID}
-	albumID := &specid.ID{Type: specid.Album, Value: t.Album.ID}
-	artistID := &specid.ID{Type: specid.Artist, Value: t.Artist.ID}
+	trackID := &specid.ID{URI: fmt.Sprintf("td:tr:%d", t.ID)}
+	albumID := &specid.ID{URI: fmt.Sprintf("td:al:%d", t.Album.ID)}
+	artistID := &specid.ID{URI: fmt.Sprintf("td:ar:%d", t.Artist.ID)}
 	
 	// Use track ID as fallback for cover if album ID is invalid
 	coverIDValue := t.Album.ID
 	if coverIDValue == 0 {
 		coverIDValue = t.ID
 	}
-	coverID := &specid.ID{Type: specid.Album, Value: coverIDValue}
+	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", coverIDValue)}
 
 	tc := &TrackChild{
 		ID:          trackID,
@@ -62,7 +62,7 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 		tc.Artists = make([]*ArtistRef, len(t.Artists))
 		names := make([]string, len(t.Artists))
 		for i, a := range t.Artists {
-			id := &specid.ID{Type: specid.Artist, Value: a.ID}
+			id := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
 			tc.Artists[i] = &ArtistRef{ID: id, Name: a.Name}
 			names[i] = a.Name
 		}
@@ -74,18 +74,18 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 
 // NewAlbumFromTidal converts a Tidal album to Subsonic Album
 func NewAlbumFromTidal(a *tidalproxy.TidalAlbum) *Album {
-	albumID := &specid.ID{Type: specid.Album, Value: a.ID}
-	coverID := &specid.ID{Type: specid.Album, Value: a.ID}
+	albumID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
+	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
 
 	artistName := ""
 	var artistID *specid.ID
 	var artistRefs []*ArtistRef
 	if len(a.Artists) > 0 {
 		artistName = a.Artists[0].Name
-		artistID = &specid.ID{Type: specid.Artist, Value: a.Artists[0].ID}
+		artistID = &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.Artists[0].ID)}
 		artistRefs = make([]*ArtistRef, len(a.Artists))
 		for i, ar := range a.Artists {
-			id := &specid.ID{Type: specid.Artist, Value: ar.ID}
+			id := &specid.ID{URI: fmt.Sprintf("td:ar:%d", ar.ID)}
 			artistRefs[i] = &ArtistRef{ID: id, Name: ar.Name}
 		}
 	}
@@ -111,8 +111,8 @@ func NewAlbumFromTidal(a *tidalproxy.TidalAlbum) *Album {
 
 // NewArtistFromTidal converts a Tidal artist to Subsonic Artist
 func NewArtistFromTidal(a *tidalproxy.TidalArtist) *Artist {
-	id := &specid.ID{Type: specid.Artist, Value: a.ID}
-	coverID := &specid.ID{Type: specid.Artist, Value: a.ID}
+	id := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
+	coverID := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
 
 	return &Artist{
 		ID:      id,

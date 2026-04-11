@@ -1,6 +1,7 @@
 package ctrlsubsonic
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -75,9 +76,11 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type != specid.Track {
+	if err != nil || id.Type() != specid.Track {
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
+	uri := id.String()
+	trackID := id.Value()
 
 	submissionStr, _ := p.Get("submission")
 	isSubmission := true
@@ -85,35 +88,37 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 		isSubmission = false
 	}
 
-	log.Printf("[SCROBBLE] track=%d user=%s submission=%s isSubmission=%v", id.Value, user.Name, submissionStr, isSubmission)
+	log.Printf("[SCROBBLE] track=%s user=%s submission=%s isSubmission=%v", uri, user.Name, submissionStr, isSubmission)
 
 	if isSubmission {
 		// record play in local DB
 		var play db.Play
-		c.dbc.Where("user_id=? AND tidal_id=?", user.ID, id.Value).First(&play)
+		c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&play)
 		oldCount := play.Count
 		if play.ID == 0 {
 			play.UserID = user.ID
-			play.TidalID = id.Value
+			play.URI = uri
+			play.Provider = "tidal"
 			play.PlayedAt = time.Now()
 			play.Count = 1
-			log.Printf("[SCROBBLE] NEW play record for track=%d user=%s count=1", id.Value, user.Name)
+			log.Printf("[SCROBBLE] NEW play record for track=%s user=%s count=1", uri, user.Name)
 		} else {
 			play.Count++
 			play.PlayedAt = time.Now()
-			log.Printf("[SCROBBLE] UPDATED play record for track=%d user=%s count=%d (was %d)", id.Value, user.Name, play.Count, oldCount)
+			log.Printf("[SCROBBLE] UPDATED play record for track=%s user=%s count=%d (was %d)", uri, user.Name, play.Count, oldCount)
 		}
 		if err := c.dbc.Save(&play).Error; err != nil {
 			log.Printf("[SCROBBLE] ERROR saving play record: %v", err)
 		} else {
-			log.Printf("[SCROBBLE] SAVED play record for track=%d count=%d", id.Value, play.Count)
+			log.Printf("[SCROBBLE] SAVED play record for track=%s count=%d", uri, play.Count)
 		}
 
 		// Update album play stats if album is favorited
-		track, _ := c.proxy.GetTrackInfo(r.Context(), id.Value)
+		track, _ := c.proxy.GetTrackInfo(r.Context(), trackID)
 		if track != nil && track.Album.ID != 0 {
 			var albumStar db.AlbumStar
-			if c.dbc.Where("user_id=? AND tidal_id=?", user.ID, track.Album.ID).First(&albumStar).Error == nil {
+			albumURI := fmt.Sprintf("td:al:%d", track.Album.ID)
+			if c.dbc.Where("user_id=? AND uri=?", user.ID, albumURI).First(&albumStar).Error == nil {
 				albumStar.LastPlayed = time.Now()
 				albumStar.PlayCount++
 				c.dbc.Save(&albumStar)
@@ -123,7 +128,7 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 	}
 
 	// fetch track info for scrobbling (fire and forget if fails)
-	track, err := c.proxy.GetTrackInfo(r.Context(), id.Value)
+	track, err := c.proxy.GetTrackInfo(r.Context(), trackID)
 	if err == nil && track != nil {
 		for _, s := range c.scrobblers {
 			if s.IsUserAuthenticated(*user) {
@@ -151,13 +156,13 @@ func (c *Controller) ServeGetPlayQueue(r *http.Request) *spec.Response {
 		ChangedBy: queue.ChangedBy,
 	}
 
-	if queue.Current > 0 {
-		currentID := &specid.ID{Type: specid.Track, Value: queue.Current}
-		sub.PlayQueue.Current = currentID
+	if queue.CurrentURI != "" {
+		sub.PlayQueue.Current = &specid.ID{URI: queue.CurrentURI}
 	}
 
-	// parse items JSON and batch-fetch metadata
-	tidalIDs := parseTidalIDs(queue.Items)
+	// parse items JSON (now URIs) and batch-fetch metadata
+	itemURIs := parseURIList(queue.Items)
+	tidalIDs := extractIDsFromURIs(itemURIs)
 	sub.PlayQueue.List = c.batchFetchTracks(r, tidalIDs)
 
 	return sub
@@ -168,17 +173,17 @@ func (c *Controller) ServeSavePlayQueue(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	ids, _ := p.GetIDList("id")
-	var tidalIDs []int
+	var itemURIs []string
 	for _, id := range ids {
-		if id.Type == specid.Track {
-			tidalIDs = append(tidalIDs, id.Value)
+		if id.Type() == specid.Track {
+			itemURIs = append(itemURIs, id.String())
 		}
 	}
 
 	current, err := p.GetID("current")
-	var currentIDVal int
-	if err == nil && current.Type == specid.Track {
-		currentIDVal = current.Value
+	var currentURI string
+	if err == nil && current.Type() == specid.Track {
+		currentURI = current.String()
 	}
 
 	position := p.GetOrInt("position", 0)
@@ -187,10 +192,10 @@ func (c *Controller) ServeSavePlayQueue(r *http.Request) *spec.Response {
 	var queue db.PlayQueue
 	c.dbc.Where("user_id=?", user.ID).First(&queue)
 	queue.UserID = user.ID
-	queue.Current = currentIDVal
+	queue.CurrentURI = currentURI
 	queue.Position = position
 	queue.ChangedBy = client
-	queue.Items = encodeTidalIDs(tidalIDs)
+	queue.Items = encodeURIs(itemURIs)
 	queue.UpdatedAt = time.Now()
 	c.dbc.Save(&queue)
 
