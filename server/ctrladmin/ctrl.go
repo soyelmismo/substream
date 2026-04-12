@@ -377,7 +377,6 @@ var (
 	errValiNoUsername        = errors.New("please enter a username")
 	errValiPasswordAllFields = errors.New("please enter the password twice")
 	errValiPasswordsNotSame  = errors.New("passwords entered were not the same")
-	errValiKeysAllFields     = errors.New("please enter the api key and secret")
 )
 
 func validateUsername(username string) error {
@@ -393,13 +392,6 @@ func validatePasswords(pOne, pTwo string) error {
 	}
 	if !(pOne == pTwo) {
 		return errValiPasswordsNotSame
-	}
-	return nil
-}
-
-func validateAPIKey(apiKey, secret string) error {
-	if apiKey == "" || secret == "" {
-		return errValiKeysAllFields
 	}
 	return nil
 }

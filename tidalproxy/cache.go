@@ -275,20 +275,24 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error) {
 	key := fmt.Sprintf("td:al:%d", albumID)
 
-	checkCache := func(data []byte) *TidalAlbum {
+	checkCache := func(data []byte) (*TidalAlbum, bool) {
 		var a TidalAlbum
-		if err := json.Unmarshal(data, &a); err == nil {
-			// Require items for GetAlbumInfo
-			if len(a.Items) > 0 || a.NumberOfTracks == 0 {
-				return &a
-			}
+		if err := json.Unmarshal(data, &a); err != nil {
+			return nil, true // Corrupt data
 		}
-		return nil
+		// Require items for GetAlbumInfo
+		if len(a.Items) > 0 || a.NumberOfTracks == 0 {
+			return &a, false
+		}
+		return nil, false // Valid but incomplete (not corrupt)
 	}
 
 	// 1. Check in-memory LRU cache
 	if cached := c.albums.Get(key); cached != nil {
-		if a := checkCache(cached); a != nil {
+		if a, corrupt := checkCache(cached); corrupt {
+			c.albums.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt album data in LRU key=%s", key)
+		} else if a != nil {
 			return a, nil
 		}
 	}
@@ -297,7 +301,10 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 	c.pendingMu.Lock()
 	if data, ok := c.pending[key]; ok {
 		c.pendingMu.Unlock()
-		if a := checkCache(data); a != nil {
+		if a, corrupt := checkCache(data); corrupt {
+			c.albums.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt album in pending buffer key=%s", key)
+		} else if a != nil {
 			return a, nil
 		}
 	} else {
@@ -307,7 +314,10 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 	// 2. Check SQLite persistent cache (if db available)
 	if c.db != nil {
 		if cached := c.db.GetCachedMetadata(key); cached != nil {
-			if a := checkCache(cached); a != nil {
+			if a, corrupt := checkCache(cached); corrupt {
+				c.albums.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt album in SQLite key=%s", key)
+			} else if a != nil {
 				c.albums.Set(key, cached, 0) // Warm LRU cache
 				return a, nil
 			}
@@ -331,6 +341,9 @@ func (c *CachedProxy) GetAlbumMetadata(ctx context.Context, albumID int) (*Tidal
 		var a TidalAlbum
 		if err := json.Unmarshal(cached, &a); err == nil {
 			return &a, nil
+		} else {
+			c.albums.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt album metadata in LRU key=%s: %v", key, err)
 		}
 	}
 
@@ -340,6 +353,9 @@ func (c *CachedProxy) GetAlbumMetadata(ctx context.Context, albumID int) (*Tidal
 		var a TidalAlbum
 		if err := json.Unmarshal(data, &a); err == nil {
 			return &a, nil
+		} else {
+			c.albums.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt album metadata in pending key=%s: %v", key, err)
 		}
 	} else {
 		c.pendingMu.Unlock()
@@ -351,6 +367,9 @@ func (c *CachedProxy) GetAlbumMetadata(ctx context.Context, albumID int) (*Tidal
 			if err := json.Unmarshal(cached, &a); err == nil {
 				c.albums.Set(key, cached, 0)
 				return &a, nil
+			} else {
+				c.albums.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt album metadata in SQLite key=%s: %v", key, err)
 			}
 		}
 	}
@@ -386,6 +405,9 @@ func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) ma
 					result[id] = &a
 					continue
 				}
+			} else {
+				c.albums.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt album in batch LRU key=%s: %v", key, err)
 			}
 		}
 		missingIDs = append(missingIDs, id)
@@ -419,6 +441,9 @@ func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) ma
 							foundIDs[id] = struct{}{}
 						}
 					}
+				} else {
+					c.albums.MarkCorrupt()
+					log.Printf("[CACHE ANOMALY] corrupt album in batch SQLite key=%s: %v", key, err)
 				}
 			}
 
@@ -472,6 +497,9 @@ func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalAr
 		var a TidalArtistDetail
 		if err := json.Unmarshal(cached, &a); err == nil {
 			return &a, nil
+		} else {
+			c.artists.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt artist data in LRU key=%s: %v", key, err)
 		}
 	}
 
@@ -482,9 +510,13 @@ func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalAr
 		var a TidalArtistDetail
 		if err := json.Unmarshal(data, &a); err == nil {
 			return &a, nil
+		} else {
+			c.artists.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt artist in pending buffer key=%s: %v", key, err)
 		}
+	} else {
+		c.pendingMu.Unlock()
 	}
-	c.pendingMu.Unlock()
 
 	// 2. Check SQLite persistent cache (if db available)
 	if c.db != nil {
@@ -493,6 +525,9 @@ func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalAr
 			if err := json.Unmarshal(cached, &a); err == nil {
 				c.artists.Set(key, cached, 0) // Warm LRU cache
 				return &a, nil
+			} else {
+				c.artists.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt artist in SQLite key=%s: %v", key, err)
 			}
 		}
 	}
@@ -577,6 +612,9 @@ func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTra
 		var p TidalArtistPage
 		if err := json.Unmarshal(cached, &p); err == nil {
 			return &p, nil
+		} else {
+			c.artistAlbums.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt artist albums in LRU key=%s: %v", key, err)
 		}
 	}
 
@@ -587,9 +625,13 @@ func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTra
 		var p TidalArtistPage
 		if err := json.Unmarshal(data, &p); err == nil {
 			return &p, nil
+		} else {
+			c.artistAlbums.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt artist albums in pending key=%s: %v", key, err)
 		}
+	} else {
+		c.pendingMu.Unlock()
 	}
-	c.pendingMu.Unlock()
 
 	// 3. Check SQLite
 	if c.db != nil {
@@ -598,6 +640,9 @@ func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTra
 			if err := json.Unmarshal(cached, &p); err == nil {
 				c.artistAlbums.Set(key, cached, 0)
 				return &p, nil
+			} else {
+				c.artistAlbums.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt artist albums in SQLite key=%s: %v", key, err)
 			}
 		}
 	}
@@ -638,6 +683,9 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 		var t []TidalTrack
 		if err := json.Unmarshal(cached, &t); err == nil {
 			return t, nil
+		} else {
+			c.artistTopTracks.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt top tracks in LRU key=%s: %v", key, err)
 		}
 	}
 
@@ -648,9 +696,13 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 		var t []TidalTrack
 		if err := json.Unmarshal(data, &t); err == nil {
 			return t, nil
+		} else {
+			c.artistTopTracks.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt top tracks in pending key=%s: %v", key, err)
 		}
+	} else {
+		c.pendingMu.Unlock()
 	}
-	c.pendingMu.Unlock()
 
 	// 3. Check SQLite
 	if c.db != nil {
@@ -659,6 +711,9 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 			if err := json.Unmarshal(cached, &t); err == nil {
 				c.artistTopTracks.Set(key, cached, 0)
 				return t, nil
+			} else {
+				c.artistTopTracks.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt top tracks in SQLite key=%s: %v", key, err)
 			}
 		}
 	}
@@ -691,6 +746,9 @@ func (c *CachedProxy) GetSimilarArtists(ctx context.Context, artistID int) ([]Ti
 		var a []TidalArtist
 		if err := json.Unmarshal(cached, &a); err == nil {
 			return a, nil
+		} else {
+			c.similarArtists.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt similar artists in LRU key=%s: %v", key, err)
 		}
 	}
 
@@ -701,9 +759,13 @@ func (c *CachedProxy) GetSimilarArtists(ctx context.Context, artistID int) ([]Ti
 		var a []TidalArtist
 		if err := json.Unmarshal(data, &a); err == nil {
 			return a, nil
+		} else {
+			c.similarArtists.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt similar artists in pending key=%s: %v", key, err)
 		}
+	} else {
+		c.pendingMu.Unlock()
 	}
-	c.pendingMu.Unlock()
 
 	// 3. Check SQLite
 	if c.db != nil {
@@ -712,6 +774,9 @@ func (c *CachedProxy) GetSimilarArtists(ctx context.Context, artistID int) ([]Ti
 			if err := json.Unmarshal(cached, &a); err == nil {
 				c.similarArtists.Set(key, cached, 0)
 				return a, nil
+			} else {
+				c.similarArtists.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt similar artists in SQLite key=%s: %v", key, err)
 			}
 		}
 	}
