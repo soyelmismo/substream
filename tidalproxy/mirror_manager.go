@@ -457,9 +457,9 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 		return
 	}
 
-	// Success - verify HTTP status is actually OK
-	if resp.StatusCode != http.StatusOK {
-		// Health check returned non-200, treat as failure
+	// Success - verify HTTP status is in 2xx range
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Health check returned non-2xx, treat as failure
 		m.lastHealthCheckFail.Store(time.Now().Unix())
 		m.consecutiveSuccess.Store(0) // Reset consecutive success counter
 		if m.GetState() == StateHealthy {
