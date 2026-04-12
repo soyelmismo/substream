@@ -20,13 +20,14 @@ import (
 
 // streamRequest bundle for unified stream preparation
 type streamRequest struct {
-	Quality   string
-	ClientIP  string
-	StreamURL string
-	Track     *tidalproxy.TidalTrack
-	Ext       string
-	IsHLS     bool
-	IsDASH    bool
+	Quality    string
+	ClientIP   string
+	StreamURL  string
+	Track      *tidalproxy.TidalTrack
+	Ext        string
+	IsHLS      bool
+	IsDASH     bool
+	ClientName string // for client-specific handling (e.g., tempus, symfonium)
 }
 
 // batchFetch is a generic concurrent fetcher with rate limiting and order preservation.
@@ -146,6 +147,9 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 	}
 	clientIP = strings.Trim(clientIP, "[]")
 
+	// 2a. Client name (for client-specific handling)
+	clientName := p.GetOr("c", "")
+
 	// 3 & 4. Fetch Stream URL and Track Info concurrently
 	var url string
 	var track *tidalproxy.TidalTrack
@@ -214,13 +218,14 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 	}
 
 	return &streamRequest{
-		Quality:   quality,
-		ClientIP:  clientIP,
-		StreamURL: url,
-		Track:     track,
-		Ext:       ext,
-		IsHLS:     isHLS,
-		IsDASH:    isDASH,
+		Quality:    quality,
+		ClientIP:   clientIP,
+		StreamURL:  url,
+		Track:      track,
+		Ext:        ext,
+		IsHLS:      isHLS,
+		IsDASH:     isDASH,
+		ClientName: clientName,
 	}, nil
 }
 

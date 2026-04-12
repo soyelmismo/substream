@@ -18,6 +18,12 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
 
+// needsForcedProxy returns true for clients that require proxy mode for proper seeking
+func needsForcedProxy(clientName string) bool {
+	lower := strings.ToLower(clientName)
+	return lower == "tempus" || lower == "symfonium"
+}
+
 func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 	id, err := p.GetID("id")
@@ -39,18 +45,22 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	c.dbc.Exec(`INSERT INTO plays (user_id, uri, provider, played_at, count) VALUES (?, ?, 'tidal', ?, 1) ON CONFLICT(user_id, uri) DO UPDATE SET count=count+1, played_at=?`,
 		user.ID, trackURI, time.Now(), time.Now())
 
-	// 2. Redirect if not proxying
+	// 2. Redirect if not proxying (force proxy for certain Android clients that can't seek with redirects)
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
-	if proxyStreams != "true" && !prep.IsHLS && !prep.IsDASH {
+	if proxyStreams != "true" && !prep.IsHLS && !prep.IsDASH && !needsForcedProxy(prep.ClientName) {
 		http.Redirect(w, r, prep.StreamURL, http.StatusFound)
 		return nil
 	}
 
 	// 3. Proxy stream
 	contentType := "audio/flac"
-	if prep.Ext == "m4a" { contentType = "audio/mp4" }
+	if prep.Ext == "m4a" {
+		contentType = "audio/mp4"
+	}
 	w.Header().Set("Content-Type", contentType)
-	if !prep.IsHLS && !prep.IsDASH { w.Header().Set("Accept-Ranges", "bytes") }
+	if !prep.IsHLS && !prep.IsDASH {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
 	if strings.Contains(r.URL.Path, "download") {
 		cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s.%s", prep.Track.Artist.Name, prep.Track.Title, prep.Ext), "/", "_")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName))
@@ -62,7 +72,9 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		err = c.downloadAndStitchDASH(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track)
 	} else {
 		req, _ := http.NewRequestWithContext(r.Context(), "GET", prep.StreamURL, nil)
-		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" { req.Header.Set("Range", rangeHdr) }
+		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+			req.Header.Set("Range", rangeHdr)
+		}
 		req.Header.Set("X-Forwarded-For", prep.ClientIP)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -70,7 +82,9 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			return nil
 		}
 		defer resp.Body.Close()
-		for k, v := range resp.Header { w.Header()[k] = v }
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, err = io.Copy(w, resp.Body)
 	}
@@ -87,7 +101,6 @@ func (c *Controller) getCachedSetting(key, defaultVal string) string {
 	c.settingsCache.Set(key, val, 5*time.Second)
 	return val
 }
-
 
 func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
