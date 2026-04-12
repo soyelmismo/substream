@@ -11,6 +11,7 @@
     <div class="font-medium text-gray-500 max-w-[700px]">if you are logging in as an admin, the default credentials can be found in the readme</div>
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
         <form class="flex flex-col md:flex-row gap-2 items-end" action="{{ path "/admin/login_do" }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
             <input class="text-center" type="text" id="username" name="username" placeholder="username">
             <input class="text-center" type="password" id="password" name="password" placeholder="password">
             <input type="submit" value="login">

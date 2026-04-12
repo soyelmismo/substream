@@ -11,8 +11,14 @@
     <hr class="bg-gray-900/30 my-1" />
     <div class="font-medium text-gray-500 max-w-[700px]">are you sure? this will also delete their plays, playlists, starred, rated, etc.</div>
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
-        <form class="inline-block" action="{{ printf "/admin/delete_user_do?user=%s" .SelectedUser.Name | path }}" method="post">
-            <input type="submit" value="yes">
+        <form class="flex flex-col gap-2 items-end" action="{{ printf "/admin/delete_user_do?user=%s" (.SelectedUser.Name | urlquery) | path }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+            <input type="password" name="current_password" placeholder="your current password" required>
+            <input type="text" name="confirmation" placeholder="type DELETE to confirm" required pattern="DELETE" title="Type DELETE in uppercase">
+            <div class="flex gap-2 mt-2">
+                <a href="{{ path "/admin/home" }}" class="text-gray-500 px-3 py-1">cancel</a>
+                <input type="submit" value="delete user" class="bg-red-500 hover:bg-red-600 text-white">
+            </div>
         </form>
     </div>
 </div>

@@ -57,6 +57,12 @@ func (db *DB) UserCount() int64 {
 	return count
 }
 
+func (db *DB) AdminCount() int64 {
+	var count int64
+	db.Model(&User{}).Where("is_admin = ?", true).Count(&count)
+	return count
+}
+
 func (db *DB) GetProxies() ([]*ProxyInstance, error) {
 	var proxies []*ProxyInstance
 	err := db.Order("created_at DESC").Find(&proxies).Error

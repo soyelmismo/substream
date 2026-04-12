@@ -10,8 +10,10 @@
     </div>
     <hr class="bg-gray-900/30 my-1" />
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
-        <form class="flex flex-col md:flex-row gap-2 items-end" action="{{ printf "/admin/change_username_do?user=%s" .SelectedUser.Name | path }}" method="post">
-            <input type="text" id="username" name="username" placeholder="new username">
+        <form class="flex flex-col md:flex-row gap-2 items-end" action="{{ printf "/admin/change_username_do?user=%s" (.SelectedUser.Name | urlquery) | path }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+            <input type="password" id="current_password" name="current_password" placeholder="current password" required>
+            <input type="text" id="username" name="username" placeholder="new username" required pattern="^[a-zA-Z0-9._-]+$" maxlength="64">
             <input type="submit" value="change">
         </form>
     </div>

@@ -22,9 +22,106 @@ type segmentInfo struct {
 	duration float64 // in seconds
 }
 
+// fixMp4Durations traverses the MP4 box hierarchy and writes the correct total
+// duration into mvhd and mdhd boxes. For fMP4 streams from Tidal, these boxes
+// have duration=0 (unknown), which causes Psysonic to treat EVERY seek as
+// "beyond end" and enter a buggy code path that panics with frac >= 1.0.
+//
+// We also ensure the written duration is never an exact multiple of the
+// timescale, preventing a secondary bug where frac == 0.0 triggers the same
+// panic via an arithmetic sign error in Psysonic's seek-end adjustment.
+//
+// Box layouts (version 0):
+//   [size:4][name:4][ver:1][flags:3][ctime:4][mtime:4][timescale:4][duration:4]
+//   offsets from box start: timescale=20, duration=24
+// Box layouts (version 1):
+//   [size:4][name:4][ver:1][flags:3][ctime:8][mtime:8][timescale:4][duration:8]
+//   offsets from box start: timescale=28, duration=32
+func fixMp4Durations(data []byte, totalDurationSecs float64) {
+	i := 0
+	for i+8 <= len(data) {
+		size := int(binary.BigEndian.Uint32(data[i : i+4]))
+		if size < 8 {
+			break
+		}
+		if i+size > len(data) {
+			break
+		}
+		name := string(data[i+4 : i+8])
+
+		if name == "moov" || name == "trak" || name == "mdia" {
+			i += 8
+			continue
+		}
+
+		if name == "mvhd" || name == "mdhd" {
+			version := data[i+8]
+			if version == 0 && i+28 <= len(data) {
+				ts := binary.BigEndian.Uint32(data[i+20 : i+24])
+				if ts > 0 {
+					dur := uint32(totalDurationSecs*float64(ts)) + 1 // +1 ensures frac != 0.0
+					binary.BigEndian.PutUint32(data[i+24:i+28], dur)
+				}
+			} else if version == 1 && i+40 <= len(data) {
+				ts := binary.BigEndian.Uint32(data[i+28 : i+32])
+				if ts > 0 {
+					dur := uint64(totalDurationSecs*float64(ts)) + 1
+					binary.BigEndian.PutUint64(data[i+32:i+40], dur)
+				}
+			}
+		}
+
+		i += size
+	}
+}
+
+// createFakeSidx builds an sidx box using the parsed HLS segments and a fake bitrate
+// This makes Android ExoPlayer believe the fragmented MP4 stream is seekable.
+func createFakeSidx(segments []segmentInfo, bytesPerSec int64, firstOffset uint32) []byte {
+	timescale := uint32(1000000)
+	refCount := len(segments)
+
+	// Size = 4 (length) + 4 (name) + 4 (version/flags) + 4 (refID) + 4 (timescale)
+	// + 4 (ept) + 4 (firstOffset) + 2 (reserved) + 2 (refCount) = 32 bytes header
+	// + refCount * 12 bytes per entry
+	boxSize := 32 + (refCount * 12)
+
+	buf := make([]byte, boxSize)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(boxSize))
+	copy(buf[4:8], []byte("sidx"))
+	buf[8] = 0 // version 0
+	buf[9], buf[10], buf[11] = 0, 0, 0 // flags
+	binary.BigEndian.PutUint32(buf[12:16], 1) // reference_ID
+	binary.BigEndian.PutUint32(buf[16:20], timescale)
+	binary.BigEndian.PutUint32(buf[20:24], 0) // earliest_presentation_time
+	binary.BigEndian.PutUint32(buf[24:28], firstOffset) // first_offset (relative to anchor)
+
+	// reserved = 0, reference_count
+	binary.BigEndian.PutUint16(buf[30:32], uint16(refCount))
+
+	offset := 32
+	for _, seg := range segments {
+		durFunc := uint32(seg.duration * float64(timescale))
+		sizeFunc := uint32(seg.duration * float64(bytesPerSec))
+
+		// reference_type = 0 (1 bit), referenced_size = sizeFunc (31 bits)
+		if sizeFunc > 0x7FFFFFFF {
+			sizeFunc = 0x7FFFFFFF
+		}
+		binary.BigEndian.PutUint32(buf[offset:offset+4], sizeFunc)
+		binary.BigEndian.PutUint32(buf[offset+4:offset+8], durFunc)
+		// starts_with_SAP (1 bit) = 1, SAP_type (3 bits) = 1, SAP_delta_time (28 bits) = 0
+		binary.BigEndian.PutUint32(buf[offset+8:offset+12], 0x90000000)
+
+		offset += 12
+	}
+
+	return buf
+}
+
 // downloadAndStitchHLS fetches an M3U8 manifest and streams all its segments to w
 // offsetSeconds allows time-based seeking (skip segments until offset)
-func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64) error {
+func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64, startByte int64, totalBytes int64) error {
 	// 1. Fetch the manifest
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
 	if err != nil {
@@ -110,7 +207,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 
 	if isMaster && variantURL != "" {
 		log.Printf("[DOWNLOAD] HLS Master detected, following variant: %s", variantURL)
-		return c.downloadAndStitchHLS(ctx, variantURL, w, clientIP, track, offsetSeconds)
+		return c.downloadAndStitchHLS(ctx, variantURL, w, clientIP, track, offsetSeconds, startByte, totalBytes)
 	}
 
 	// Calculate which segment to start from based on time offset
@@ -145,7 +242,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	const maxConcurrency = 6
 
 	flusher, canFlush := w.(http.Flusher)
-	tagger := &flacTagger{w: w, track: track}
+	tagger := &flacTagger{w: w, track: track, startByte: startByte, totalBytes: totalBytes}
 
 	type segmentResult struct {
 		index int
@@ -195,6 +292,39 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
 				}
 				log.Printf("[DOWNLOAD] fMP4 container detected, corrected Content-Type to audio/mp4")
+
+				// Inject fake sidx to force ExoPlayer to show seek bar
+				ftypLen := binary.BigEndian.Uint32(initData[0:4])
+				if ftypLen > 0 && ftypLen < uint32(len(initData)) && track != nil && track.Duration > 0 && startByte == 0 {
+					bps := int64(125000)
+					if totalBytes > 0 {
+						bps = totalBytes / int64(track.Duration)
+					}
+					
+					fixMp4Durations(initData, float64(track.Duration))
+					
+					firstOffset := uint32(len(initData)) - ftypLen
+					fakeSidx := createFakeSidx(segments, bps, firstOffset)
+					
+					newInitData := make([]byte, 0, len(initData)+len(fakeSidx))
+					newInitData = append(newInitData, initData[:ftypLen]...)
+					newInitData = append(newInitData, fakeSidx...)
+					newInitData = append(newInitData, initData[ftypLen:]...)
+					
+					initData = newInitData
+					if totalBytes > 0 {
+						totalBytes += int64(len(fakeSidx))
+					}
+					log.Printf("[DOWNLOAD] Injected simulated sidx index box (%d bytes) to support seeking", len(fakeSidx))
+				}
+			}
+			
+			if totalBytes > 0 {
+				rw.Header().Set("Accept-Ranges", "bytes")
+			}
+			if startByte > 0 && totalBytes > 0 {
+				rw.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startByte, totalBytes-1, totalBytes))
+				rw.WriteHeader(http.StatusPartialContent)
 			}
 		}
 
@@ -221,11 +351,25 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		if err != nil {
 			return fmt.Errorf("first segment %d failed: %w", startIdx, err)
 		}
-		// Try tagging if FLAC, then write
-		if err := tagger.process(bytes.NewReader(firstData), c); err != nil {
-			log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
+		if startByte > 0 {
+			if rw, ok := w.(http.ResponseWriter); ok {
+				rw.Header().Set("Content-Type", "audio/flac")
+				if totalBytes > 0 {
+					rw.Header().Set("Accept-Ranges", "bytes")
+					rw.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startByte, totalBytes-1, totalBytes))
+				}
+				rw.WriteHeader(http.StatusPartialContent)
+			}
 			if _, err := w.Write(firstData); err != nil {
 				return err
+			}
+		} else {
+			// Try tagging if FLAC, then write
+			if err := tagger.process(bytes.NewReader(firstData), c); err != nil {
+				log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
+				if _, err := w.Write(firstData); err != nil {
+					return err
+				}
 			}
 		}
 		if canFlush {
@@ -442,7 +586,7 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 	// Get flusher for low-latency streaming if writer supports it
 	flusher, canFlush := w.(http.Flusher)
 
-	tagger := &flacTagger{w: w, track: track}
+	tagger := &flacTagger{w: w, track: track, startByte: 0, totalBytes: 0}
 
 	type segmentResult struct {
 		index int
@@ -537,8 +681,10 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 }
 
 type flacTagger struct {
-	w     io.Writer
-	track *tidalproxy.TidalTrack
+	w          io.Writer
+	track      *tidalproxy.TidalTrack
+	startByte  int64
+	totalBytes int64
 }
 
 func (t *flacTagger) process(r io.Reader, c *Controller) error {
@@ -560,7 +706,17 @@ func (t *flacTagger) process(r io.Reader, c *Controller) error {
 			rw.Header().Set("Content-Type", "audio/mp4")
 			rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
 		}
-		rw.Header().Set("Transfer-Encoding", "chunked")
+		
+		if t.totalBytes > 0 {
+			rw.Header().Set("Accept-Ranges", "bytes")
+		} else {
+			rw.Header().Set("Transfer-Encoding", "chunked")
+		}
+
+		if t.startByte > 0 && t.totalBytes > 0 {
+			rw.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", t.startByte, t.totalBytes-1, t.totalBytes))
+			rw.WriteHeader(http.StatusPartialContent)
+		}
 	}
 
 	if !isFlac {

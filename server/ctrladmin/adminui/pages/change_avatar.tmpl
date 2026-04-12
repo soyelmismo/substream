@@ -12,12 +12,14 @@
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
         <div class="flex flex-col gap-2 items-end">
         {{ if ne (len .SelectedUser.Avatar) 0 }}
-            <img class="h-[8rem] w-[8rem] object-cover" src="data:image/jpg;base64,{{ .SelectedUser.Avatar | base64 }}" />
-            <form class="contents" action="{{ printf "/admin/delete_avatar_do?user=%s" .SelectedUser.Name | path }}" method="post">
+            <img class="h-[8rem] w-[8rem] object-cover" src="data:image/jpeg;base64,{{ .SelectedUser.Avatar | base64 }}" />
+            <form class="contents" action="{{ printf "/admin/delete_avatar_do?user=%s" (.SelectedUser.Name | urlquery) | path }}" method="post">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
                 <input type="submit" value="delete avatar">
             </form>
         {{ end }}
-        <form enctype="multipart/form-data" action="{{ printf "/admin/change_avatar_do?user=%s" .SelectedUser.Name | path }}" method="post">
+        <form enctype="multipart/form-data" action="{{ printf "/admin/change_avatar_do?user=%s" (.SelectedUser.Name | urlquery) | path }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
             <div class="relative pointer-events-auto">
                 <input class="auto-submit absolute opacity-0" name="avatar" type="file" accept="image/jpeg image/png image/gif"  />
                 <input type="button" value="choose file">

@@ -312,6 +312,7 @@ func MigrateFixBookmarks(db *gorm.DB) error {
 		return dropBookmarksTidalIDColumn(tx)
 	})
 }
+
 // migratePlayQueueTable handles the play_queues table with CurrentURI and Items as JSON array of URIs
 func migratePlayQueueTable(tx *gorm.DB) error {
 	// Add new columns
@@ -556,10 +557,55 @@ func MigrateCleanupOldCacheKeys(db *gorm.DB) error {
 	return nil
 }
 
+// MigrateSubsonicPassword populates subsonic_password for existing users
+// that have plaintext passwords stored in the password field (legacy)
+func MigrateSubsonicPassword(db *gorm.DB) error {
+	// Check if migration has already been run
+	var setting Setting
+	err := db.Where("key = ?", "subsonic_password_migration_completed").First(&setting).Error
+	if err == nil && setting.Value == "true" {
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Starting subsonic_password migration...")
+
+	// Find users with plaintext passwords (not bcrypt hashes) and empty subsonic_password
+	// Bcrypt hashes start with $2a$, $2b$, or $2y$
+	result := db.Exec(`
+		UPDATE users 
+		SET subsonic_password = password 
+		WHERE subsonic_password = '' 
+		  AND password NOT LIKE '$2a$%' 
+		  AND password NOT LIKE '$2b$%' 
+		  AND password NOT LIKE '$2y$%'
+	`)
+	if result.Error != nil {
+		log.Printf("[MIGRATION] Warning: could not migrate subsonic_password: %v", result.Error)
+		// Don't fail - this is not critical
+	} else {
+		log.Printf("[MIGRATION] Migrated %d users to subsonic_password", result.RowsAffected)
+	}
+
+	// Mark migration as completed
+	if err := db.Exec(`
+		INSERT INTO settings (key, value) VALUES ('subsonic_password_migration_completed', 'true')
+		ON CONFLICT(key) DO UPDATE SET value = 'true'
+	`).Error; err != nil {
+		log.Printf("[MIGRATION] Warning: could not mark migration complete: %v", err)
+	}
+
+	return nil
+}
+
 func (db *DB) Migrate() error {
 	// Run URN migration before AutoMigrate
 	if err := MigrateToURNs(db.DB); err != nil {
 		return fmt.Errorf("urn migration failed: %w", err)
+	}
+
+	// Run subsonic_password migration before AutoMigrate
+	if err := MigrateSubsonicPassword(db.DB); err != nil {
+		return fmt.Errorf("subsonic_password migration failed: %w", err)
 	}
 
 	// Run tidal_id column drop migration

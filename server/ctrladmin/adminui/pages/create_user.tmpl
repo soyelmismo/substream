@@ -9,11 +9,13 @@
         <span class="text-gray-900 font-bold">creating new user</span>
     </div>
     <hr class="bg-gray-900/30 my-1" />
+    <div class="font-medium text-gray-500 max-w-[700px]">create a new user account. password must be at least 8 characters.</div>
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
         <form class="flex flex-col gap-2 items-end" action="{{ path "/admin/create_user_do" }}" method="post">
-            <input type="text" id="username" name="username" placeholder="username" required>
-            <input type="password" id="password_one" name="password_one" placeholder="password" required>
-            <input type="password" id="password_two" name="password_two" placeholder="verify password" required>
+            <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+            <input type="text" id="username" name="username" placeholder="username" required pattern="^[a-zA-Z0-9._-]+$" maxlength="64" title="Letters, numbers, dots, hyphens, and underscores only">
+            <input type="password" id="password_one" name="password_one" placeholder="password" required minlength="8" maxlength="128">
+            <input type="password" id="password_two" name="password_two" placeholder="verify password" required minlength="8" maxlength="128">
             <select name="role" id="role" style="width: 100%;">
                 <option value="user" selected>regular user</option>
                 <option value="admin">admin user</option>

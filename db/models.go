@@ -8,12 +8,14 @@ type User struct {
 	ID                int       `gorm:"primary_key"`
 	CreatedAt         time.Time `sql:"DEFAULT:current_timestamp"`
 	Name              string    `gorm:"not null; unique_index"`
-	Password          string    `gorm:"not null"`
+	Password          string    `gorm:"not null"`      // Bcrypt hash for secure auth (login, basic auth)
+	SubsonicPassword  string    `gorm:"default: null"` // Plaintext for Subsonic token auth (t/s params)
 	IsAdmin           bool      `gorm:"not null" sql:"DEFAULT:false"`
 	Avatar            []byte    `sql:"default: null"`
 	LastfmSession     string    `sql:"default: null"`
 	ListenbrainzUrl   string    `sql:"default: null"`
 	ListenbrainzToken string    `sql:"default: null"`
+	SessionVersion    int       `gorm:"not null" sql:"DEFAULT:0"` // Incremented to invalidate all sessions
 }
 
 type TrackStar struct {

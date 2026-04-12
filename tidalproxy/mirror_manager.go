@@ -92,6 +92,9 @@ type MirrorManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// Benchmark debounce - prevent consecutive benchmark runs
+	lastBenchmarkTime atomic.Int64 // unix timestamp in nanoseconds
 }
 
 // MirrorConfig for initializing mirrors
@@ -310,10 +313,17 @@ func (mm *MirrorManager) UpdateMirrors(urls []string) {
 	mm.mirrors = newMirrors
 	log.Printf("[MIRROR] Updated mirror list: %d mirrors active", len(mm.mirrors))
 
-	// Run benchmark if we have enough mirrors and it's the first substantial update
+	// Run benchmark if we have enough mirrors and debounce period has passed
 	if len(newMirrors) >= 5 {
-		// Run in background to not block the update
-		go mm.BenchmarkMirrors()
+		lastBench := mm.lastBenchmarkTime.Load()
+		now := time.Now().UnixNano()
+		// Debounce: only run if 5 seconds have passed since last benchmark
+		if now-lastBench > int64(5*time.Second) {
+			if mm.lastBenchmarkTime.CompareAndSwap(lastBench, now) {
+				// Run in background to not block the update
+				go mm.BenchmarkMirrors()
+			}
+		}
 	}
 }
 

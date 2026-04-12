@@ -3,6 +3,7 @@ package ctrlsubsonic
 import (
 	"context"
 	"crypto/md5"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -28,6 +29,7 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/tidalproxy"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type CtxKey int
@@ -440,14 +442,26 @@ func withUser(dbc *db.DB) handlerutil.Middleware {
 				// Auto-register requires password auth (not token auth) to set the initial password
 				if tokenAuth || password == "" {
 					log.Printf("[AUTH] auto-register rejected: user=%s token_auth=%v pass_len=%d (password required for auto-register)", username, tokenAuth, len(password))
-					_ = writeResp(w, r, spec.NewError(40, "invalid username"))
+					if tokenAuth {
+						_ = writeResp(w, r, spec.NewError(40, "auto-register requires password auth. Please register via web panel first"))
+					} else {
+						_ = writeResp(w, r, spec.NewError(40, "invalid username"))
+					}
 					return
 				}
 				// Auto-create user with the provided password
+				// Hash with bcrypt for secure auth, store plaintext for Subsonic token auth
+				hashedPass, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+				if err != nil {
+					log.Printf("[AUTH] auto-register failed for %s: bcrypt error: %v", username, err)
+					_ = writeResp(w, r, spec.NewError(40, "invalid username"))
+					return
+				}
 				newUser := &db.User{
-					Name:     username,
-					Password: password, // Stored as plaintext (gonic convention)
-					IsAdmin:  false,
+					Name:             username,
+					Password:         string(hashedPass), // Bcrypt hash for secure auth
+					SubsonicPassword: password,           // Plaintext for Subsonic token auth
+					IsAdmin:          false,
 				}
 				log.Printf("[AUTH] auto-registering user=%s with pass_len=%d", username, len(password))
 				if err := dbc.Create(newUser).Error; err != nil {
@@ -460,7 +474,7 @@ func withUser(dbc *db.DB) handlerutil.Middleware {
 			}
 			var credsOk bool
 			if tokenAuth {
-				credsOk = checkCredsToken(user.Password, token, salt)
+				credsOk = checkCredsToken(user, token, salt)
 			} else {
 				credsOk = checkCredsBasic(user.Password, password)
 			}
@@ -483,13 +497,25 @@ func slow(next http.Handler) http.Handler {
 	})
 }
 
-func checkCredsToken(password, token, salt string) bool {
-	toHash := fmt.Sprintf("%s%s", password, salt)
+func checkCredsToken(user *db.User, token, salt string) bool {
+	// Token auth requires plaintext password to compute expected token
+	// Use SubsonicPassword if available (set when user has bcrypt Password)
+	plainPassword := user.SubsonicPassword
+	if plainPassword == "" {
+		// Fallback: if Password field is not bcrypt, use it directly (legacy plaintext users)
+		if !isBcryptHash(user.Password) {
+			plainPassword = user.Password
+		} else {
+			log.Printf("[AUTH] token auth rejected: user has bcrypt password but no SubsonicPassword set")
+			return false
+		}
+	}
+	toHash := fmt.Sprintf("%s%s", plainPassword, salt)
 	hash := md5.Sum([]byte(toHash))
 	expToken := hex.EncodeToString(hash[:])
 	match := token == expToken
 	if !match {
-		log.Printf("[AUTH] token mismatch: expected=%s got=%s salt=%s pass_len=%d", expToken[:16], token[:16], salt, len(password))
+		log.Printf("[AUTH] token mismatch: expected=%s got=%s salt=%s pass_len=%d", expToken[:16], token[:16], salt, len(plainPassword))
 	}
 	return match
 }
@@ -499,7 +525,20 @@ func checkCredsBasic(password, given string) bool {
 		b, _ := hex.DecodeString(given[4:])
 		given = string(b)
 	}
-	return password == given
+	// Check if stored password is a bcrypt hash
+	if isBcryptHash(password) {
+		err := bcrypt.CompareHashAndPassword([]byte(password), []byte(given))
+		return err == nil
+	}
+	// Legacy: plaintext comparison using constant-time to prevent timing attacks
+	return subtle.ConstantTimeCompare([]byte(password), []byte(given)) == 1
+}
+
+// isBcryptHash checks if the password is stored as a bcrypt hash
+func isBcryptHash(password string) bool {
+	return strings.HasPrefix(password, "$2a$") ||
+		strings.HasPrefix(password, "$2b$") ||
+		strings.HasPrefix(password, "$2y$")
 }
 
 func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) error {

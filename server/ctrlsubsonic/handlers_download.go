@@ -181,7 +181,7 @@ func (c *Controller) downloadAndAddToZip(ctx context.Context, streamURL string, 
 
 	if isHLS {
 		// Use HLS stitcher - download and concatenate all segments (no seeking for downloads)
-		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, nil, 0)
+		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, nil, 0, 0, 0)
 	}
 	if isDASH {
 		// Use DASH stitcher (no seeking for downloads, offset=0)

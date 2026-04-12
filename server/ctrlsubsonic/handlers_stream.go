@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,9 +20,17 @@ import (
 )
 
 // needsForcedProxy returns true for clients that require proxy mode for proper seeking
-func needsForcedProxy(clientName string) bool {
+// Currently disabled - all clients that needed proxy are now in needsHLSStitching.
+func needsForcedProxy(_ string) bool {
+	return false
+}
+
+// needsHLSStitching returns true for clients that cannot decode HLS manifests
+// and need the server to download and stitch HLS segments into raw audio.
+// These clients (like psysonic using Symphonia) require continuous audio data.
+func needsHLSStitching(clientName string) bool {
 	lower := strings.ToLower(clientName)
-	return lower == "tempus" || lower == "symfonium"
+	return lower == "psysonic" || lower == "tempus" || lower == "symfonium"
 }
 
 func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.Response {
@@ -109,8 +118,10 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 	// 2. Redirect if not proxying (force proxy for certain Android clients that can't seek with redirects)
 	// [FIX] Now allows redirects for HLS/DASH - MPV/Supersonic handles them natively
+	// [FIX] Force proxy for clients needing HLS stitching (psysonic) - they need raw audio, not manifests
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
-	if proxyStreams != "true" && !needsForcedProxy(prep.ClientName) {
+	needsStitch := prep.IsHLS && needsHLSStitching(prep.ClientName)
+	if proxyStreams != "true" && !needsForcedProxy(prep.ClientName) && !needsStitch {
 		urlPreview := prep.StreamURL
 		if len(urlPreview) > 100 {
 			urlPreview = urlPreview[:100]
@@ -136,18 +147,72 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	}
 
 	if prep.IsHLS {
-		// [NEW] Serve HLS manifest directly to MPV - it handles HLS natively
-		urlPreview := prep.StreamURL
-		if len(urlPreview) > 100 {
-			urlPreview = urlPreview[:100]
-		}
-		log.Printf("[STREAM] DEBUG: proxying HLS manifest for track %d URL=%s", id.Value(), urlPreview)
-		err = c.proxyHLSManifest(streamCtx, prep.StreamURL, w, prep.ClientIP)
-		if err != nil {
-			streamErr = err
-			log.Printf("[STREAM] ERROR: HLS proxy failed for track %d: %v", id.Value(), err)
+		if needsHLSStitching(prep.ClientName) {
+			// Clients like psysonic (Symphonia) cannot decode HLS manifests
+			// Download and stitch segments into raw audio stream
+			urlPreview := prep.StreamURL
+			if len(urlPreview) > 100 {
+				urlPreview = urlPreview[:100]
+			}
+			log.Printf("[STREAM] HLS stitch mode for %s track=%d URL=%s", prep.ClientName, id.Value(), urlPreview)
+			
+			// --- RANGE CALCULATION LOGIC ---
+			rangeHdr := r.Header.Get("Range")
+			offsetSeconds := 0.0
+			startByte := int64(0)
+			var totalBytes int64 = 0
+
+			bytesPerSec := int64(125000)
+			if prep.Quality == "HIGH" || prep.Quality == "LOW" || prep.Ext == "m4a" {
+				bytesPerSec = 40000 
+			} else if prep.Quality == "HI_RES_LOSSLESS" {
+				bytesPerSec = 175000
+			}
+
+			if prep.Track != nil && prep.Track.Duration > 0 {
+				totalBytes = int64(prep.Track.Duration) * bytesPerSec
+			}
+
+			timeOffsetParam := p.GetOrFloat("timeOffset", 0.0)
+			if timeOffsetParam > 0 {
+				offsetSeconds = timeOffsetParam
+			} else if rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") && totalBytes > 0 {
+				parts := strings.Split(strings.TrimPrefix(rangeHdr, "bytes="), "-")
+				if len(parts) > 0 && parts[0] != "" {
+					if parsedByte, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+						startByte = parsedByte
+						offsetSeconds = float64(startByte) / float64(bytesPerSec)
+						if offsetSeconds > float64(prep.Track.Duration) {
+							offsetSeconds = float64(prep.Track.Duration) - 1
+						}
+						if offsetSeconds < 0 {
+							offsetSeconds = 0
+						}
+					}
+				}
+			}
+
+			err = c.downloadAndStitchHLS(streamCtx, prep.StreamURL, w, prep.ClientIP, prep.Track, offsetSeconds, startByte, totalBytes)
+			if err != nil {
+				streamErr = err
+				log.Printf("[STREAM] ERROR: HLS stitch failed for track %d: %v", id.Value(), err)
+			} else {
+				log.Printf("[STREAM] HLS stitch succeeded for track %d", id.Value())
+			}
 		} else {
-			log.Printf("[STREAM] DEBUG: HLS proxy succeeded for track %d", id.Value())
+			// [NEW] Serve HLS manifest directly to MPV - it handles HLS natively
+			urlPreview := prep.StreamURL
+			if len(urlPreview) > 100 {
+				urlPreview = urlPreview[:100]
+			}
+			log.Printf("[STREAM] DEBUG: proxying HLS manifest for track %d URL=%s", id.Value(), urlPreview)
+			err = c.proxyHLSManifest(streamCtx, prep.StreamURL, w, prep.ClientIP)
+			if err != nil {
+				streamErr = err
+				log.Printf("[STREAM] ERROR: HLS proxy failed for track %d: %v", id.Value(), err)
+			} else {
+				log.Printf("[STREAM] DEBUG: HLS proxy succeeded for track %d", id.Value())
+			}
 		}
 	} else if prep.IsDASH {
 		// [NEW] Serve DASH manifest directly

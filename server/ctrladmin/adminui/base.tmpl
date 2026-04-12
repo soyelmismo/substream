@@ -31,7 +31,11 @@
     <body class="font-mono leading-4 text-base text-gray-800 bg-zinc-50">
         <div class="container mx-auto min-w-min space-y-5 p-5">
             <div class="border-b-2 border-gray-300">
+                {{ if and .User .User.IsAdmin }}
                 <a href="{{ path "/admin/home" }}">
+                {{ else }}
+                <a href="{{ path "/admin/profile" }}">
+                {{ end }}
                     <img class="mx-auto w-[400px]" src="{{ path "/admin/static/gonic.png" }}" alt="substream">
                 </a>
             </div>
@@ -49,15 +53,19 @@
 
 {{ define "nav" }}
             <div class="px-4 text-gray-500 text-right whitespace-nowrap">
-                welcome {{ .User.Name }}
-                &#124;
-                <a class="text-blue-500" href="{{ path "/admin/home" }}">home&#8230;</a>
+                {{ if .User }}
+                welcome <a class="text-blue-500" href="{{ path "/admin/profile" }}">{{ .User.Name }}</a>
                 &#124;
                 {{ if .User.IsAdmin }}
+                <a class="text-blue-500" href="{{ path "/admin/home" }}">home&#8230;</a>
+                &#124;
                 <a class="text-blue-500" href="{{ path "/admin/proxies" }}">proxies&#8230;</a>
                 &#124;
                 {{ end }}
                 <a class="text-blue-500" href="{{ path "/admin/logout" }}">logout&#8230;</a>
+                {{ else }}
+                <a class="text-blue-500" href="{{ path "/admin/login" }}">login&#8230;</a>
+                {{ end }}
             </div>
 {{ end }}
 
