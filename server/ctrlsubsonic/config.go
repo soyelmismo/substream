@@ -34,8 +34,8 @@ var (
 	hotFetchConcurrency = 5
 
 	// hotFetchTimeout is the HTTP timeout for requests to hot.monochrome.tf API.
-	// Shorter than general timeout to fail fast on unresponsive requests.
-	hotFetchTimeout = 5 * time.Second
+	// Fail fast (2s) to use cached data or defaults when API is slow.
+	hotFetchTimeout = 2 * time.Second
 
 	// hotFetchMaxAlbums is the maximum number of albums to fetch from hot.monochrome.tf
 	// when extracting tracks for a genre. Limits API calls when top_tracks is empty.
@@ -64,8 +64,8 @@ var (
 	genreCacheTTL = 30 * time.Minute
 
 	// genreCountsCacheTTL is the time-to-live for genre counts cache before it expires.
-	// Genre counts change slowly, so 5 minutes is reasonable for freshness vs load.
-	genreCountsCacheTTL = 5 * time.Minute
+	// Genre counts change slowly, so 1 hour reduces load on hot.monochrome.tf when it's slow.
+	genreCountsCacheTTL = time.Hour
 
 	// genreAlbumCacheTTL is the time-to-live for genre album caches before they expire.
 	// Album metadata changes infrequently, so 1 hour balances freshness with API rate limiting.
@@ -78,7 +78,6 @@ var (
 	// genreFetchTimeout is the timeout for genre track fetching from hot.monochrome.tf.
 	// Short timeout ensures quick fallback to local content.
 	genreFetchTimeout = 3 * time.Second
-
 
 	// genreFetchMaxCount is the maximum number of tracks to return per genre request.
 	// Prevents oversized responses.
@@ -144,37 +143,37 @@ func initConfig() {
 // hotGenreMapping maps Subsonic genre names to hot.monochrome.tf genre IDs
 // IDs match monochrome client's genre IDs
 var hotGenreMapping = map[string]string{
-	"Pop":               "pop",
-	"Rock":              "rock",
-	"Hip-Hop":           "hip_hop",
-	"R&B":               "rnb",
-	"R&B / Soul":        "rnb",
-	"Electronic":        "electronic",
-	"Classical":         "classical",
-	"Jazz":              "jazz",
-	"Blues":             "blues",
-	"Country":           "country",
-	"Metal":             "metal",
-	"Reggae":            "reggae",
+	"Pop":                "pop",
+	"Rock":               "rock",
+	"Hip-Hop":            "hip_hop",
+	"R&B":                "rnb",
+	"R&B / Soul":         "rnb",
+	"Electronic":         "electronic",
+	"Classical":          "classical",
+	"Jazz":               "jazz",
+	"Blues":              "blues",
+	"Country":            "country",
+	"Metal":              "metal",
+	"Reggae":             "reggae",
 	"Reggae / Dancehall": "reggae",
-	"Latin":             "latin",
-	"World":             "world",
-	"Global":            "world",
-	"Kids":              "kids",
-	"Gospel":            "gospel",
+	"Latin":              "latin",
+	"World":              "world",
+	"Global":             "world",
+	"Kids":               "kids",
+	"Gospel":             "gospel",
 	"Gospel / Christian": "gospel",
 	"Dance & Electronic": "dance_electronic",
-	"Indie Rock":        "indierock",
-	"Rock / Indie":      "indierock",
-	"Folk / Americana":  "americana",
-	"Americana":         "americana",
-	"K-Pop":             "kpop",
-	"Legacy":            "retro",
-	"Retro":             "retro",
-	"Alternative":       "alternative",
-	"Dance":            "dance",
-	"Soul":             "soul",
-	"All":              "pop",
+	"Indie Rock":         "indierock",
+	"Rock / Indie":       "indierock",
+	"Folk / Americana":   "americana",
+	"Americana":          "americana",
+	"K-Pop":              "kpop",
+	"Legacy":             "retro",
+	"Retro":              "retro",
+	"Alternative":        "alternative",
+	"Dance":              "dance",
+	"Soul":               "soul",
+	"All":                "pop",
 }
 
 // hotGenreList is the canonical list of genres exposed to clients.
