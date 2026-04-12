@@ -598,21 +598,156 @@ func (p *Pool) GetArtistAlbums(ctx context.Context, artistID int, skipTracks boo
 }
 
 func (p *Pool) SearchTracks(ctx context.Context, query string, limit, offset int) ([]TidalTrack, error) {
-	q := url.Values{
-		"s":      {query},
-		"limit":  {fmt.Sprint(limit)},
-		"offset": {fmt.Sprint(offset)},
+	return p.searchAggregate(ctx, query, limit, offset, "s", func(q url.Values, result interface{}) error {
+		var r struct {
+			Items []TidalTrack `json:"items"`
+		}
+		if err := p.doSearchRequest(ctx, q, &r); err != nil {
+			return err
+		}
+		*result.(*[]TidalTrack) = r.Items
+		return nil
+	})
+}
+
+// doSearchRequest performs a single search request to a mirror
+func (p *Pool) doSearchRequest(ctx context.Context, query url.Values, result interface{}) error {
+	// Get all healthy mirrors
+	var mirrors []*Mirror
+	p.mu.RLock()
+	if p.mirrorMgr != nil {
+		for _, m := range p.mirrorMgr.GetMirrors() {
+			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
+				mirrors = append(mirrors, m)
+			}
+		}
 	}
+	p.mu.RUnlock()
+
+	if len(mirrors) == 0 {
+		return fmt.Errorf("no healthy mirrors available")
+	}
+
+	// Limit to first 5 mirrors to avoid overload
+	if len(mirrors) > 5 {
+		mirrors = mirrors[:5]
+	}
+
+	// Create search-specific context with longer timeout
+	searchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	type searchResult struct {
+		items []TidalTrack
+		err   error
+	}
+
+	results := make(chan searchResult, len(mirrors))
+
+	// Query all mirrors in parallel
+	for _, m := range mirrors {
+		go func(mirror *Mirror) {
+			items, err := p.searchTracksFromMirror(searchCtx, query, mirror)
+			results <- searchResult{items: items, err: err}
+		}(m)
+	}
+
+	// Aggregate results
+	var allItems []TidalTrack
+	seen := make(map[int]bool) // dedupe by ID
+
+searchLoop:
+	for i := 0; i < len(mirrors); i++ {
+		select {
+		case res := <-results:
+			if res.err == nil {
+				for _, item := range res.items {
+					if !seen[item.ID] {
+						seen[item.ID] = true
+						allItems = append(allItems, item)
+					}
+				}
+			}
+		case <-searchCtx.Done():
+			break searchLoop
+		}
+	}
+
+	if len(allItems) == 0 {
+		return fmt.Errorf("no search results from any mirror")
+	}
+
+	// Sort by relevance (Tidal's original order is usually good)
+	// Limit results
+	limit := 16
+	if len(allItems) > limit {
+		allItems = allItems[:limit]
+	}
+
+	*result.(*[]TidalTrack) = allItems
+	return nil
+}
+
+func (p *Pool) searchTracksFromMirror(ctx context.Context, query url.Values, m *Mirror) ([]TidalTrack, error) {
+	u := m.URL + "/search/"
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
 	var result struct {
 		Items []TidalTrack `json:"items"`
 	}
-	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
+
+	// Try envelope first
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+		if err := json.Unmarshal(envelope.Data, &result); err == nil {
+			return result.Items, nil
+		}
+	}
+
+	// Fallback: direct unmarshal
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, err
 	}
-	if limit > 0 && len(result.Items) > limit {
-		result.Items = result.Items[:limit]
-	}
 	return result.Items, nil
+}
+
+// searchAggregate is a generic search aggregator
+func (p *Pool) searchAggregate(_ context.Context, query string, limit, offset int, paramName string, fetchFunc func(url.Values, interface{}) error) ([]TidalTrack, error) {
+	q := url.Values{
+		paramName: {query},
+		"limit":   {fmt.Sprint(limit)},
+		"offset":  {fmt.Sprint(offset)},
+	}
+	var result []TidalTrack
+	if err := fetchFunc(q, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (p *Pool) SearchArtists(ctx context.Context, query string, limit, offset int) ([]TidalArtist, error) {
@@ -836,18 +971,19 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 	}
 	var combos []combo
 
-	if requestedQuality == "HI_RES_LOSSLESS" {
+	switch requestedQuality {
+	case "HI_RES_LOSSLESS":
 		combos = append(combos, combo{"BTS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES", "MQA"}})
 		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
 		combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
-	} else if requestedQuality == "LOSSLESS" {
+	case "LOSSLESS":
 		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
 		combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
-	} else {
+	default:
 		combos = append(combos, combo{"BTS", requestedQuality, []string{"AACLC", "HEAACV1"}})
 		combos = append(combos, combo{"HLS", requestedQuality, []string{"AACLC", "HEAACV1"}})
 	}
@@ -994,102 +1130,7 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 	return "", fmt.Errorf("escopetazo fallido, %d peticiones dieron error. Logs: %s", len(tasks), strings.Join(errorsList, " | "))
 }
 
-// downloadAndParseHLSManifest downloads a Tidal manifest and extracts the audio stream URL
-// Tidal V2 manifests are BTS (Base64 encoded) or MPD (MPEG-DASH) format
-func (p *Pool) downloadAndParseHLSManifest(ctx context.Context, manifestURL string, clientIP string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-	if clientIP != "" {
-		req.Header.Set("X-Forwarded-For", clientIP)
-	}
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("manifest fetch failed: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read manifest body: %w", err)
-	}
-
-	bodyStr := string(body)
-	log.Printf("[TIDAL] Manifest content type: %s, size: %d bytes", resp.Header.Get("Content-Type"), len(body))
-	log.Printf("[TIDAL] Manifest preview (first 200 chars): %s", bodyStr[:min(200, len(bodyStr))])
-
-	// Tidal V2 manifests are often Base64-encoded BTS format
-	// Try to decode base64
-	decoded, err := base64.StdEncoding.DecodeString(bodyStr)
-	if err == nil && len(decoded) > 0 {
-		log.Printf("[TIDAL] Manifest is Base64 encoded, decoded size: %d bytes", len(decoded))
-		bodyStr = string(decoded)
-	}
-
-	// Try to parse as JSON
-	var manifest struct {
-		URLs []string `json:"urls"`
-		URL  string   `json:"url"`
-	}
-	if err := json.Unmarshal([]byte(bodyStr), &manifest); err == nil {
-		if len(manifest.URLs) > 0 {
-			log.Printf("[TIDAL] Found audio URL in JSON manifest: %s...", manifest.URLs[0][:min(50, len(manifest.URLs[0]))])
-			return manifest.URLs[0], nil
-		}
-		if manifest.URL != "" {
-			log.Printf("[TIDAL] Found audio URL in JSON manifest: %s...", manifest.URL[:min(50, len(manifest.URL))])
-			return manifest.URL, nil
-		}
-	}
-
-	// Look for MPD (MPEG-DASH) BaseURL or SegmentURL
-	if strings.Contains(bodyStr, "BaseURL") {
-		// Extract BaseURL from MPD
-		start := strings.Index(bodyStr, "<BaseURL>")
-		end := strings.Index(bodyStr, "</BaseURL>")
-		if start != -1 && end != -1 && end > start+9 {
-			url := bodyStr[start+9 : end]
-			log.Printf("[TIDAL] Found BaseURL in MPD manifest: %s...", url[:min(50, len(url))])
-			return url, nil
-		}
-	}
-
-	// Parse HLS M3U8 manifest - look for variant streams after #EXT-X-STREAM-INF
-	lines := strings.Split(bodyStr, "\n")
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		// Skip comments and empty lines
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		// This is a URL line (either variant URL in master playlist or segment URL)
-		if strings.HasPrefix(line, "http") {
-			log.Printf("[TIDAL] Found stream URL in HLS manifest: %s...", line[:min(50, len(line))])
-			return line, nil
-		}
-		// Check if next line after STREAM-INF is a relative URL
-		if i > 0 && strings.HasPrefix(lines[i-1], "#EXT-X-STREAM-INF") && !strings.HasPrefix(line, "#") {
-			// Relative URL, construct absolute
-			baseURL := manifestURL
-			if lastSlash := strings.LastIndex(baseURL, "/"); lastSlash != -1 {
-				baseURL = baseURL[:lastSlash+1]
-			}
-			absoluteURL := baseURL + line
-			log.Printf("[TIDAL] Found relative stream URL in HLS manifest: %s...", absoluteURL[:min(50, len(absoluteURL))])
-			return absoluteURL, nil
-		}
-	}
-
-	return "", fmt.Errorf("no audio URL found in manifest")
-}
-
+// min returns the minimum of two integers
 func min(a, b int) int {
 	if a < b {
 		return a
