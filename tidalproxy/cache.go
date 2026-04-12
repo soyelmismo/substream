@@ -250,7 +250,8 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 		}
 	}
 
-	// 3. Fetch from API
+	// 3. Fetch from API using MEDIUM tier (not critical like streaming)
+	ctx = WithTier(ctx, TierMedium)
 	t, err := c.TidalProxy.GetTrackInfo(ctx, trackID)
 	if err == nil && t != nil {
 		c.cacheTrackJSON(t)
@@ -300,7 +301,8 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 		}
 	}
 
-	// 3. Fetch from API
+	// 4. Fetch from API using MEDIUM tier
+	ctx = WithTier(ctx, TierMedium)
 	a, err := c.TidalProxy.GetAlbumInfo(ctx, albumID)
 	if err == nil && a != nil {
 		c.cacheAlbumJSON(a)
@@ -350,10 +352,13 @@ func (c *CachedProxy) GetAlbumMetadata(ctx context.Context, albumID int) (*Tidal
 
 // GetAlbumsInfoBatch fetches multiple albums efficiently using batch SQLite query
 // Falls back to individual API calls for cache misses
+// Uses MEDIUM tier to avoid saturating LOW tier mirrors
 func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) map[int]*TidalAlbum {
 	if len(albumIDs) == 0 {
 		return nil
 	}
+
+	ctx = WithTier(ctx, TierMedium)
 
 	result := make(map[int]*TidalAlbum, len(albumIDs))
 	missingIDs := make([]int, 0)
@@ -479,7 +484,8 @@ func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalAr
 		}
 	}
 
-	// 3. Fetch from API
+	// 3. Fetch from API using MEDIUM tier
+	ctx = WithTier(ctx, TierMedium)
 	a, err := c.TidalProxy.GetArtistInfo(ctx, artistID)
 	if err == nil && a != nil {
 		// Serialize to JSON
@@ -509,14 +515,18 @@ func (c *CachedProxy) GetCoverUUIDForAlbum(ctx context.Context, albumID int) str
 	if cached := c.albumArt.Get(key); cached != "" {
 		return cached
 	}
+
+	// Trigger album fetch to get cover (MEDIUM tier via GetAlbumInfo)
+	ctx = WithTier(ctx, TierMedium)
 	a, err := c.GetAlbumInfo(ctx, albumID)
-	if err == nil && a != nil && a.Cover != "" {
+	if err == nil && a != nil {
 		return a.Cover
 	}
 	return ""
 }
 
 func (c *CachedProxy) SearchAlbums(ctx context.Context, query string, limit, offset int) ([]TidalAlbum, error) {
+	ctx = WithTier(ctx, TierMedium) // Search uses MEDIUM tier
 	albums, err := c.TidalProxy.SearchAlbums(ctx, query, limit, offset)
 	if err == nil {
 		for _, a := range albums {
@@ -527,6 +537,7 @@ func (c *CachedProxy) SearchAlbums(ctx context.Context, query string, limit, off
 }
 
 func (c *CachedProxy) SearchTracks(ctx context.Context, query string, limit, offset int) ([]TidalTrack, error) {
+	ctx = WithTier(ctx, TierMedium) // Search uses MEDIUM tier
 	tracks, err := c.TidalProxy.SearchTracks(ctx, query, limit, offset)
 	if err == nil {
 		for _, t := range tracks {
@@ -536,7 +547,13 @@ func (c *CachedProxy) SearchTracks(ctx context.Context, query string, limit, off
 	return tracks, err
 }
 
+func (c *CachedProxy) SearchArtists(ctx context.Context, query string, limit, offset int) ([]TidalArtist, error) {
+	ctx = WithTier(ctx, TierMedium) // Search uses MEDIUM tier
+	return c.TidalProxy.SearchArtists(ctx, query, limit, offset)
+}
+
 func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTracks bool) (*TidalArtistPage, error) {
+	ctx = WithTier(ctx, TierMedium) // Artist albums uses MEDIUM tier
 	key := fmt.Sprintf("td:ar:al:%d", artistID)
 	if skipTracks {
 		key += ":skip"
@@ -600,6 +617,7 @@ func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTra
 }
 
 func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) {
+	ctx = WithTier(ctx, TierMedium) // Top tracks uses MEDIUM tier
 	key := fmt.Sprintf("td:ar:tt:%d", artistID)
 
 	// 1. Check LRU
@@ -652,6 +670,7 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 }
 
 func (c *CachedProxy) GetSimilarArtists(ctx context.Context, artistID int) ([]TidalArtist, error) {
+	ctx = WithTier(ctx, TierMedium) // Similar artists uses MEDIUM tier
 	key := fmt.Sprintf("td:ar:sim:%d", artistID)
 
 	// 1. Check LRU
@@ -700,6 +719,7 @@ func (c *CachedProxy) GetSimilarArtists(ctx context.Context, artistID int) ([]Ti
 }
 
 func (c *CachedProxy) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) {
+	ctx = WithTier(ctx, TierMedium) // Top tracks uses MEDIUM tier
 	tracks, err := c.TidalProxy.GetTopTracks(ctx, limit)
 	if err == nil {
 		for _, t := range tracks {
@@ -710,6 +730,7 @@ func (c *CachedProxy) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack
 }
 
 func (c *CachedProxy) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error) {
+	ctx = WithTier(ctx, TierMedium) // Recommendations uses MEDIUM tier
 	tracks, err := c.TidalProxy.GetRecommendations(ctx, trackID)
 	if err == nil {
 		for _, t := range tracks {

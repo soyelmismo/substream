@@ -35,11 +35,34 @@ func (s MirrorState) String() string {
 	}
 }
 
+// LatencyTier represents the latency category of a mirror
+type LatencyTier int
+
+const (
+	TierLow    LatencyTier = iota // Fastest ~33% - for streaming
+	TierMedium                    // Middle ~33% - for general/VIP use
+	TierHigh                      // Slowest ~33% - for background cache hydration
+)
+
+func (t LatencyTier) String() string {
+	switch t {
+	case TierLow:
+		return "LOW"
+	case TierMedium:
+		return "MED"
+	case TierHigh:
+		return "HIGH"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // Mirror represents a single proxy mirror
 type Mirror struct {
 	URL            string
 	Weight         int
-	HealthEndpoint string // e.g., "/health" or just "/" for HEAD check
+	HealthEndpoint string      // e.g., "/health" or just "/" for HEAD check
+	Tier           LatencyTier // Assigned based on benchmark latency
 
 	// Runtime stats - accessed via atomic
 	state               atomic.Int32 // MirrorState
@@ -110,7 +133,130 @@ func NewMirrorManager(configs []MirrorConfig, healthCheckInterval time.Duration)
 func (mm *MirrorManager) Start() {
 	mm.wg.Add(1)
 	go mm.healthCheckLoop()
-	log.Printf("[MIRROR] Manager started with %d mirrors", len(mm.mirrors))
+	log.Printf("[MIRROR] Manager started with %d mirrors (latency benchmark runs after mirror discovery)", len(mm.mirrors))
+}
+
+// BenchmarkMirrors measures latency of all mirrors for initial sorting
+func (mm *MirrorManager) BenchmarkMirrors() {
+	mm.mu.RLock()
+	mirrors := make([]*Mirror, len(mm.mirrors))
+	copy(mirrors, mm.mirrors)
+	mm.mu.RUnlock()
+
+	if len(mirrors) == 0 {
+		return
+	}
+
+	log.Printf("[MIRROR] Benchmarking %d mirrors for latency sorting...", len(mirrors))
+
+	var wg sync.WaitGroup
+	results := make(chan struct {
+		mirror  *Mirror
+		latency time.Duration
+	}, len(mirrors))
+
+	for _, m := range mirrors {
+		wg.Add(1)
+		go func(mirror *Mirror) {
+			defer wg.Done()
+
+			// Quick ping to measure latency (2 attempts, take fastest)
+			var bestLatency time.Duration = time.Second
+
+			for i := 0; i < 2; i++ {
+				start := time.Now()
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+				endpoint := mirror.URL + mirror.HealthEndpoint
+				req, _ := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+
+				client := &http.Client{Timeout: 3 * time.Second}
+				resp, err := client.Do(req)
+				cancel()
+
+				if err == nil && resp != nil {
+					resp.Body.Close()
+					latency := time.Since(start)
+					if latency < bestLatency {
+						bestLatency = latency
+					}
+				}
+			}
+
+			results <- struct {
+				mirror  *Mirror
+				latency time.Duration
+			}{mirror, bestLatency}
+		}(m)
+	}
+
+	// Close results channel when all done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	var sortedMirrors []*Mirror
+	for r := range results {
+		if r.latency < time.Second {
+			r.mirror.latencyEMA.Store(int64(r.latency))
+			sortedMirrors = append(sortedMirrors, r.mirror)
+			log.Printf("[MIRROR] %s latency: %v", r.mirror.URL, r.latency)
+		} else {
+			log.Printf("[MIRROR] %s latency: timeout/unreachable", r.mirror.URL)
+		}
+	}
+
+	// Sort mirrors by latency
+	mm.mu.Lock()
+	for i := 0; i < len(mm.mirrors)-1; i++ {
+		for j := i + 1; j < len(mm.mirrors); j++ {
+			if mm.mirrors[i].latencyEMA.Load() > mm.mirrors[j].latencyEMA.Load() {
+				mm.mirrors[i], mm.mirrors[j] = mm.mirrors[j], mm.mirrors[i]
+			}
+		}
+	}
+
+	// Assign tiers based on latency percentiles
+	// Low: fastest ~33%, Medium: middle ~33%, High: slowest ~33%
+	n := len(mm.mirrors)
+	if n > 0 {
+		lowThreshold := n / 3
+		if lowThreshold < 1 {
+			lowThreshold = 1
+		}
+		highThreshold := (2 * n) / 3
+
+		for i, m := range mm.mirrors {
+			switch {
+			case i < lowThreshold:
+				m.Tier = TierLow
+			case i >= highThreshold:
+				m.Tier = TierHigh
+			default:
+				m.Tier = TierMedium
+			}
+		}
+
+		// Log tier distribution
+		lowCount, medCount, highCount := 0, 0, 0
+		for _, m := range mm.mirrors {
+			switch m.Tier {
+			case TierLow:
+				lowCount++
+			case TierMedium:
+				medCount++
+			case TierHigh:
+				highCount++
+			}
+		}
+		log.Printf("[MIRROR] Tiers assigned: LOW=%d MED=%d HIGH=%d", lowCount, medCount, highCount)
+	}
+	mm.mu.Unlock()
+
+	log.Printf("[MIRROR] Benchmark complete. Fastest: %s (%v) [Tier:%s]",
+		mm.mirrors[0].URL, time.Duration(mm.mirrors[0].latencyEMA.Load()), mm.mirrors[0].Tier)
 }
 
 // UpdateMirrors updates the mirror list with new URLs (preserves stats for existing mirrors)
@@ -163,6 +309,12 @@ func (mm *MirrorManager) UpdateMirrors(urls []string) {
 
 	mm.mirrors = newMirrors
 	log.Printf("[MIRROR] Updated mirror list: %d mirrors active", len(mm.mirrors))
+
+	// Run benchmark if we have enough mirrors and it's the first substantial update
+	if len(newMirrors) >= 5 {
+		// Run in background to not block the update
+		go mm.BenchmarkMirrors()
+	}
 }
 
 // Stop shuts down the manager
@@ -505,15 +657,89 @@ func (mm *MirrorManager) GetStatus() string {
 	status := "Mirror Status:\n"
 	for _, m := range mm.mirrors {
 		state, latency, fails, reqs := m.GetStats()
-		status += fmt.Sprintf("  %s: %s | latency=%v | fails=%d | reqs=%d | weight=%d\n",
-			m.URL, state, latency, fails, reqs, m.Weight)
+		status += fmt.Sprintf("  %s: %s | tier=%s | latency=%v | fails=%d | reqs=%d\n",
+			m.URL, state, m.Tier, latency, fails, reqs)
 	}
 	return status
 }
 
-// GetMirrors returns the list of mirrors (readonly)
+// GetMirrors returns the list of mirrors sorted by latency (fastest first)
 func (mm *MirrorManager) GetMirrors() []*Mirror {
+	return mm.GetMirrorsByTierWithFallback(TierLow, 3) // Default: Low tier with fallback to Medium
+}
+
+// GetMirrorsByTier returns mirrors from a specific tier only
+func (mm *MirrorManager) GetMirrorsByTier(tier LatencyTier) []*Mirror {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
-	return mm.mirrors
+
+	var filtered []*Mirror
+	for _, m := range mm.mirrors {
+		if m.Tier == tier && m.GetState() == StateHealthy {
+			filtered = append(filtered, m)
+		}
+	}
+
+	// Sort by latency within tier
+	for i := 0; i < len(filtered)-1; i++ {
+		for j := i + 1; j < len(filtered); j++ {
+			if filtered[i].latencyEMA.Load() > filtered[j].latencyEMA.Load() {
+				filtered[i], filtered[j] = filtered[j], filtered[i]
+			}
+		}
+	}
+
+	return filtered
+}
+
+// GetMirrorsByTierWithFallback returns mirrors from requested tier,
+// falling back to Medium tier if not enough mirrors available
+func (mm *MirrorManager) GetMirrorsByTierWithFallback(tier LatencyTier, minCount int) []*Mirror {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	var result []*Mirror
+
+	// First, get mirrors from requested tier
+	for _, m := range mm.mirrors {
+		if m.Tier == tier && (m.GetState() == StateHealthy || m.GetState() == StateProbing) {
+			result = append(result, m)
+		}
+	}
+
+	// If not enough, fallback to Medium tier
+	if len(result) < minCount {
+		for _, m := range mm.mirrors {
+			if m.Tier == TierMedium && (m.GetState() == StateHealthy || m.GetState() == StateProbing) {
+				// Check not already added
+				found := false
+				for _, r := range result {
+					if r.URL == m.URL {
+						found = true
+						break
+					}
+				}
+				if !found {
+					result = append(result, m)
+				}
+			}
+		}
+	}
+
+	// Sort by latency
+	for i := 0; i < len(result)-1; i++ {
+		for j := i + 1; j < len(result); j++ {
+			if result[i].latencyEMA.Load() > result[j].latencyEMA.Load() {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+
+	return result
+}
+
+// GetMirrorsForCache returns High tier mirrors (for background cache hydration)
+// Falls back to Medium if High tier has insufficient mirrors
+func (mm *MirrorManager) GetMirrorsForCache() []*Mirror {
+	return mm.GetMirrorsByTierWithFallback(TierHigh, 2)
 }

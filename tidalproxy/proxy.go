@@ -2,6 +2,30 @@ package tidalproxy
 
 import "context"
 
+// CtxKey type for context keys
+type CtxKey int
+
+const (
+	// CtxTier allows specifying which mirror tier to use for the request
+	// TierLow for streaming, TierMedium for metadata, TierHigh for cache
+	CtxTier CtxKey = iota
+)
+
+// WithTier returns a context with the specified tier for mirror selection
+func WithTier(ctx context.Context, tier LatencyTier) context.Context {
+	return context.WithValue(ctx, CtxTier, tier)
+}
+
+// GetTierFromContext extracts the tier preference from context, defaults to TierLow
+func GetTierFromContext(ctx context.Context) LatencyTier {
+	if val := ctx.Value(CtxTier); val != nil {
+		if tier, ok := val.(LatencyTier); ok {
+			return tier
+		}
+	}
+	return TierLow // Default: streaming priority
+}
+
 // TidalProxy abstracts all interaction with hifi-api instances
 type TidalProxy interface {
 	// Metadata

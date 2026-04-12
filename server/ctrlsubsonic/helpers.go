@@ -334,6 +334,8 @@ func (c *Controller) hydrateTrackBackground(trackID int) {
 		time.Sleep(50 * time.Millisecond) // yield
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
+		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
 		c.proxy.GetTrackInfo(ctx, trackID)
 	}()
 }
@@ -349,6 +351,8 @@ func (c *Controller) hydrateAlbumBackground(albumID int) {
 		time.Sleep(50 * time.Millisecond) // yield
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
+		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
 		log.Printf("[HYDRATE] Deep hydrating album %d...", albumID)
 		c.proxy.GetAlbumInfo(ctx, albumID) // GetAlbumInfo triggers caching of all its tracks
 	}()
@@ -367,7 +371,10 @@ func (c *Controller) hydrateArtistBackground(artistID int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		log.Printf("[HYDRATE] Deep hydrating artist %d...", artistID)
+		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
+		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
+
+		log.Printf("[HYDRATE] Deep hydrating artist %d... [Tier:HIGH]", artistID)
 
 		// 1. Get Artist Info
 		c.proxy.GetArtistInfo(ctx, artistID)

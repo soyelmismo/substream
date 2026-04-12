@@ -221,16 +221,49 @@ func calculateBackoff(try int, baseDelay time.Duration, errCategory ErrorCategor
 // doFetchRawWithInstance performs a GET request to a specific proxy instance (by index).
 // Used for retry logic when 404 errors are encountered.
 // Also tracks results with MirrorManager if available.
+// Respects CtxTier from context for mirror selection (LOW for streaming, MED for metadata, HIGH for cache).
 func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query url.Values, clientIP string, instanceIdx int) ([]byte, error) {
 	p.mu.RLock()
-	// Select mirror: smart selection for try 0, round-robin for retries
+	// Select mirror based on tier from context
 	var m *Mirror
 	var base string
 
 	if instanceIdx == 0 && p.mirrorMgr != nil {
-		m = p.mirrorMgr.SelectMirror()
-		if m != nil {
-			base = m.URL
+		// Get tier preference from context
+		tier := GetTierFromContext(ctx)
+
+		// Select mirror from appropriate tier
+		var mirrors []*Mirror
+		switch tier {
+		case TierLow:
+			mirrors = p.mirrorMgr.GetMirrorsByTierWithFallback(TierLow, 3)
+		case TierMedium:
+			mirrors = p.mirrorMgr.GetMirrorsByTierWithFallback(TierMedium, 2)
+		case TierHigh:
+			mirrors = p.mirrorMgr.GetMirrorsForCache()
+		default:
+			mirrors = p.mirrorMgr.GetMirrorsByTierWithFallback(TierLow, 3)
+		}
+
+		if len(mirrors) > 0 {
+			// Select from tier pool - pick least loaded from fastest mirrors
+			m = mirrors[0] // Already sorted by latency, pick first
+			for _, candidate := range mirrors[1:] {
+				if candidate.activeRequests.Load() < m.activeRequests.Load() {
+					m = candidate
+				}
+			}
+			if m != nil {
+				base = m.URL
+			}
+		}
+
+		// Fallback to default selection if tier selection failed
+		if base == "" {
+			m = p.mirrorMgr.SelectMirror()
+			if m != nil {
+				base = m.URL
+			}
 		}
 	}
 

@@ -2,8 +2,8 @@ package db
 
 import (
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,7 +22,8 @@ func New(path string) (*DB, error) {
 		return nil, fmt.Errorf("with gorm: %w", err)
 	}
 
-	db.SetLogger(log.New(os.Stdout, "gorm ", 0))
+	// Silent GORM logger - migration errors are handled gracefully
+	db.SetLogger(log.New(io.Discard, "", 0))
 	db.DB().SetMaxOpenConns(4)
 
 	// Custom pragmas for SQLite optimization
