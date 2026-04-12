@@ -226,6 +226,13 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		}
 	}
 
+	// Collect results from parallel searches (if not from cache)
+	if !fromCache {
+		tracks = <-tracksCh
+		artists = <-artistsCh
+		albums = <-albumsCh
+	}
+
 	if len(favAlbums) > 0 {
 		seenIDs := make(map[int]bool)
 		var combined []*spec.Album

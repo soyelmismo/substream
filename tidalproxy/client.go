@@ -183,6 +183,11 @@ func classifyError(err error) ErrorCategory {
 		return ErrorTransient
 	}
 
+	// HTML instead of JSON - mirror misconfiguration, retry with another
+	if strings.Contains(lowerErr, "html instead of json") {
+		return ErrorTransient
+	}
+
 	return ErrorPermanent
 }
 
@@ -327,11 +332,31 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	if m != nil {
-		p.mirrorMgr.ReportResult(m, latency, err)
+	if err != nil {
+		if m != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return nil, err
 	}
 
-	return body, err
+	// Validate response is JSON, not HTML error page
+	if len(body) > 0 && body[0] == '<' {
+		htmlPreview := string(body)
+		if len(htmlPreview) > 100 {
+			htmlPreview = htmlPreview[:100] + "..."
+		}
+		err := fmt.Errorf("upstream %s returned HTML instead of JSON: %s", path, htmlPreview)
+		if m != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return nil, err
+	}
+
+	if m != nil {
+		p.mirrorMgr.ReportResult(m, latency, nil)
+	}
+
+	return body, nil
 }
 
 // doFetchRawWithMirror performs a GET request to a specific mirror and decodes JSON response.
@@ -668,20 +693,74 @@ func (p *Pool) GetArtistAlbums(ctx context.Context, artistID int, skipTracks boo
 }
 
 func (p *Pool) SearchTracks(ctx context.Context, query string, limit, offset int) ([]TidalTrack, error) {
-	return p.searchAggregate(ctx, query, limit, offset, "s", func(q url.Values, result interface{}) error {
-		var r struct {
+	q := url.Values{
+		"s":      {query},
+		"limit":  {fmt.Sprint(limit)},
+		"offset": {fmt.Sprint(offset)},
+	}
+
+	log.Printf("[SEARCH:TRACKS] Querying mirrors for: %q (limit=%d, offset=%d)", query, limit, offset)
+
+	// Use independent context with timeout - don't let client cancellation abort the search
+	searchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Gather results from all mirrors
+	bodies := p.gatherFromMirrors(searchCtx, q)
+	if len(bodies) == 0 {
+		return nil, fmt.Errorf("no search results from any mirror")
+	}
+
+	// Parse and aggregate results from all mirrors
+	var allItems []TidalTrack
+	seen := make(map[int]bool) // dedupe by track ID
+
+	for i, body := range bodies {
+		var result struct {
 			Items []TidalTrack `json:"items"`
 		}
-		if err := p.doSearchRequest(ctx, q, &r); err != nil {
-			return err
+
+		// Try envelope first, then direct
+		var envelope struct {
+			Data json.RawMessage `json:"data"`
 		}
-		*result.(*[]TidalTrack) = r.Items
-		return nil
-	})
+		if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+			if err := json.Unmarshal(envelope.Data, &result); err != nil {
+				log.Printf("[SEARCH:TRACKS] Body %d: envelope unmarshal error: %v", i, err)
+				continue
+			}
+		} else if err := json.Unmarshal(body, &result); err != nil {
+			log.Printf("[SEARCH:TRACKS] Body %d: direct unmarshal error: %v", i, err)
+			continue
+		}
+
+		log.Printf("[SEARCH:TRACKS] Body %d: parsed %d tracks", i, len(result.Items))
+
+		for _, item := range result.Items {
+			if !seen[item.ID] {
+				seen[item.ID] = true
+				allItems = append(allItems, item)
+			}
+		}
+	}
+
+	log.Printf("[SEARCH:TRACKS] Total unique tracks found: %d", len(allItems))
+
+	if len(allItems) == 0 {
+		return nil, fmt.Errorf("no search results from any mirror")
+	}
+
+	// Apply limit
+	if limit > 0 && len(allItems) > limit {
+		allItems = allItems[:limit]
+	}
+
+	return allItems, nil
 }
 
-// doSearchRequest performs a single search request to a mirror
-func (p *Pool) doSearchRequest(ctx context.Context, query url.Values, result interface{}) error {
+// gatherFromMirrors executes a request against all healthy mirrors in parallel
+// and returns all successful response bodies. This is the core "gather shotgun" pattern.
+func (p *Pool) gatherFromMirrors(ctx context.Context, query url.Values) [][]byte {
 	// Get all healthy mirrors
 	var mirrors []*Mirror
 	p.mu.RLock()
@@ -695,7 +774,8 @@ func (p *Pool) doSearchRequest(ctx context.Context, query url.Values, result int
 	p.mu.RUnlock()
 
 	if len(mirrors) == 0 {
-		return fmt.Errorf("no healthy mirrors available")
+		log.Printf("[GATHER] No healthy mirrors available")
+		return nil
 	}
 
 	// Limit to first 5 mirrors to avoid overload
@@ -703,121 +783,121 @@ func (p *Pool) doSearchRequest(ctx context.Context, query url.Values, result int
 		mirrors = mirrors[:5]
 	}
 
-	// Create search-specific context with longer timeout
-	searchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Create search-specific context with timeout
+	// Must be longer than HTTP client timeout (10s) so we can receive responses
+	searchCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
-	type searchResult struct {
-		items []TidalTrack
-		err   error
+	// Debug: Check context deadline and cancellation
+	if deadline, ok := searchCtx.Deadline(); ok {
+		log.Printf("[GATHER] Context deadline: %v (from now: %v)", deadline, time.Until(deadline))
+	} else {
+		log.Printf("[GATHER] No deadline set on context")
+	}
+	select {
+	case <-ctx.Done():
+		log.Printf("[GATHER] WARNING: Parent context already canceled before gather started!")
+	default:
+		log.Printf("[GATHER] Parent context is active")
+	}
+	select {
+	case <-searchCtx.Done():
+		log.Printf("[GATHER] WARNING: Search context already canceled before gather started!")
+	default:
+		log.Printf("[GATHER] Search context is active")
 	}
 
-	results := make(chan searchResult, len(mirrors))
+	type mirrorResult struct {
+		mirrorURL string
+		body      []byte
+		err       error
+	}
+
+	results := make(chan mirrorResult, len(mirrors))
 
 	// Query all mirrors in parallel
 	for _, m := range mirrors {
 		go func(mirror *Mirror) {
-			items, err := p.searchTracksFromMirror(searchCtx, query, mirror)
-			results <- searchResult{items: items, err: err}
+			body, err := p.searchFromMirror(searchCtx, "/search/", query, mirror)
+			results <- mirrorResult{mirrorURL: mirror.URL, body: body, err: err}
 		}(m)
 	}
 
-	// Aggregate results
-	var allItems []TidalTrack
-	seen := make(map[int]bool) // dedupe by ID
-
-searchLoop:
+	// Collect all successful responses
+	var allBodies [][]byte
+	successCount := 0
+	errorCount := 0
 	for i := 0; i < len(mirrors); i++ {
 		select {
 		case res := <-results:
-			if res.err == nil {
-				for _, item := range res.items {
-					if !seen[item.ID] {
-						seen[item.ID] = true
-						allItems = append(allItems, item)
-					}
+			if res.err == nil && len(res.body) > 0 {
+				allBodies = append(allBodies, res.body)
+				successCount++
+				// Log preview of response for debugging
+				preview := string(res.body)
+				if len(preview) > 200 {
+					preview = preview[:200] + "..."
 				}
+				log.Printf("[GATHER] Mirror %s returned %d bytes: %s", res.mirrorURL, len(res.body), preview)
+			} else if res.err != nil {
+				errorCount++
+				log.Printf("[GATHER] Mirror %s error: %v", res.mirrorURL, res.err)
+			} else {
+				errorCount++
+				log.Printf("[GATHER] Mirror %s returned empty body", res.mirrorURL)
 			}
 		case <-searchCtx.Done():
-			break searchLoop
+			// Timeout reached, stop waiting for more
+			log.Printf("[GATHER] Timeout reached, got %d/%d responses (success=%d, error=%d)",
+				len(allBodies), len(mirrors), successCount, errorCount)
+			return allBodies
 		}
 	}
 
-	if len(allItems) == 0 {
-		return fmt.Errorf("no search results from any mirror")
-	}
-
-	// Sort by relevance (Tidal's original order is usually good)
-	// Limit results
-	limit := 16
-	if len(allItems) > limit {
-		allItems = allItems[:limit]
-	}
-
-	*result.(*[]TidalTrack) = allItems
-	return nil
+	log.Printf("[GATHER] Completed: %d mirrors queried, %d success, %d error, %d bodies collected",
+		len(mirrors), successCount, errorCount, len(allBodies))
+	return allBodies
 }
 
-func (p *Pool) searchTracksFromMirror(ctx context.Context, query url.Values, m *Mirror) ([]TidalTrack, error) {
-	u := m.URL + "/search/"
+// searchFromMirror performs a raw search request to a specific mirror and returns the body
+func (p *Pool) searchFromMirror(ctx context.Context, path string, query url.Values, m *Mirror) ([]byte, error) {
+	u := m.URL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
 
+	start := time.Now()
+	mirrorHost := m.URL
+	log.Printf("[SEARCH:MIRROR] %s -> Starting request: %s", mirrorHost, u)
+
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
+		log.Printf("[SEARCH:MIRROR] %s -> Request build error: %v (took %v)", mirrorHost, err, time.Since(start))
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
 
 	resp, err := p.client.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
+		log.Printf("[SEARCH:MIRROR] %s -> HTTP error: %v (took %v)", mirrorHost, err, elapsed)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("[SEARCH:MIRROR] %s -> Status error: %d (took %v)", mirrorHost, resp.StatusCode, elapsed)
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("[SEARCH:MIRROR] %s -> Read body error: %v (took %v)", mirrorHost, err, elapsed)
 		return nil, err
 	}
 
-	var result struct {
-		Items []TidalTrack `json:"items"`
-	}
-
-	// Try envelope first
-	var envelope struct {
-		Data json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
-		if err := json.Unmarshal(envelope.Data, &result); err == nil {
-			return result.Items, nil
-		}
-	}
-
-	// Fallback: direct unmarshal
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-	return result.Items, nil
-}
-
-// searchAggregate is a generic search aggregator
-func (p *Pool) searchAggregate(_ context.Context, query string, limit, offset int, paramName string, fetchFunc func(url.Values, interface{}) error) ([]TidalTrack, error) {
-	q := url.Values{
-		paramName: {query},
-		"limit":   {fmt.Sprint(limit)},
-		"offset":  {fmt.Sprint(offset)},
-	}
-	var result []TidalTrack
-	if err := fetchFunc(q, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
+	log.Printf("[SEARCH:MIRROR] %s -> Success: %d bytes in %v", mirrorHost, len(body), elapsed)
+	return body, nil
 }
 
 func (p *Pool) SearchArtists(ctx context.Context, query string, limit, offset int) ([]TidalArtist, error) {
@@ -826,27 +906,74 @@ func (p *Pool) SearchArtists(ctx context.Context, query string, limit, offset in
 		"limit":  {fmt.Sprint(limit)},
 		"offset": {fmt.Sprint(offset)},
 	}
-	var result struct {
-		Artists struct {
+
+	log.Printf("[SEARCH:ARTISTS] Querying mirrors for: %q (limit=%d, offset=%d)", query, limit, offset)
+
+	// Use independent context with timeout - don't let client cancellation abort the search
+	searchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Gather results from all mirrors
+	bodies := p.gatherFromMirrors(searchCtx, q)
+	if len(bodies) == 0 {
+		return nil, fmt.Errorf("no search results from any mirror")
+	}
+
+	// Parse and aggregate results from all mirrors
+	var allItems []TidalArtist
+	seen := make(map[int]bool) // dedupe by artist ID
+
+	for i, body := range bodies {
+		var result struct {
+			Artists struct {
+				Items []TidalArtist `json:"items"`
+			} `json:"artists"`
 			Items []TidalArtist `json:"items"`
-		} `json:"artists"`
-		// support flat items if proxy doesn't use top-hits
-		Items []TidalArtist `json:"items"`
-	}
-	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
-		return nil, err
-	}
-	if len(result.Artists.Items) > 0 {
-		items := result.Artists.Items
-		if limit > 0 && len(items) > limit {
-			items = items[:limit]
 		}
-		return items, nil
+
+		// Try envelope first, then direct
+		var envelope struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+			if err := json.Unmarshal(envelope.Data, &result); err != nil {
+				log.Printf("[SEARCH:ARTISTS] Body %d: envelope unmarshal error: %v", i, err)
+				continue
+			}
+		} else if err := json.Unmarshal(body, &result); err != nil {
+			log.Printf("[SEARCH:ARTISTS] Body %d: direct unmarshal error: %v", i, err)
+			continue
+		}
+
+		// Use Artists.Items if available, fallback to flat Items
+		items := result.Artists.Items
+		if len(items) == 0 {
+			items = result.Items
+		}
+
+		log.Printf("[SEARCH:ARTISTS] Body %d: parsed %d artists (Artists.Items=%d, flat Items=%d)",
+			i, len(items), len(result.Artists.Items), len(result.Items))
+
+		for _, item := range items {
+			if !seen[item.ID] {
+				seen[item.ID] = true
+				allItems = append(allItems, item)
+			}
+		}
 	}
-	if limit > 0 && len(result.Items) > limit {
-		result.Items = result.Items[:limit]
+
+	log.Printf("[SEARCH:ARTISTS] Total unique artists found: %d", len(allItems))
+
+	if len(allItems) == 0 {
+		return nil, fmt.Errorf("no search results from any mirror")
 	}
-	return result.Items, nil
+
+	// Apply limit
+	if limit > 0 && len(allItems) > limit {
+		allItems = allItems[:limit]
+	}
+
+	return allItems, nil
 }
 
 func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int) ([]TidalAlbum, error) {
@@ -855,34 +982,70 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 		"limit":  {fmt.Sprint(limit)},
 		"offset": {fmt.Sprint(offset)},
 	}
-	var result struct {
-		Albums struct {
-			Items []TidalAlbum `json:"items"`
-		} `json:"albums"`
-		Items []TidalAlbum `json:"items"`
-	}
-	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
-		return nil, err
+
+	log.Printf("[SEARCH:ALBUMS] Querying mirrors for: %q (limit=%d, offset=%d)", query, limit, offset)
+
+	// Use independent context with timeout - don't let client cancellation abort the search
+	searchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Gather results from all mirrors
+	bodies := p.gatherFromMirrors(searchCtx, q)
+	if len(bodies) == 0 {
+		return nil, fmt.Errorf("no search results from any mirror")
 	}
 
-	var sourceItems []TidalAlbum
-	if len(result.Albums.Items) > 0 {
-		sourceItems = result.Albums.Items
-	} else {
-		sourceItems = result.Items
-	}
-
-	// Deduplicate search results too
-	seenAlbums := make(map[string]bool)
+	// Parse and aggregate results from all mirrors
+	seenAlbums := make(map[string]bool) // dedupe by title+date (albums can have same name)
 	var uniqueItems []TidalAlbum
-	for _, item := range sourceItems {
-		key := fmt.Sprintf("%s|%s", strings.ToLower(strings.TrimSpace(item.Title)), item.ReleaseDate)
-		if !seenAlbums[key] {
-			seenAlbums[key] = true
-			uniqueItems = append(uniqueItems, item)
+
+	for i, body := range bodies {
+		var result struct {
+			Albums struct {
+				Items []TidalAlbum `json:"items"`
+			} `json:"albums"`
+			Items []TidalAlbum `json:"items"`
+		}
+
+		// Try envelope first, then direct
+		var envelope struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+			if err := json.Unmarshal(envelope.Data, &result); err != nil {
+				log.Printf("[SEARCH:ALBUMS] Body %d: envelope unmarshal error: %v", i, err)
+				continue
+			}
+		} else if err := json.Unmarshal(body, &result); err != nil {
+			log.Printf("[SEARCH:ALBUMS] Body %d: direct unmarshal error: %v", i, err)
+			continue
+		}
+
+		// Use Albums.Items if available, fallback to flat Items
+		items := result.Albums.Items
+		if len(items) == 0 {
+			items = result.Items
+		}
+
+		log.Printf("[SEARCH:ALBUMS] Body %d: parsed %d albums (Albums.Items=%d, flat Items=%d)",
+			i, len(items), len(result.Albums.Items), len(result.Items))
+
+		for _, item := range items {
+			key := fmt.Sprintf("%s|%s", strings.ToLower(strings.TrimSpace(item.Title)), item.ReleaseDate)
+			if !seenAlbums[key] {
+				seenAlbums[key] = true
+				uniqueItems = append(uniqueItems, item)
+			}
 		}
 	}
 
+	log.Printf("[SEARCH:ALBUMS] Total unique albums found: %d", len(uniqueItems))
+
+	if len(uniqueItems) == 0 {
+		return nil, fmt.Errorf("no search results from any mirror")
+	}
+
+	// Apply limit
 	if limit > 0 && len(uniqueItems) > limit {
 		uniqueItems = uniqueItems[:limit]
 	}
