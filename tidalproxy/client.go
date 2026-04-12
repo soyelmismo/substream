@@ -1427,3 +1427,8 @@ func parseManifestURL(trackID int, version, mimeType, manifest string) (string, 
 func (p *Pool) ClearAll() {
 	// Pool has no in-memory caches to clear
 }
+
+// Stats returns empty stats as Pool has no internal caches
+func (p *Pool) Stats() CacheStats {
+	return CacheStats{}
+}

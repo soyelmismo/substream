@@ -295,6 +295,9 @@ type templateData struct {
 	// settings
 	AutoRegister bool
 	ProxyStreams bool
+
+	// cache
+	CacheStats tidalproxy.CacheStats
 }
 
 func funcMap() template.FuncMap {

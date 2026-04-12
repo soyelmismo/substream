@@ -407,6 +407,22 @@ func (db *DB) GetCacheStats() (total int64, expired int64, oldest time.Time, new
 	return
 }
 
+// GetGlobalStats returns total counts of starred albums, artists, and tracks across all users
+func (db *DB) GetGlobalStats() (albums, artists, tracks int64) {
+	db.Model(&AlbumStar{}).Count(&albums)
+	db.Model(&ArtistStar{}).Count(&artists)
+	db.Model(&TrackStar{}).Count(&tracks)
+	return
+}
+
+// GetUserStats returns counts for a specific user
+func (db *DB) GetUserStats(userID int) (albums, artists, tracks int64) {
+	db.Model(&AlbumStar{}).Where("user_id = ?", userID).Count(&albums)
+	db.Model(&ArtistStar{}).Where("user_id = ?", userID).Count(&artists)
+	db.Model(&TrackStar{}).Where("user_id = ?", userID).Count(&tracks)
+	return
+}
+
 // ClearAllCache removes all entries from the metadata_cache
 func (db *DB) ClearAllCache() error {
 	// Forzar checkpoint de WAL antes de DELETE para consolidar escrituras previas

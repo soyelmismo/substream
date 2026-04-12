@@ -225,6 +225,10 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 		var t TidalTrack
 		if err := json.Unmarshal(cached, &t); err == nil {
 			return &t, nil
+		} else {
+			// Data exists but is corrupt/invalid
+			c.tracks.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt track data for key=%s: %v", key, err)
 		}
 	}
 
@@ -235,9 +239,14 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 		var t TidalTrack
 		if err := json.Unmarshal(data, &t); err == nil {
 			return &t, nil
+		} else {
+			// Data in pending buffer is corrupt (shouldn't happen)
+			c.tracks.MarkCorrupt()
+			log.Printf("[CACHE ANOMALY] corrupt track in pending buffer key=%s: %v", key, err)
 		}
+	} else {
+		c.pendingMu.Unlock()
 	}
-	c.pendingMu.Unlock()
 
 	// 2. Check SQLite persistent cache (if db available)
 	if c.db != nil {
@@ -246,6 +255,10 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 			if err := json.Unmarshal(cached, &t); err == nil {
 				c.tracks.Set(key, cached, 0) // Warm LRU cache
 				return &t, nil
+			} else {
+				// Data in SQLite is corrupt
+				c.tracks.MarkCorrupt()
+				log.Printf("[CACHE ANOMALY] corrupt track in SQLite key=%s: %v", key, err)
 			}
 		}
 	}
@@ -848,6 +861,106 @@ func (c *CachedProxy) Close() {
 	c.similarArtists.Stop()
 	c.streamURLs.Stop()
 	c.unavailableTracks.Stop()
+}
+
+// CacheLevelStats holds stats for a single cache level
+type CacheLevelStats struct {
+	Name      string
+	Size      int
+	Hits      int64
+	Misses    int64
+	Evictions int64
+	Corrupt   int64 // Invalid/corrupted entries detected
+	HitRate   float64
+}
+
+// CacheStats holds statistics for all cache levels
+type CacheStats struct {
+	// In-memory LRU caches
+	Tracks          CacheLevelStats
+	Albums          CacheLevelStats
+	Artists         CacheLevelStats
+	AlbumArt        CacheLevelStats
+	AlbumCount      CacheLevelStats
+	ArtistAlbums    CacheLevelStats
+	ArtistTopTracks CacheLevelStats
+	SimilarArtists  CacheLevelStats
+	StreamURLs      CacheLevelStats
+	Unavailable     CacheLevelStats
+	// Write-back buffer
+	PendingBuffer int
+	// SQLite persistent cache
+	SQLiteTotal   int64
+	SQLiteExpired int64
+}
+
+// Stats returns current statistics for all cache levels
+func (c *CachedProxy) Stats() CacheStats {
+	tracksStats := c.tracks.Stats()
+	albumsStats := c.albums.Stats()
+	artistsStats := c.artists.Stats()
+	albumArtStats := c.albumArt.Stats()
+	albumCountStats := c.albumCount.Stats()
+	artistAlbumsStats := c.artistAlbums.Stats()
+	artistTopTracksStats := c.artistTopTracks.Stats()
+	similarArtistsStats := c.similarArtists.Stats()
+	streamURLsStats := c.streamURLs.Stats()
+	unavailableStats := c.unavailableTracks.Stats()
+
+	c.pendingMu.Lock()
+	pendingCount := len(c.pending)
+	c.pendingMu.Unlock()
+
+	var sqliteTotal, sqliteExpired int64
+	if c.db != nil {
+		sqliteTotal, sqliteExpired, _, _ = c.db.GetCacheStats()
+	}
+
+	return CacheStats{
+		Tracks: CacheLevelStats{
+			Name: "tracks", Size: tracksStats.Size, Hits: tracksStats.Hits,
+			Misses: tracksStats.Misses, Evictions: tracksStats.Evictions, Corrupt: tracksStats.Corrupt, HitRate: tracksStats.HitRate,
+		},
+		Albums: CacheLevelStats{
+			Name: "albums", Size: albumsStats.Size, Hits: albumsStats.Hits,
+			Misses: albumsStats.Misses, Evictions: albumsStats.Evictions, Corrupt: albumsStats.Corrupt, HitRate: albumsStats.HitRate,
+		},
+		Artists: CacheLevelStats{
+			Name: "artists", Size: artistsStats.Size, Hits: artistsStats.Hits,
+			Misses: artistsStats.Misses, Evictions: artistsStats.Evictions, Corrupt: artistsStats.Corrupt, HitRate: artistsStats.HitRate,
+		},
+		AlbumArt: CacheLevelStats{
+			Name: "album-art", Size: albumArtStats.Size, Hits: albumArtStats.Hits,
+			Misses: albumArtStats.Misses, Evictions: albumArtStats.Evictions, Corrupt: albumArtStats.Corrupt, HitRate: albumArtStats.HitRate,
+		},
+		AlbumCount: CacheLevelStats{
+			Name: "album-count", Size: albumCountStats.Size, Hits: albumCountStats.Hits,
+			Misses: albumCountStats.Misses, Evictions: albumCountStats.Evictions, Corrupt: albumCountStats.Corrupt, HitRate: albumCountStats.HitRate,
+		},
+		ArtistAlbums: CacheLevelStats{
+			Name: "artist-albums", Size: artistAlbumsStats.Size, Hits: artistAlbumsStats.Hits,
+			Misses: artistAlbumsStats.Misses, Evictions: artistAlbumsStats.Evictions, Corrupt: artistAlbumsStats.Corrupt, HitRate: artistAlbumsStats.HitRate,
+		},
+		ArtistTopTracks: CacheLevelStats{
+			Name: "artist-top-tracks", Size: artistTopTracksStats.Size, Hits: artistTopTracksStats.Hits,
+			Misses: artistTopTracksStats.Misses, Evictions: artistTopTracksStats.Evictions, Corrupt: artistTopTracksStats.Corrupt, HitRate: artistTopTracksStats.HitRate,
+		},
+		SimilarArtists: CacheLevelStats{
+			Name: "similar-artists", Size: similarArtistsStats.Size, Hits: similarArtistsStats.Hits,
+			Misses: similarArtistsStats.Misses, Evictions: similarArtistsStats.Evictions, Corrupt: similarArtistsStats.Corrupt, HitRate: similarArtistsStats.HitRate,
+		},
+		StreamURLs: CacheLevelStats{
+			Name: "stream-urls", Size: streamURLsStats.Size, Hits: streamURLsStats.Hits,
+			Misses: streamURLsStats.Misses, Evictions: streamURLsStats.Evictions, Corrupt: streamURLsStats.Corrupt, HitRate: streamURLsStats.HitRate,
+		},
+		Unavailable: CacheLevelStats{
+			Name: "unavailable-tracks", Size: unavailableStats.Size, Hits: unavailableStats.Hits,
+			Misses: unavailableStats.Misses, Evictions: unavailableStats.Evictions, Corrupt: unavailableStats.Corrupt, HitRate: unavailableStats.HitRate,
+		},
+		PendingBuffer: pendingCount,
+		SQLiteTotal:   sqliteTotal,
+		SQLiteExpired: sqliteExpired,
+	}
 }
 
 // ClearAll clears all in-memory LRU caches

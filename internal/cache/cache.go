@@ -85,6 +85,7 @@ type Cache[T any] struct {
 	hits      atomic.Int64
 	misses    atomic.Int64
 	evictions atomic.Int64
+	corrupt   atomic.Int64 // Invalid/corrupted entries found
 
 	stopCleanup chan struct{}
 	stopped     atomic.Bool
@@ -476,6 +477,7 @@ type Stats struct {
 	Hits      int64
 	Misses    int64
 	Evictions int64
+	Corrupt   int64 // Invalid/corrupted entries detected
 	Size      int
 	HitRate   float64 // Hit rate as percentage (0-100)
 }
@@ -496,16 +498,24 @@ func (c *Cache[T]) Stats() Stats {
 		Hits:      hits,
 		Misses:    misses,
 		Evictions: c.evictions.Load(),
+		Corrupt:   c.corrupt.Load(),
 		Size:      c.lru.Len(),
 		HitRate:   hitRate,
 	}
 }
 
-// ResetStats clears all statistics counters (hits, misses, evictions).
+// ResetStats clears all statistics counters (hits, misses, evictions, corrupt).
 func (c *Cache[T]) ResetStats() {
 	c.hits.Store(0)
 	c.misses.Store(0)
 	c.evictions.Store(0)
+	c.corrupt.Store(0)
+}
+
+// MarkCorrupt increments the corrupt entry counter.
+// Call this when data exists but is invalid/corrupted.
+func (c *Cache[T]) MarkCorrupt() {
+	c.corrupt.Add(1)
 }
 
 // removeEntry removes an entry from both map and list.

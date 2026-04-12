@@ -10,7 +10,7 @@
         <span class="text-gray-900 font-bold">stats</span>
     </div>
     <hr class="bg-gray-900/30 my-1" />
-    <div class="font-medium text-gray-500 max-w-[700px]">saved metrics in the local database</div>
+    <div class="font-medium text-gray-500 max-w-[700px]">global starred items across all users</div>
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
         <div class="grid grid-cols-[auto_min-content] gap-2 gap-x-5 text-right">
             <div class="text-gray-500">albums</div>
@@ -123,6 +123,50 @@
     </div>
     <hr class="bg-gray-900/30 my-1" />
     <div class="font-medium text-gray-500 max-w-[700px]">clear cached metadata from tidal api responses</div>
+
+    <!-- Cache Stats -->
+    <div class="mt-3 max-w-[700px] ml-auto">
+        <div class="text-sm text-gray-600 mb-2 text-right">cache levels</div>
+        <div class="grid grid-cols-[auto_min-content_min-content] gap-x-4 gap-y-1 text-right text-sm">
+            <!-- Level 1: In-Memory LRU -->
+            <div class="text-gray-500 font-medium">in-memory (lru)</div>
+            <div class="text-gray-400 text-xs">size</div>
+            <div class="text-gray-400 text-xs">hit rate</div>
+
+            <div class="text-gray-500">tracks</div>
+            <div class="font-mono">{{ .CacheStats.Tracks.Size }}</div>
+            <div class="font-mono {{ if gt .CacheStats.Tracks.Corrupt 0 }}text-red-500 font-bold{{ end }}">{{ printf "%.1f%%" .CacheStats.Tracks.HitRate }}{{ if gt .CacheStats.Tracks.Corrupt 0 }} ⚠{{ end }}</div>
+
+            <div class="text-gray-500">albums</div>
+            <div class="font-mono">{{ .CacheStats.Albums.Size }}</div>
+            <div class="font-mono {{ if gt .CacheStats.Albums.Corrupt 0 }}text-red-500 font-bold{{ end }}">{{ printf "%.1f%%" .CacheStats.Albums.HitRate }}{{ if gt .CacheStats.Albums.Corrupt 0 }} ⚠{{ end }}</div>
+
+            <div class="text-gray-500">artists</div>
+            <div class="font-mono">{{ .CacheStats.Artists.Size }}</div>
+            <div class="font-mono {{ if gt .CacheStats.Artists.Corrupt 0 }}text-red-500 font-bold{{ end }}">{{ printf "%.1f%%" .CacheStats.Artists.HitRate }}{{ if gt .CacheStats.Artists.Corrupt 0 }} ⚠{{ end }}</div>
+
+            <div class="text-gray-500">album art</div>
+            <div class="font-mono">{{ .CacheStats.AlbumArt.Size }}</div>
+            <div class="font-mono {{ if gt .CacheStats.AlbumArt.Corrupt 0 }}text-red-500 font-bold{{ end }}">{{ printf "%.1f%%" .CacheStats.AlbumArt.HitRate }}{{ if gt .CacheStats.AlbumArt.Corrupt 0 }} ⚠{{ end }}</div>
+
+            <div class="text-gray-500">stream urls</div>
+            <div class="font-mono">{{ .CacheStats.StreamURLs.Size }}</div>
+            <div class="font-mono {{ if gt .CacheStats.StreamURLs.Corrupt 0 }}text-red-500 font-bold{{ end }}">{{ printf "%.1f%%" .CacheStats.StreamURLs.HitRate }}{{ if gt .CacheStats.StreamURLs.Corrupt 0 }} ⚠{{ end }}</div>
+
+            <!-- Level 2: Write-back Buffer -->
+            <div class="col-span-3 border-t border-gray-200 mt-1 pt-1"></div>
+            <div class="text-gray-500 font-medium">write-back buffer</div>
+            <div class="font-mono">{{ .CacheStats.PendingBuffer }}</div>
+            <div class="text-gray-400 text-xs">pending</div>
+
+            <!-- Level 3: SQLite Persistent -->
+            <div class="col-span-3 border-t border-gray-200 mt-1 pt-1"></div>
+            <div class="text-gray-500 font-medium">sqlite persistent</div>
+            <div class="font-mono">{{ .CacheStats.SQLiteTotal }}</div>
+            <div class="text-gray-400 text-xs">{{ .CacheStats.SQLiteExpired }} expired</div>
+        </div>
+    </div>
+
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
         <form class="contents" action="{{ path "/admin/clear_cache_do" }}" method="post">
             <input type="submit" value="clear all cache" onclick="return confirm('Are you sure you want to clear all cached metadata?');">

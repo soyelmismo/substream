@@ -26,14 +26,17 @@ func (c *Controller) ServeHome(r *http.Request) *Response {
 	user := r.Context().Value(CtxUser).(*db.User)
 
 	data := &templateData{}
-	// stats box
-	var albums, artists, tracks int64
+	// stats box - global counts across all users
+	albums, artists, tracks := c.dbc.GetGlobalStats()
 
 	data.Stats = StatsData{
 		Albums:  albums,
 		Artists: artists,
 		Tracks:  tracks,
 	}
+
+	// cache stats from all levels
+	data.CacheStats = c.proxy.Stats()
 
 	data.RequestRoot = handlerutil.BaseURL(r)
 	data.DefaultListenBrainzURL = listenbrainz.BaseURL
