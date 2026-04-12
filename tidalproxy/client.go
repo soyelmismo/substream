@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -72,7 +73,6 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 	p.mirrorMgr.Start()
 	log.Printf("[POOL] Initialized with %d mirrors using intelligent routing", len(mirrorConfigs))
 
-	go p.healthCheck(cfg.HealthInterval) // Keep old health check as backup
 	return p
 }
 
@@ -96,28 +96,122 @@ func (p *Pool) GetMirrorManager() *MirrorManager {
 	return p.mirrorMgr
 }
 
-func (p *Pool) healthCheck(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	for range ticker.C {
-		p.mu.RLock()
-		instances := p.instances
-		p.mu.RUnlock()
+// ErrorCategory classifies errors to determine appropriate retry/fail behavior
+type ErrorCategory int
 
-		for _, inst := range instances {
-			go func(i *instance) {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
+const (
+	ErrorTransient        ErrorCategory = iota // Temporary errors: 502, 503, 504, timeout - definitely retry
+	ErrorRateLimited                           // 429 - retry after longer backoff
+	ErrorAuthExpired                           // 403 auth/session expired - retry once, then fail
+	ErrorTrackUnavailable                      // 403/404 specific to track (region blocked, deleted) - fail fast, don't retry
+	ErrorPermanent                             // Other non-retryable errors
+)
 
-				req, _ := http.NewRequestWithContext(ctx, "GET", i.url+"/info/?id=123", nil)
-				resp, err := p.client.Do(req)
-				healthy := err == nil && (resp.StatusCode == 200 || resp.StatusCode == 404)
-				if resp != nil {
-					resp.Body.Close()
-				}
-				i.healthy.Store(healthy)
-			}(inst)
+// classifyError categorizes API errors for smart retry logic
+func classifyError(err error) ErrorCategory {
+	if err == nil {
+		return ErrorTransient // Shouldn't happen, but be safe
+	}
+	errStr := err.Error()
+	lowerErr := strings.ToLower(errStr)
+
+	// Check for specific track unavailability patterns (fail fast, don't retry)
+	// These indicate the track is genuinely unavailable, not a proxy issue
+	trackUnavailablePatterns := []string{
+		"preview",       // Track only available as preview
+		"not available", // Explicit "not available" message
+		" unavailable",  // Explicit unavailable message
+		"region",        // Region-locked content
+		"restricted",    // Restricted content
+	}
+
+	// "upstream api error" can mean either track unavailable OR proxy issue
+	// Check context: if it's a 403 with auth/session keywords, it's auth-related
+	// If it's 404, it might be track unavailable
+	// Otherwise it's likely a transient proxy error
+	for _, pattern := range trackUnavailablePatterns {
+		if strings.Contains(lowerErr, pattern) {
+			return ErrorTrackUnavailable
 		}
 	}
+
+	// Rate limited - specific backoff needed
+	if strings.Contains(errStr, "429") {
+		return ErrorRateLimited
+	}
+
+	// Server errors - definitely retry
+	if strings.Contains(errStr, "502") ||
+		strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "504") {
+		return ErrorTransient
+	}
+
+	// 404 on trackManifests or track endpoints - might be proxy without track
+	// But if we've tried multiple proxies, it's likely track unavailable
+	if strings.Contains(errStr, "404") {
+		// If the error specifically mentions the track endpoint, it might be unavailable
+		if strings.Contains(lowerErr, "track") && strings.Contains(lowerErr, "manifest") {
+			return ErrorTrackUnavailable
+		}
+		return ErrorTransient
+	}
+
+	// 403 can be auth expired OR track unavailable - check context
+	if strings.Contains(errStr, "403") {
+		// If error mentions "auth", "session", "token" - it's auth expired
+		authPatterns := []string{"auth", "session", "token", "unauthorized"}
+		for _, pattern := range authPatterns {
+			if strings.Contains(lowerErr, pattern) {
+				return ErrorAuthExpired
+			}
+		}
+		// Otherwise assume track unavailable (region lock, account restriction)
+		return ErrorTrackUnavailable
+	}
+
+	// Network/timeout errors - retry
+	if strings.Contains(lowerErr, "timeout") ||
+		strings.Contains(lowerErr, "deadline exceeded") ||
+		strings.Contains(lowerErr, "connection refused") ||
+		strings.Contains(lowerErr, "no such host") ||
+		strings.Contains(lowerErr, "connection reset") {
+		return ErrorTransient
+	}
+
+	return ErrorPermanent
+}
+
+// calculateBackoff returns exponential backoff duration with jitter based on error category
+func calculateBackoff(try int, baseDelay time.Duration, errCategory ErrorCategory) time.Duration {
+	var delay time.Duration
+
+	switch errCategory {
+	case ErrorRateLimited:
+		// Rate limit needs longer backoff - start at 2 seconds
+		delay = 2 * time.Second * time.Duration(1<<try)
+		if delay > 60*time.Second {
+			delay = 60 * time.Second
+		}
+	case ErrorAuthExpired:
+		// Auth errors - medium backoff
+		delay = 500 * time.Millisecond * time.Duration(1<<try)
+		if delay > 10*time.Second {
+			delay = 10 * time.Second
+		}
+	case ErrorTransient:
+		// Server errors/timeout - standard backoff
+		delay = baseDelay * time.Duration(1<<try)
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+	default:
+		delay = baseDelay
+	}
+
+	// Add jitter (0-25%) to prevent thundering herd
+	jitter := time.Duration(rand.Int63n(int64(delay) / 4))
+	return delay + jitter
 }
 
 // doFetchRawWithInstance performs a GET request to a specific proxy instance (by index).
@@ -144,6 +238,12 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		}
 	}
 	p.mu.RUnlock()
+
+	// Track active requests for load balancing
+	if m != nil {
+		m.activeRequests.Add(1)
+		defer m.activeRequests.Add(-1)
+	}
 
 	u := base + path
 	if len(query) > 0 {
@@ -191,26 +291,118 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 	return body, err
 }
 
+// doFetchRawWithMirror performs a GET request to a specific mirror and decodes JSON response.
+// This allows GetStreamURL to use smart mirror selection with exclusion.
+func (p *Pool) doFetchRawWithMirror(ctx context.Context, path string, query url.Values, clientIP string, m *Mirror, result interface{}) error {
+	if m == nil {
+		return fmt.Errorf("no mirror provided")
+	}
+
+	// Increment active requests for load balancing
+	m.activeRequests.Add(1)
+	defer m.activeRequests.Add(-1)
+
+	u := m.URL + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+		req.Header.Set("X-Real-IP", clientIP)
+	}
+
+	start := time.Now()
+	resp, err := p.client.Do(req)
+	latency := time.Since(start)
+
+	if err != nil {
+		if p.mirrorMgr != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return fmt.Errorf("request %s: %w", path, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		err := fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
+		if p.mirrorMgr != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if err != nil {
+		if p.mirrorMgr != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return fmt.Errorf("read body: %w", err)
+	}
+
+	// Try to unmarshal envelope first, then direct
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil && len(envelope.Data) > 0 {
+		if err := json.Unmarshal(envelope.Data, result); err == nil {
+			if p.mirrorMgr != nil {
+				p.mirrorMgr.ReportResult(m, latency, nil)
+			}
+			return nil
+		}
+	}
+
+	// Fallback: direct unmarshal
+	if err := json.Unmarshal(body, result); err != nil {
+		return fmt.Errorf("decode result: %w (body: %s)", err, string(body))
+	}
+
+	if p.mirrorMgr != nil {
+		p.mirrorMgr.ReportResult(m, latency, nil)
+	}
+	return nil
+}
+
 // apiGet performs a GET to a hifi-api endpoint and decodes JSON from .data field with retries.
 // It now accepts an optional clientIP to set X-Forwarded-For for Tidal's IP-locked streaming.
 func (p *Pool) apiGet(ctx context.Context, path string, query url.Values, result interface{}, clientIP string) error {
 	return p.apiGetWithRetry(ctx, path, query, result, clientIP, 3) // Default 3 retries
 }
 
-// apiGetWithRetry attempts the request with multiple proxies on 404 errors.
-// This handles Tidal API inconsistency where an artist exists on some proxies but not others.
+// apiGetWithRetry attempts the request with multiple proxies on retryable errors.
+// This handles Tidal API inconsistency and transient proxy errors.
 func (p *Pool) apiGetWithRetry(ctx context.Context, path string, query url.Values, result interface{}, clientIP string, maxRetries int) error {
 	var lastErr error
+	baseDelay := 100 * time.Millisecond
+
 	for try := 0; try < maxRetries; try++ {
 		body, err := p.doFetchRawWithInstance(ctx, path, query, clientIP, try)
 		if err != nil {
 			lastErr = err
-			// Check if it's a 404 error
-			if strings.Contains(err.Error(), "404") {
-				log.Printf("[TIDAL] apiGet 404 on try %d/%d for %s, retrying with next proxy...", try+1, maxRetries, path)
-				continue // Try next proxy
+			errCat := classifyError(err)
+			if errCat == ErrorTransient || errCat == ErrorRateLimited || errCat == ErrorAuthExpired {
+				log.Printf("[TIDAL] apiGet retryable error on try %d/%d for %s: %v", try+1, maxRetries, path, err)
+				if try < maxRetries-1 {
+					backoff := calculateBackoff(try, baseDelay, errCat)
+					select {
+					case <-time.After(backoff):
+						continue
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+				continue
 			}
-			return err // Non-404 error, fail fast
+			return err // Non-retryable error, fail fast
 		}
 
 		// Envelope handling: many hifi-api endpoints wrap data in a top-level JSON
@@ -230,7 +422,7 @@ func (p *Pool) apiGetWithRetry(ctx context.Context, path string, query url.Value
 		}
 		return nil
 	}
-	return fmt.Errorf("all %d proxies returned 404 or error for %s: %v", maxRetries, path, lastErr)
+	return fmt.Errorf("all %d proxies returned error for %s: %v", maxRetries, path, lastErr)
 }
 
 // apiGetRaw returns the raw body as bytes with retries.
@@ -239,22 +431,34 @@ func (p *Pool) apiGetRaw(ctx context.Context, path string, query url.Values, cli
 	return p.apiGetRawWithRetry(ctx, path, query, clientIP, 3)
 }
 
-// apiGetRawWithRetry attempts the request with multiple proxies on 404 errors.
+// apiGetRawWithRetry attempts the request with multiple proxies on retryable errors.
 func (p *Pool) apiGetRawWithRetry(ctx context.Context, path string, query url.Values, clientIP string, maxRetries int) ([]byte, error) {
 	var lastErr error
+	baseDelay := 100 * time.Millisecond
+
 	for try := 0; try < maxRetries; try++ {
 		body, err := p.doFetchRawWithInstance(ctx, path, query, clientIP, try)
 		if err != nil {
 			lastErr = err
-			if strings.Contains(err.Error(), "404") {
-				log.Printf("[TIDAL] apiGetRaw 404 on try %d/%d for %s, retrying with next proxy...", try+1, maxRetries, path)
+			errCat := classifyError(err)
+			if errCat == ErrorTransient || errCat == ErrorRateLimited || errCat == ErrorAuthExpired {
+				log.Printf("[TIDAL] apiGetRaw retryable error on try %d/%d for %s: %v", try+1, maxRetries, path, err)
+				if try < maxRetries-1 {
+					backoff := calculateBackoff(try, baseDelay, errCat)
+					select {
+					case <-time.After(backoff):
+						continue
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
 				continue
 			}
 			return nil, err
 		}
 		return body, nil
 	}
-	return nil, fmt.Errorf("all %d proxies returned 404 or error for %s: %v", maxRetries, path, lastErr)
+	return nil, fmt.Errorf("all %d proxies returned error for %s: %v", maxRetries, path, lastErr)
 }
 
 // =====================================================================
@@ -443,7 +647,7 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 	if err := p.apiGet(ctx, "/search/", q, &result, ""); err != nil {
 		return nil, err
 	}
-	
+
 	var sourceItems []TidalAlbum
 	if len(result.Albums.Items) > 0 {
 		sourceItems = result.Albums.Items
@@ -465,7 +669,7 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 	if limit > 0 && len(uniqueItems) > limit {
 		uniqueItems = uniqueItems[:limit]
 	}
-	
+
 	return uniqueItems, nil
 }
 
@@ -484,21 +688,58 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 
 	var lastErr error
 
+	// [Smart Mirror Exclusion] Track which mirrors we've already tried for this request
+	// to avoid wasting time on mirrors that already failed
+	triedMirrors := make(map[string]bool)
+
 	// Reduce retries if we use smart mirror selection
 	maxRetries := 3
 	for try := 0; try < maxRetries; try++ {
+		// Select next mirror, excluding ones we've already tried
+		var m *Mirror
+		p.mu.RLock()
+		if p.mirrorMgr != nil {
+			// Try to find a healthy mirror we haven't tried yet
+			for _, candidate := range p.mirrorMgr.GetMirrors() {
+				if triedMirrors[candidate.URL] {
+					continue
+				}
+				state := candidate.GetState()
+				if state == StateHealthy || state == StateProbing {
+					m = candidate
+					break
+				}
+			}
+			// If no untried healthy mirrors, fallback to any untried mirror
+			if m == nil {
+				for _, candidate := range p.mirrorMgr.GetMirrors() {
+					if !triedMirrors[candidate.URL] {
+						m = candidate
+						break
+					}
+				}
+			}
+		}
+		p.mu.RUnlock()
+
+		if m == nil {
+			// We've tried all available mirrors
+			log.Printf("[TIDAL] GetStreamURL track=%d exhausted all %d mirrors", trackID, len(triedMirrors))
+			break
+		}
+
+		// Mark this mirror as tried
+		triedMirrors[m.URL] = true
+		mirrorStart := time.Now() // Track start time for this mirror
+
 		for _, qStr := range qualities {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
 
-			// Try V2 and V1 in parallel to save time?
-			// No, let's keep it simple but with shorter timeouts for V2
-
-			log.Printf("[TIDAL] GetStreamURL track=%d try=%d/%d quality=%s", trackID, try, maxRetries-1, qStr)
+			log.Printf("[TIDAL] GetStreamURL track=%d try=%d/%d quality=%s mirror=%s", trackID, try, maxRetries-1, qStr, m.URL)
 
 			// 1. Try V2 OpenAPI Manifests first (HLS)
-			// Shorter timeout to fail fast and go to V1 or next proxy
 			v2Ctx, v2Cancel := context.WithTimeout(ctx, 2*time.Second)
 			var formats []string
 			switch qStr {
@@ -533,24 +774,48 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 				} `json:"data"`
 			}
 
-			// Pass try directly to use different mirrors in sequence
-			err := p.apiGetWithRetry(v2Ctx, "/trackManifests/", qV2, &v2Response, clientIP, 1) // Only 1 attempt here, outer loop handles retries
+			// Use specific mirror via doFetchRawWithMirror
+			err := p.doFetchRawWithMirror(v2Ctx, "/trackManifests/", qV2, clientIP, m, &v2Response)
 			v2Cancel()
 
-			if err == nil {
-				if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
-					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW (V2) - skipping quality %s", trackID, qStr)
-					continue
+			// [Fail Fast] Check if error indicates track is permanently unavailable
+			if err != nil {
+				errCat := classifyError(err)
+				if errCat == ErrorTrackUnavailable {
+					log.Printf("[TIDAL] GetStreamURL track=%d is unavailable (quality=%s): %v", trackID, qStr, err)
+					// Don't retry other mirrors for unavailable tracks
+					return "", fmt.Errorf("track unavailable: %w", err)
 				}
-				uri := v2Response.Data.Attributes.URI
-				if uri != "" && !strings.Contains(uri, "manifest.tidal.com") && !strings.Contains(uri, "/manifests/") {
-					return uri, nil
+				// Report transient errors to mirror manager
+				// Use actual latency from context deadline or a reasonable estimate
+				latency := time.Since(mirrorStart)
+				if latency < 100*time.Millisecond {
+					latency = 100 * time.Millisecond // Minimum to avoid distorting metrics
 				}
-				if uri != "" {
-					audioURL, err := p.downloadAndParseHLSManifest(ctx, uri, clientIP)
-					if err == nil && audioURL != "" {
-						return audioURL, nil
+				if p.mirrorMgr != nil {
+					p.mirrorMgr.ReportResult(m, latency, err)
+				}
+				continue // Try next quality
+			}
+
+			if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
+				log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW (V2) - skipping quality %s", trackID, qStr)
+				continue
+			}
+			uri := v2Response.Data.Attributes.URI
+			if uri != "" && !strings.Contains(uri, "manifest.tidal.com") && !strings.Contains(uri, "/manifests/") {
+				if p.mirrorMgr != nil {
+					p.mirrorMgr.ReportResult(m, 0, nil)
+				}
+				return uri, nil
+			}
+			if uri != "" {
+				audioURL, err := p.downloadAndParseHLSManifest(ctx, uri, clientIP)
+				if err == nil && audioURL != "" {
+					if p.mirrorMgr != nil {
+						p.mirrorMgr.ReportResult(m, 0, nil)
 					}
+					return audioURL, nil
 				}
 			}
 
@@ -562,27 +827,42 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, cl
 				"assetpresentation": {"FULL"},
 			}
 			var stream TidalStreamInfo
-			if err := p.apiGetWithRetry(ctx, "/track/", q, &stream, clientIP, 1); err == nil {
+			if err := p.doFetchRawWithMirror(ctx, "/track/", q, clientIP, m, &stream); err == nil {
 				if stream.TrackPresentation == "PREVIEW" {
 					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW (V1) - skipping quality %s", trackID, qStr)
 					continue
 				}
 				u, err := parseManifestURL(trackID, "V1", stream.ManifestMimeType, stream.Manifest)
 				if err == nil {
+					if p.mirrorMgr != nil {
+						p.mirrorMgr.ReportResult(m, 0, nil)
+					}
 					return u, nil
 				}
 				lastErr = err
 			} else {
 				lastErr = err
+				// Check if V1 error indicates track unavailable
+				errCat := classifyError(err)
+				if errCat == ErrorTrackUnavailable {
+					log.Printf("[TIDAL] GetStreamURL track=%d is unavailable (V1, quality=%s): %v", trackID, qStr, err)
+					return "", fmt.Errorf("track unavailable: %w", err)
+				}
+				if p.mirrorMgr != nil {
+					// Use actual latency instead of 0 to avoid corrupting EMA metrics
+					latency := time.Since(mirrorStart)
+					if latency < 100*time.Millisecond {
+						latency = 100 * time.Millisecond
+					}
+					p.mirrorMgr.ReportResult(m, latency, err)
+				}
 			}
 		}
 
-		// If we reached here, this proxy/mirror didn't work for any quality.
-		// The next iteration of 'try' loop will pick another mirror in doFetchRawWithInstance.
-		log.Printf("[TIDAL] GetStreamURL track=%d try %d failed, will try next mirror", trackID, try)
+		log.Printf("[TIDAL] GetStreamURL track=%d mirror %s failed, will try next mirror", trackID, m.URL)
 	}
 
-	return "", fmt.Errorf("could not get full stream after %d mirrors: %v", maxRetries, lastErr)
+	return "", fmt.Errorf("could not get full stream after %d mirrors: %v", len(triedMirrors), lastErr)
 }
 
 // downloadAndParseHLSManifest downloads a Tidal manifest and extracts the audio stream URL

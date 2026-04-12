@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -36,36 +37,38 @@ func (s MirrorState) String() string {
 
 // Mirror represents a single proxy mirror
 type Mirror struct {
-	URL          string
-	Weight       int
+	URL            string
+	Weight         int
 	HealthEndpoint string // e.g., "/health" or just "/" for HEAD check
-	
+
 	// Runtime stats - accessed via atomic
-	state          atomic.Int32 // MirrorState
-	latencyEMA     atomic.Int64 // nanoseconds, exponential moving average
-	failCount      atomic.Int32
-	activeRequests atomic.Int32
-	lastFail       atomic.Int64 // unix timestamp
-	lastSuccess    atomic.Int64 // unix timestamp
-	requestCount   atomic.Int64
+	state               atomic.Int32 // MirrorState
+	latencyEMA          atomic.Int64 // nanoseconds, exponential moving average
+	failCount           atomic.Int32
+	successCount        atomic.Int64 // for success rate calculation
+	consecutiveSuccess  atomic.Int32 // for hysteresis in recovery
+	activeRequests      atomic.Int32
+	lastFail            atomic.Int64 // unix timestamp of last request failure
+	lastSuccess         atomic.Int64 // unix timestamp
+	requestCount        atomic.Int64
+	lastHealthCheckFail atomic.Int64 // unix timestamp of last health check failure
 }
 
 // MirrorManager manages multiple proxy mirrors with health checking
 type MirrorManager struct {
 	mirrors []*Mirror
 	mu      sync.RWMutex
-	
+
 	// Config
 	healthCheckInterval time.Duration
 	failureThreshold    int
 	cooldownDuration    time.Duration
 	probeTimeout        time.Duration
-	
+
 	// Control
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	gate   chan struct{}
 }
 
 // MirrorConfig for initializing mirrors
@@ -78,7 +81,7 @@ type MirrorConfig struct {
 // NewMirrorManager creates a new mirror manager
 func NewMirrorManager(configs []MirrorConfig, healthCheckInterval time.Duration) *MirrorManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	mm := &MirrorManager{
 		mirrors:             make([]*Mirror, 0, len(configs)),
 		healthCheckInterval: healthCheckInterval,
@@ -88,7 +91,7 @@ func NewMirrorManager(configs []MirrorConfig, healthCheckInterval time.Duration)
 		ctx:                 ctx,
 		cancel:              cancel,
 	}
-	
+
 	for _, cfg := range configs {
 		m := &Mirror{
 			URL:            cfg.URL,
@@ -100,8 +103,6 @@ func NewMirrorManager(configs []MirrorConfig, healthCheckInterval time.Duration)
 		mm.mirrors = append(mm.mirrors, m)
 	}
 
-	mm.gate = make(chan struct{}, len(mm.mirrors))
-	
 	return mm
 }
 
@@ -127,7 +128,7 @@ func (mm *MirrorManager) UpdateMirrors(urls []string) {
 	newMirrors := make([]*Mirror, 0, len(urls))
 	for _, url := range urls {
 		url = strings.TrimSuffix(url, "/")
-		
+
 		if m, ok := existing[url]; ok {
 			// Keep existing mirror with its stats
 			newMirrors = append(newMirrors, m)
@@ -155,7 +156,7 @@ func (mm *MirrorManager) UpdateMirrors(urls []string) {
 			}
 		}
 		if !found {
-			log.Printf("[MIRROR] Removed mirror: %s (state=%s, reqs=%d)", 
+			log.Printf("[MIRROR] Removed mirror: %s (state=%s, reqs=%d)",
 				url, m.GetState(), m.requestCount.Load())
 		}
 	}
@@ -171,55 +172,53 @@ func (mm *MirrorManager) Stop() {
 }
 
 // SelectMirror chooses the best mirror based on health and latency
-// AcquireToken waits for a proxy to become available
-func (mm *MirrorManager) AcquireToken(ctx context.Context) error {
-	select {
-	case mm.gate <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// ReleaseToken frees a proxy for the next request in queue
-func (mm *MirrorManager) ReleaseToken() {
-	<-mm.gate
-}
-
 func (mm *MirrorManager) SelectMirror() *Mirror {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
 
 	var healthyMirrors []*Mirror
+	var probingMirrors []*Mirror
 	for _, m := range mm.mirrors {
-		if m.GetState() == StateHealthy {
+		switch m.GetState() {
+		case StateHealthy:
 			healthyMirrors = append(healthyMirrors, m)
+		case StateProbing:
+			probingMirrors = append(probingMirrors, m)
 		}
 	}
 
-	if len(healthyMirrors) == 0 {
+	// Priority: healthy > probing > nil
+	selectionPool := healthyMirrors
+	if len(selectionPool) == 0 {
+		selectionPool = probingMirrors
+		if len(selectionPool) > 0 {
+			log.Printf("[MIRROR] No healthy mirrors, falling back to %d probing mirrors", len(selectionPool))
+		}
+	}
+
+	if len(selectionPool) == 0 {
 		return nil
 	}
 
 	// [New Strategy] Preference for IDLE mirrors first (activeRequests == 0)
 	var idleMirrors []*Mirror
-	for _, m := range healthyMirrors {
+	for _, m := range selectionPool {
 		if m.activeRequests.Load() == 0 {
 			idleMirrors = append(idleMirrors, m)
 		}
 	}
 
-	// Use idle pool if available, otherwise use all healthy ones
-	selectionPool := idleMirrors
-	if len(selectionPool) == 0 {
-		selectionPool = healthyMirrors
+	// Use idle pool if available, otherwise use all from current pool
+	if len(idleMirrors) > 0 {
+		selectionPool = idleMirrors
 	}
 
 	if len(selectionPool) == 1 {
 		return selectionPool[0]
 	}
 
-	// Weighted Random Selection (Shotgun Spread)
+	// [Enhanced] Weighted Random Selection with Success Rate
+	// Score = (1/latency) * weight * successRate
 	var totalScore float64
 	type scoredMirror struct {
 		m     *Mirror
@@ -228,11 +227,36 @@ func (mm *MirrorManager) SelectMirror() *Mirror {
 	var scoredPool []scoredMirror
 
 	for _, m := range selectionPool {
-		_, latency, _, _ := m.GetStats()
-		// Score = (1/latency) * weight
-		score := 1.0 / (float64(latency+1) / float64(time.Millisecond)) * float64(m.Weight)
+		_, latency, _, reqs := m.GetStats()
+		successRate := m.GetSuccessRate()
+
+		// Base score from latency (inverse, in ms)
+		latencyScore := 1.0 / (float64(latency+1) / float64(time.Millisecond))
+
+		// Success rate factor: penalize mirrors with < 80% success heavily
+		successFactor := 0.5 + 0.5*successRate // Range: 0.5 (0% success) to 1.0 (100% success)
+
+		// Weighted score combining latency, success rate, and configured weight
+		score := latencyScore * successFactor * float64(m.Weight)
+
+		// Additional penalty for high failure count in current burst
+		failCount := int(m.failCount.Load())
+		if failCount > 0 {
+			score *= math.Pow(0.8, float64(failCount)) // Exponential penalty per recent failure
+		}
+
 		totalScore += score
 		scoredPool = append(scoredPool, scoredMirror{m: m, limit: totalScore})
+
+		// Debug logging for selection process
+		if reqs > 10 && successRate < 0.5 {
+			log.Printf("[MIRROR] Low success rate: %s (%.1f%% success over %d reqs, score=%.2f)",
+				m.URL, successRate*100, reqs, score)
+		}
+	}
+
+	if totalScore == 0 {
+		return selectionPool[0]
 	}
 
 	r := rand.Float64() * totalScore
@@ -248,40 +272,63 @@ func (mm *MirrorManager) SelectMirror() *Mirror {
 // ReportResult updates mirror stats after a request
 func (mm *MirrorManager) ReportResult(m *Mirror, latency time.Duration, err error) {
 	m.requestCount.Add(1)
-	
+
 	if err != nil {
-		m.failCount.Add(1)
+		failCount := int(m.failCount.Add(1))
 		m.lastFail.Store(time.Now().Unix())
-		
+
 		errStr := err.Error()
 		isRateLimit := strings.Contains(errStr, "429")
+		isServerError := strings.Contains(errStr, "502") || strings.Contains(errStr, "503") ||
+			strings.Contains(errStr, "504") || strings.Contains(errStr, "403")
 
 		// Check if we should circuit break
 		// [New] 429 (Rate Limit) causes immediate unhealthy state
-		if (isRateLimit || int(m.failCount.Load()) >= mm.failureThreshold) && m.GetState() == StateHealthy {
+		// [New] 5xx and 403 errors also count toward threshold but don't immediately circuit break
+		shouldCircuitBreak := isRateLimit || failCount >= mm.failureThreshold
+		if shouldCircuitBreak && m.GetState() == StateHealthy {
 			m.SetState(StateUnhealthy)
 			reason := "multiple failures"
-			if isRateLimit { reason = "rate limited (429)" }
-			log.Printf("[MIRROR] %s marked unhealthy: %s", m.URL, reason)
+			if isRateLimit {
+				reason = "rate limited (429)"
+			}
+			log.Printf("[MIRROR] %s marked unhealthy: %s (failCount=%d)", m.URL, reason, failCount)
+		} else if isServerError && m.GetState() == StateHealthy {
+			// Log server errors for monitoring but don't circuit break immediately
+			log.Printf("[MIRROR] %s server error (will count toward threshold): %s (failCount=%d/%d)",
+				m.URL, errStr, failCount, mm.failureThreshold)
 		}
 		return
 	}
-	
+
 	// Success - update latency EMA
 	m.lastSuccess.Store(time.Now().Unix())
-	m.failCount.Store(0)
-	
+	prevFailCount := int(m.failCount.Swap(0))
+
 	oldEMA := m.latencyEMA.Load()
 	newSample := int64(latency)
-	
+
 	// EMA: 0.7 * old + 0.3 * new
 	newEMA := int64(0.7*float64(oldEMA) + 0.3*float64(newSample))
 	m.latencyEMA.Store(newEMA)
-	
-	// If was probing and succeeded, mark healthy
-	if m.GetState() == StateProbing {
+
+	// Calculate success rate for weighted selection
+	mm.updateSuccessRate(m, true)
+
+	// Recovery logic: unhealthy -> probing, probing -> healthy, or direct unhealthy -> healthy if was succeeding
+	state := m.GetState()
+	switch state {
+	case StateUnhealthy:
+		// Check if cooldown has passed
+		lastFail := time.Unix(m.lastFail.Load(), 0)
+		if time.Since(lastFail) > mm.cooldownDuration {
+			m.SetState(StateProbing)
+			log.Printf("[MIRROR] %s recovered to probing (cooldown passed, success after %d failures)",
+				m.URL, prevFailCount)
+		}
+	case StateProbing:
 		m.SetState(StateHealthy)
-		log.Printf("[MIRROR] %s recovered and marked healthy", m.URL)
+		log.Printf("[MIRROR] %s recovered and marked healthy (latency: %v)", m.URL, latency)
 	}
 }
 
@@ -297,22 +344,39 @@ func (m *Mirror) SetState(s MirrorState) {
 
 // GetStats returns current stats for logging/monitoring
 func (m *Mirror) GetStats() (state MirrorState, latency time.Duration, failCount int, reqs int64) {
-	return m.GetState(), 
-		time.Duration(m.latencyEMA.Load()), 
-		int(m.failCount.Load()), 
+	return m.GetState(),
+		time.Duration(m.latencyEMA.Load()),
+		int(m.failCount.Load()),
 		m.requestCount.Load()
+}
+
+// GetSuccessRate returns the success rate (0.0 to 1.0) based on recent requests
+func (m *Mirror) GetSuccessRate() float64 {
+	total := m.requestCount.Load()
+	if total == 0 {
+		return 1.0 // Default to optimistic 100% if no data
+	}
+	success := m.successCount.Load()
+	return float64(success) / float64(total)
+}
+
+// updateSuccessRate updates the success/failure counters
+func (mm *MirrorManager) updateSuccessRate(m *Mirror, success bool) {
+	if success {
+		m.successCount.Add(1)
+	}
 }
 
 // healthCheckLoop periodically checks mirror health
 func (mm *MirrorManager) healthCheckLoop() {
 	defer mm.wg.Done()
-	
+
 	ticker := time.NewTicker(mm.healthCheckInterval)
 	defer ticker.Stop()
-	
+
 	// Initial check
 	mm.runHealthChecks()
-	
+
 	for {
 		select {
 		case <-mm.ctx.Done():
@@ -328,16 +392,16 @@ func (mm *MirrorManager) runHealthChecks() {
 	client := &http.Client{
 		Timeout: mm.probeTimeout,
 	}
-	
+
 	for _, m := range mm.mirrors {
 		state := m.GetState()
-		
+
 		// Only check unhealthy (for cooldown) or all periodically
 		if state == StateHealthy && rand.Float32() > 0.2 {
 			// Skip 80% of healthy checks to reduce load
 			continue
 		}
-		
+
 		go mm.checkMirror(client, m)
 	}
 }
@@ -348,31 +412,30 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 	defer m.activeRequests.Add(-1)
 
 	start := time.Now()
-	
+
 	endpoint := m.URL + m.HealthEndpoint
 	if m.HealthEndpoint == "" {
 		endpoint = m.URL // Use base URL
 	}
-	
+
 	ctx, cancel := context.WithTimeout(mm.ctx, mm.probeTimeout)
 	defer cancel()
-	
+
 	req, err := http.NewRequestWithContext(ctx, "HEAD", endpoint, nil)
 	if err != nil {
 		return
 	}
-	
+
 	resp, err := client.Do(req)
 	latency := time.Since(start)
-	
-	// Final health check - if it was marked as unhealthy while we were starting, fail fast
-	if m.GetState() == StateUnhealthy {
-		if resp != nil { resp.Body.Close() }
-		return
+	if resp != nil {
+		defer resp.Body.Close()
 	}
 
 	if err != nil {
-		// Failed - might be network error
+		// Failed - record health check failure time separately from request failures
+		m.lastHealthCheckFail.Store(time.Now().Unix())
+		m.consecutiveSuccess.Store(0) // Reset consecutive success counter on failure
 		if m.GetState() == StateHealthy {
 			m.failCount.Add(1)
 			if int(m.failCount.Load()) >= mm.failureThreshold {
@@ -382,22 +445,49 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 		}
 		return
 	}
-	resp.Body.Close()
-	
-	// Success
+
+	// Success - verify HTTP status is actually OK
+	if resp.StatusCode != http.StatusOK {
+		// Health check returned non-200, treat as failure
+		m.lastHealthCheckFail.Store(time.Now().Unix())
+		m.consecutiveSuccess.Store(0) // Reset consecutive success counter
+		if m.GetState() == StateHealthy {
+			m.failCount.Add(1)
+			if int(m.failCount.Load()) >= mm.failureThreshold {
+				m.SetState(StateUnhealthy)
+				log.Printf("[MIRROR] %s health check returned %d, marked unhealthy", m.URL, resp.StatusCode)
+			}
+		}
+		return
+	}
+
+	// Health check passed with 200 OK
+	consecutive := m.consecutiveSuccess.Add(1)
+
 	if m.GetState() == StateUnhealthy {
-		// Check if cooldown passed
-		lastFail := time.Unix(m.lastFail.Load(), 0)
-		if time.Since(lastFail) > mm.cooldownDuration {
+		// Check if cooldown passed based on last health check failure (not request failure)
+		lastHealthFail := time.Unix(m.lastHealthCheckFail.Load(), 0)
+		if time.Since(lastHealthFail) > mm.cooldownDuration {
 			m.SetState(StateProbing)
+			m.consecutiveSuccess.Store(1) // Reset to 1 (this success)
 			log.Printf("[MIRROR] %s cooldown ended, entering probing state", m.URL)
 		}
 	} else if m.GetState() == StateProbing {
-		m.SetState(StateHealthy)
-		m.failCount.Store(0)
-		log.Printf("[MIRROR] %s health check passed, marked healthy (latency: %v)", m.URL, latency)
+		// Require 2 consecutive successes before marking healthy (hysteresis)
+		if consecutive >= 2 {
+			m.SetState(StateHealthy)
+			m.failCount.Store(0)
+			log.Printf("[MIRROR] %s health check passed 2x, marked healthy (latency: %v)", m.URL, latency)
+		} else {
+			log.Printf("[MIRROR] %s probing success %d/2 (latency: %v)", m.URL, consecutive, latency)
+		}
+	} else {
+		// Already healthy, just cap the counter to prevent overflow
+		if consecutive > 100 {
+			m.consecutiveSuccess.Store(100)
+		}
 	}
-	
+
 	// Update latency even on health checks
 	mm.ReportResult(m, latency, nil)
 }
@@ -406,7 +496,7 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 func (mm *MirrorManager) GetStatus() string {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
-	
+
 	status := "Mirror Status:\n"
 	for _, m := range mm.mirrors {
 		state, latency, fails, reqs := m.GetStats()

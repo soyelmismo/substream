@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,10 @@ type CachedProxy struct {
 
 	// [New] Stream URL cache (Short-lived, IP-locked)
 	streamURLs *cache.Cache[string]
+
+	// [New] Negative cache for tracks that are unavailable (403/404 errors)
+	// This prevents repeated attempts on region-blocked or deleted tracks
+	unavailableTracks *cache.Cache[time.Time] // trackID -> first failure time
 }
 
 func NewCachedProxy(base TidalProxy, dbc *db.DB, ttl time.Duration) *CachedProxy {
@@ -97,6 +102,12 @@ func NewCachedProxy(base TidalProxy, dbc *db.DB, ttl time.Duration) *CachedProxy
 			MaxSize:         500,
 			DefaultTTL:      30 * time.Minute, // Safely within 1h Tidal window
 			CleanupInterval: 5 * time.Minute,
+		}),
+		unavailableTracks: cache.New[time.Time](cache.Config{
+			Name:            "tidal-unavailable-tracks",
+			MaxSize:         1000,             // Track up to 1000 unavailable tracks
+			DefaultTTL:      10 * time.Minute, // Cache for 10 minutes
+			CleanupInterval: 2 * time.Minute,
 		}),
 		pending: make(map[string][]byte),
 		quit:    make(chan struct{}),
@@ -611,6 +622,12 @@ func (c *CachedProxy) GetRecommendations(ctx context.Context, trackID int) ([]Ti
 }
 
 func (c *CachedProxy) GetStreamURL(ctx context.Context, trackID int, quality string, clientIP string) (string, error) {
+	// Check negative cache first - if track is known to be unavailable, fail fast
+	unavailableKey := fmt.Sprintf("td:unavailable:%d", trackID)
+	if failTime := c.unavailableTracks.Get(unavailableKey); !failTime.IsZero() {
+		return "", fmt.Errorf("track %d is unavailable (cached since %v)", trackID, failTime)
+	}
+
 	key := fmt.Sprintf("td:st:%d:%s:%s", trackID, quality, clientIP)
 	if url := c.streamURLs.Get(key); url != "" {
 		return url, nil
@@ -619,6 +636,54 @@ func (c *CachedProxy) GetStreamURL(ctx context.Context, trackID int, quality str
 	url, err := c.TidalProxy.GetStreamURL(ctx, trackID, quality, clientIP)
 	if err == nil && url != "" {
 		c.streamURLs.Set(key, url, 0)
+	} else if err != nil {
+		// Check if error indicates track is permanently unavailable
+		// This prevents wasting resources on region-blocked or deleted tracks
+		// BE CONSERVATIVE: Only cache as unavailable when definitively clear
+		errStr := strings.ToLower(err.Error())
+		isDefinitivelyUnavailable := false
+
+		// Only these patterns indicate genuine track unavailability:
+		// 1. Explicit "preview" - track only available as preview clip
+		// 2. Explicit "not available" or "unavailable" message (but NOT "upstream api error")
+		// 3. Region-blocked content (explicit "region" or "restricted")
+		if strings.Contains(errStr, "preview") {
+			isDefinitivelyUnavailable = true
+		} else if strings.Contains(errStr, "not available") ||
+			(strings.Contains(errStr, "unavailable") && !strings.Contains(errStr, "upstream")) {
+			isDefinitivelyUnavailable = true
+		} else if strings.Contains(errStr, "region") || strings.Contains(errStr, "restricted") {
+			isDefinitivelyUnavailable = true
+		}
+
+		// 403 errors are AMBIGUOUS - they can be:
+		// - Auth/session issues (transient)
+		// - Track unavailable (permanent)
+		// - Rate limiting (transient)
+		// Only mark as unavailable if it explicitly mentions auth keywords
+		if strings.Contains(errStr, "403") {
+			if strings.Contains(errStr, "auth") ||
+				strings.Contains(errStr, "session") ||
+				strings.Contains(errStr, "token") ||
+				strings.Contains(errStr, "unauthorized") {
+				// This is an auth error, NOT track unavailable - don't cache
+				isDefinitivelyUnavailable = false
+			} else if strings.Contains(errStr, "preview") ||
+				strings.Contains(errStr, "region") ||
+				strings.Contains(errStr, "restricted") {
+				// These are genuine unavailability reasons
+				isDefinitivelyUnavailable = true
+			}
+			// Other 403 errors (like "upstream api error") are NOT cached
+			// because they might be transient proxy issues
+		}
+
+		if isDefinitivelyUnavailable {
+			c.unavailableTracks.Set(unavailableKey, time.Now(), 0)
+			log.Printf("[CACHE] Track %d marked as unavailable: %v (cached for 10 min)", trackID, err)
+		} else {
+			log.Printf("[CACHE] Track %d error not cached as unavailable (transient): %v", trackID, err)
+		}
 	}
 	return url, err
 }
@@ -653,6 +718,7 @@ func (c *CachedProxy) Close() {
 	c.artistTopTracks.Stop()
 	c.similarArtists.Stop()
 	c.streamURLs.Stop()
+	c.unavailableTracks.Stop()
 }
 
 // ClearAll clears all in-memory LRU caches
@@ -667,5 +733,6 @@ func (c *CachedProxy) ClearAll() {
 	c.artistTopTracks.Clear()
 	c.similarArtists.Clear()
 	c.streamURLs.Clear()
+	c.unavailableTracks.Clear()
 	log.Printf("[CACHE] In-memory LRU caches cleared")
 }
