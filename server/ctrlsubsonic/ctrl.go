@@ -10,8 +10,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"runtime/debug"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.senan.xyz/gonic/db"
@@ -30,6 +33,7 @@ const (
 	CtxUser CtxKey = iota
 	CtxSession
 	CtxParams
+	CtxRequestID
 )
 
 type Controller struct {
@@ -165,6 +169,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	}
 
 	chain := handlerutil.Chain(
+		withRequestID, // Generate unique ID for each request for tracing
 		withLogging,
 		withRecovery,
 		withParams,
@@ -288,12 +293,74 @@ func respRaw(h handlerSubsonicRaw) http.Handler {
 		}
 	})
 }
+
+// request colors for visual tracing (rotating palette)
+var requestColors = []string{
+	"\033[31m", // Red
+	"\033[32m", // Green
+	"\033[33m", // Yellow
+	"\033[34m", // Blue
+	"\033[35m", // Magenta
+	"\033[36m", // Cyan
+}
+
+// colorIndex tracks next color to assign (atomic for thread safety)
+var colorIndex int32 = 0
+
+// generateRequestID creates a short unique ID (6 chars) for request tracing
+func generateRequestID() string {
+	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = chars[time.Now().UnixNano()%int64(len(chars))]
+		time.Sleep(1 * time.Nanosecond) // Ensure different nano for each char
+	}
+	return string(b)
+}
+
+// getNextRequestColor returns next color from rotating palette
+func getNextRequestColor() string {
+	idx := atomic.AddInt32(&colorIndex, 1)
+	return requestColors[int(idx)%len(requestColors)]
+}
+
+func withRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := generateRequestID()
+		color := getNextRequestColor()
+		ctx := context.WithValue(r.Context(), CtxRequestID, reqID+":"+color)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		log.Printf("[SUBS] IN  %s %s", r.Method, r.URL.RequestURI())
-		next.ServeHTTP(w, r)
-		log.Printf("[SUBS] OUT %s %s (%v)", r.Method, r.URL.Path, time.Since(start))
+		reqID := ""
+		reqColor := ""
+		if val := r.Context().Value(CtxRequestID); val != nil {
+			parts := strings.Split(val.(string), ":")
+			if len(parts) == 2 {
+				reqID = parts[0]
+				reqColor = parts[1]
+			}
+		}
+
+		// Check if running under systemd (no colors)
+		runningUnderSystemd := os.Getenv("JOURNAL_STREAM") != "" || os.Getenv("INVOCATION_ID") != ""
+
+		if runningUnderSystemd {
+			log.Printf("[SUBS:%s] IN  %s %s", reqID, r.Method, r.URL.RequestURI())
+			next.ServeHTTP(w, r)
+			log.Printf("[SUBS:%s] OUT %s %s (%v)", reqID, r.Method, r.URL.Path, time.Since(start))
+		} else {
+			// Color the request ID with unique rotating color for visual tracing
+			reset := "\033[0m"
+			colorID := reqColor + reqID + reset
+			log.Printf("[SUBS:%s] IN  %s %s", colorID, r.Method, r.URL.RequestURI())
+			next.ServeHTTP(w, r)
+			log.Printf("[SUBS:%s] OUT %s %s (%v)", colorID, r.Method, r.URL.Path, time.Since(start))
+		}
 	})
 }
 

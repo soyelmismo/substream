@@ -935,17 +935,6 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 		return res
 	}
 
-	// Debug: Log what Tidal actually returned
-	uriPreview := v2Response.Data.Attributes.URI
-	if len(uriPreview) > 100 {
-		uriPreview = uriPreview[:100]
-	}
-	log.Printf("[SHOTGUN-DEBUG] track=%d mirror=%s manifest=%s quality=%s: Formats=%v MimeType=%s URI=%s",
-		trackID, task.Mirror.URL, task.ManifestType, task.Quality,
-		v2Response.Data.Attributes.Formats,
-		v2Response.Data.Attributes.ManifestMimeType,
-		uriPreview)
-
 	// 1. Extraer URL de un JSON Base64 (Típico de BTS)
 	manifestB64 := v2Response.Data.Attributes.Manifest
 	if manifestB64 != "" {
@@ -1082,21 +1071,31 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 			}
 
 			if res.Err == nil && res.URL != "" {
-				// ¿Es el match perfecto? (BTS crudo en la calidad solicitada)
-				if res.ManifestType == "BTS" && res.Quality == requestedQuality {
-					formatType := "AAC"
-					if strings.Contains(res.Quality, "LOSSLESS") || strings.Contains(res.Quality, "FLAC") {
-						formatType = "FLAC"
-					}
-					log.Printf("[SHOTGUN] 🎯 WINNER PERFECTO track %d: %s (%s/%s) desde %s en %v",
+				formatType := "AAC"
+				if strings.Contains(res.Quality, "LOSSLESS") || strings.Contains(res.Quality, "FLAC") {
+					formatType = "FLAC"
+				}
+
+				// FAST PATH: Si encontramos la calidad solicitada, entregar inmediatamente
+				// sin esperar grace period. El usuario ya tiene lo que pidió.
+				if res.Quality == requestedQuality {
+					log.Printf("[SHOTGUN] 🎯 FAST PATH track %d: %s (%s/%s) desde %s en %v",
 						trackID, formatType, res.ManifestType, res.Quality, res.Mirror.URL, res.Latency)
 					return res.URL, nil
 				}
 
-				// No es el perfecto, pero funciona. Guardarlo.
+				// BONUS: Si encontramos FLAC pero el usuario pidió AAC, igual entregamos
+				// (mejor calidad de la solicitada = win inmediato)
+				if (res.Quality == "LOSSLESS" || res.Quality == "HI_RES_LOSSLESS") && requestedQuality == "HIGH" {
+					log.Printf("[SHOTGUN] 🎯 BONUS UPGRADE track %d: FLAC encontrado (pidió AAC), desde %s en %v",
+						trackID, res.Mirror.URL, res.Latency)
+					return res.URL, nil
+				}
+
+				// No es lo solicitado, pero funciona. Guardarlo y esperar grace period.
 				if bestResult == nil {
 					bestResult = &res
-					// Iniciar periodo de gracia por si un BTS viene justo detrás
+					// Iniciar periodo de gracia por si viene la calidad solicitada
 					graceTimer = time.NewTimer(gracePeriod)
 				} else {
 					// Si este nuevo resultado es mejor, lo reemplazamos

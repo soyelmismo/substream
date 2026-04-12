@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +19,46 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic"
 	"go.senan.xyz/gonic/tidalproxy"
 )
+
+// compactLogWriter wraps log output with compact timestamp format
+type compactLogWriter struct{}
+
+func (w *compactLogWriter) Write(p []byte) (n int, err error) {
+	msg := string(p)
+	// Remove trailing newline if present
+	msg = strings.TrimSuffix(msg, "\n")
+
+	// Check if running under systemd/journald (it adds its own timestamp, no colors)
+	runningUnderSystemd := os.Getenv("JOURNAL_STREAM") != "" || os.Getenv("INVOCATION_ID") != ""
+
+	// Determine level
+	level := "INF"
+	if strings.Contains(msg, "error") || strings.Contains(msg, "Error") || strings.Contains(msg, "fatal") {
+		level = "ERR"
+	} else if strings.Contains(msg, "warn") || strings.Contains(msg, "Warn") {
+		level = "WRN"
+	}
+
+	// Always show compact timestamp
+	now := time.Now()
+	timestamp := fmt.Sprintf("%02d/%02d %02d:%02d:%02d", now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second())
+
+	if runningUnderSystemd {
+		// Under journald: plain text with timestamp (for --output=cat)
+		fmt.Printf("%s [%s] %s\n", timestamp, level, msg)
+	} else {
+		// Direct terminal: colors + timestamp
+		color := "\033[36m" // Cyan for INF
+		if level == "ERR" {
+			color = "\033[31m" // Red
+		} else if level == "WRN" {
+			color = "\033[33m" // Yellow
+		}
+		reset := "\033[0m"
+		fmt.Printf("%s %s%s%s %s\n", timestamp, color, level, reset, msg)
+	}
+	return len(p), nil
+}
 
 func getEnv(key, defaultVal string) string {
 	if val, ok := os.LookupEnv(key); ok {
@@ -36,6 +77,10 @@ func main() {
 	confKeyPath := flag.String("key-path", getEnv("SUBSTREAM_KEY_PATH", ""), "path to SSL key")
 
 	flag.Parse()
+
+	// Configure compact colored logging
+	log.SetFlags(0) // Remove standard date/time flags
+	log.SetOutput(&compactLogWriter{})
 
 	log.Printf("Starting SubStream on %s", *confListenAddr)
 
