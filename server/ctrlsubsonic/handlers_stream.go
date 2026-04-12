@@ -155,7 +155,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 				urlPreview = urlPreview[:100]
 			}
 			log.Printf("[STREAM] HLS stitch mode for %s track=%d URL=%s", prep.ClientName, id.Value(), urlPreview)
-			
+
 			// --- RANGE CALCULATION LOGIC ---
 			rangeHdr := r.Header.Get("Range")
 			offsetSeconds := 0.0
@@ -164,7 +164,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 			bytesPerSec := int64(125000)
 			if prep.Quality == "HIGH" || prep.Quality == "LOW" || prep.Ext == "m4a" {
-				bytesPerSec = 40000 
+				bytesPerSec = 40000
 			} else if prep.Quality == "HI_RES_LOSSLESS" {
 				bytesPerSec = 175000
 			}
