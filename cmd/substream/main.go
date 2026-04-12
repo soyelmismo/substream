@@ -72,7 +72,7 @@ func main() {
 		HealthInterval: 30 * time.Second,
 		Timeout:        10 * time.Second,
 	})
-	proxy := tidalproxy.NewCachedProxy(proxyPool, dbc, 5*time.Minute)
+	proxy := tidalproxy.NewCachedProxy(proxyPool, dbc, 30*24*time.Hour) // 30 days, matching SQLite TTL
 
 	// Load proxies from DB if any
 	dbProxies, _ := dbc.GetProxies()

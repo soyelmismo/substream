@@ -259,7 +259,9 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		}
 		results.Artists = combined
 	} else {
-		for i := range artists { results.Artists = append(results.Artists, &artists[i]) }
+		for i := range artists {
+			results.Artists = append(results.Artists, &artists[i])
+		}
 	}
 
 	if len(favTracks) > 0 {
@@ -276,7 +278,9 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		}
 		results.Tracks = combined
 	} else {
-		for i := range tracks { results.Tracks = append(results.Tracks, &tracks[i]) }
+		for i := range tracks {
+			results.Tracks = append(results.Tracks, &tracks[i])
+		}
 	}
 
 	if !fromCache && (len(tracks) > 0 || len(artists) > 0 || len(albums) > 0) {
@@ -440,6 +444,123 @@ func (c *Controller) getAlbumRating(userID int, uri string) int {
 		return rating.Rating
 	}
 	return 0
+}
+
+// Batch methods for applying user metadata efficiently
+// These reduce N+1 queries to 3 queries total (stars, ratings, play counts)
+
+// applyTrackStarsBatch applies star status to multiple tracks using L3 cache first
+func (c *Controller) applyTrackStarsBatch(userID int, tracks []*spec.TrackChild) {
+	if len(tracks) == 0 {
+		return
+	}
+
+	// Try L3 cache first (0 queries if warmed)
+	prefs := c.getUserPreferences(userID)
+	if prefs != nil {
+		for _, tc := range tracks {
+			if tc.ID != nil {
+				if starDate, ok := prefs.Stars[tc.ID.String()]; ok {
+					tc.Starred = &starDate
+				}
+			}
+		}
+		return
+	}
+
+	// Fallback to DB batch query
+	uris := make([]string, 0, len(tracks))
+	uriToTrack := make(map[string]*spec.TrackChild)
+	for _, tc := range tracks {
+		if tc.ID != nil {
+			uri := tc.ID.String()
+			uris = append(uris, uri)
+			uriToTrack[uri] = tc
+		}
+	}
+
+	stars := c.dbc.GetTrackStarsBatch(userID, uris)
+	for uri, starDate := range stars {
+		if tc, ok := uriToTrack[uri]; ok {
+			tc.Starred = &starDate
+		}
+	}
+}
+
+// applyTrackPlayCountsBatch applies play counts to multiple tracks using L3 cache first
+func (c *Controller) applyTrackPlayCountsBatch(userID int, tracks []*spec.TrackChild) {
+	if len(tracks) == 0 {
+		return
+	}
+
+	// Try L3 cache first
+	prefs := c.getUserPreferences(userID)
+	if prefs != nil {
+		for _, tc := range tracks {
+			if tc.ID != nil {
+				if count, ok := prefs.Plays[tc.ID.String()]; ok {
+					tc.PlayCount = count
+				}
+			}
+		}
+		return
+	}
+
+	// Fallback to DB batch query
+	uris := make([]string, 0, len(tracks))
+	uriToTrack := make(map[string]*spec.TrackChild)
+	for _, tc := range tracks {
+		if tc.ID != nil {
+			uri := tc.ID.String()
+			uris = append(uris, uri)
+			uriToTrack[uri] = tc
+		}
+	}
+
+	playCounts := c.dbc.GetTrackPlayCountsBatch(userID, uris)
+	for uri, count := range playCounts {
+		if tc, ok := uriToTrack[uri]; ok {
+			tc.PlayCount = count
+		}
+	}
+}
+
+// applyTrackRatingsBatch applies ratings to multiple tracks using L3 cache first
+func (c *Controller) applyTrackRatingsBatch(userID int, tracks []*spec.TrackChild) {
+	if len(tracks) == 0 {
+		return
+	}
+
+	// Try L3 cache first
+	prefs := c.getUserPreferences(userID)
+	if prefs != nil {
+		for _, tc := range tracks {
+			if tc.ID != nil {
+				if rating, ok := prefs.Ratings[tc.ID.String()]; ok {
+					tc.UserRating = rating
+				}
+			}
+		}
+		return
+	}
+
+	// Fallback to DB batch query
+	uris := make([]string, 0, len(tracks))
+	uriToTrack := make(map[string]*spec.TrackChild)
+	for _, tc := range tracks {
+		if tc.ID != nil {
+			uri := tc.ID.String()
+			uris = append(uris, uri)
+			uriToTrack[uri] = tc
+		}
+	}
+
+	ratings := c.dbc.GetTrackRatingsBatch(userID, uris)
+	for uri, rating := range ratings {
+		if tc, ok := uriToTrack[uri]; ok {
+			tc.UserRating = rating
+		}
+	}
 }
 
 // =====================================================================

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jinzhu/gorm"
@@ -142,6 +144,8 @@ func (db *DB) GetVirtualLibraryTrackIDs(userID int) []string {
 
 // GetCachedMetadata retrieves cached metadata from SQLite
 // Returns nil if not found or expired
+var cacheHitCounter atomic.Int64
+
 func (db *DB) GetCachedMetadata(key string) []byte {
 	var cache MetadataCache
 	err := db.Where("key = ?", key).First(&cache).Error
@@ -158,8 +162,59 @@ func (db *DB) GetCachedMetadata(key string) []byte {
 		return nil
 	}
 
-	log.Printf("[CACHE HIT] %s (%d bytes, age: %v)", key, len(cache.Value), time.Since(cache.FetchedAt))
+	// Batch logging: log every 100 cache hits to reduce I/O spam
+	count := cacheHitCounter.Add(1)
+	if count%100 == 0 {
+		log.Printf("[CACHE HIT] %s (%d bytes, age: %v) [batch: %d hits]", key, len(cache.Value), time.Since(cache.FetchedAt), count)
+	}
 	return cache.Value
+}
+
+// GetCachedMetadataBatch retrieves multiple cached entries in a single query
+// Much more efficient than N individual GetCachedMetadata calls
+func (db *DB) GetCachedMetadataBatch(keys []string) map[string][]byte {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// Deduplicate keys
+	keyMap := make(map[string]struct{})
+	for _, k := range keys {
+		keyMap[k] = struct{}{}
+	}
+	uniqueKeys := make([]string, 0, len(keyMap))
+	for k := range keyMap {
+		uniqueKeys = append(uniqueKeys, k)
+	}
+
+	// Query all matching keys in one shot using IN clause
+	// Build placeholders for SQLite: (?, ?, ?, ...)
+	placeholders := make([]string, len(uniqueKeys))
+	args := make([]interface{}, len(uniqueKeys))
+	for i, key := range uniqueKeys {
+		placeholders[i] = "?"
+		args[i] = key
+	}
+
+	var caches []MetadataCache
+	sql := fmt.Sprintf("SELECT * FROM metadata_cache WHERE key IN (%s)", strings.Join(placeholders, ","))
+	err := db.Raw(sql, args...).Scan(&caches).Error
+	if err != nil {
+		log.Printf("[CACHE ERROR] Batch fetch failed: %v", err)
+		return nil
+	}
+
+	// Filter expired and build result map
+	now := time.Now()
+	result := make(map[string][]byte, len(caches))
+	for _, cache := range caches {
+		if now.Sub(cache.FetchedAt) > time.Duration(cache.TTLSeconds)*time.Second {
+			continue // Expired, skip
+		}
+		result[cache.Key] = cache.Value
+	}
+
+	return result
 }
 
 // SetCachedMetadata stores metadata in SQLite cache
@@ -167,8 +222,8 @@ func (db *DB) SetCachedMetadata(key string, value []byte, ttlSeconds int) error 
 	now := time.Now()
 	return db.Exec(`INSERT INTO metadata_cache (key, value, fetched_at, ttl_seconds) 
                    VALUES (?, ?, ?, ?) 
-                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, fetched_at=excluded.fetched_at, ttl_seconds=excluded.ttl_seconds`, 
-                   key, value, now, ttlSeconds).Error
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, fetched_at=excluded.fetched_at, ttl_seconds=excluded.ttl_seconds`,
+		key, value, now, ttlSeconds).Error
 }
 
 // SetCachedMetadataBatch stores multiple metadata entries in a single transaction
@@ -178,8 +233,8 @@ func (db *DB) SetCachedMetadataBatch(batch map[string][]byte, ttlSeconds int) er
 	for key, value := range batch {
 		if err := tx.Exec(`INSERT INTO metadata_cache (key, value, fetched_at, ttl_seconds) 
 		                   VALUES (?, ?, ?, ?) 
-		                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, fetched_at=excluded.fetched_at, ttl_seconds=excluded.ttl_seconds`, 
-		                   key, value, now, ttlSeconds).Error; err != nil {
+		                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, fetched_at=excluded.fetched_at, ttl_seconds=excluded.ttl_seconds`,
+			key, value, now, ttlSeconds).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -244,6 +299,97 @@ func (db *DB) StartCacheMaintenance(interval time.Duration, maxEntries int) {
 	}()
 
 	log.Printf("[CACHE] Started metadata_cache maintenance: interval=%v, maxEntries=%d", interval, maxEntries)
+}
+
+// buildINClause builds a SQL IN clause with proper placeholders for SQLite
+func buildINClause(baseQuery string, userID int, uris []string) (string, []interface{}) {
+	placeholders := make([]string, len(uris))
+	args := make([]interface{}, 0, len(uris)+1)
+	args = append(args, userID)
+
+	for i, uri := range uris {
+		placeholders[i] = "?"
+		args = append(args, uri)
+	}
+
+	sql := fmt.Sprintf(baseQuery, strings.Join(placeholders, ","))
+	return sql, args
+}
+
+// GetTrackStarsBatch retrieves star dates for multiple tracks in a single query
+// Returns map[uri]starDate for tracks that are starred
+func (db *DB) GetTrackStarsBatch(userID int, uris []string) map[string]time.Time {
+	if len(uris) == 0 {
+		return nil
+	}
+
+	var stars []TrackStar
+	result := make(map[string]time.Time)
+
+	// Build query with explicit placeholders for SQLite
+	sql, args := buildINClause("SELECT * FROM track_stars WHERE user_id = ? AND uri IN (%s)", userID, uris)
+	err := db.Raw(sql, args...).Scan(&stars).Error
+	if err != nil {
+		log.Printf("[DB ERROR] GetTrackStarsBatch failed: %v", err)
+		return result
+	}
+
+	for _, s := range stars {
+		result[s.URI] = s.StarDate
+	}
+	return result
+}
+
+// GetTrackRatingsBatch retrieves ratings for multiple tracks in a single query
+// Returns map[uri]rating
+func (db *DB) GetTrackRatingsBatch(userID int, uris []string) map[string]int {
+	if len(uris) == 0 {
+		return nil
+	}
+
+	var ratings []TrackRating
+	result := make(map[string]int)
+
+	sql, args := buildINClause("SELECT * FROM track_ratings WHERE user_id = ? AND uri IN (%s)", userID, uris)
+	err := db.Raw(sql, args...).Scan(&ratings).Error
+	if err != nil {
+		log.Printf("[DB ERROR] GetTrackRatingsBatch failed: %v", err)
+		return result
+	}
+
+	for _, r := range ratings {
+		result[r.URI] = r.Rating
+	}
+	return result
+}
+
+// GetTrackPlayCountsBatch retrieves play counts for multiple tracks in a single query
+// Returns map[uri]playCount
+func (db *DB) GetTrackPlayCountsBatch(userID int, uris []string) map[string]int {
+	if len(uris) == 0 {
+		return nil
+	}
+
+	result := make(map[string]int)
+
+	// Query from plays table (not scrobbles)
+	sql, args := buildINClause("SELECT uri, count FROM plays WHERE user_id = ? AND uri IN (%s)", userID, uris)
+	rows, err := db.Raw(sql, args...).Rows()
+
+	if err != nil {
+		log.Printf("[DB ERROR] GetTrackPlayCountsBatch failed: %v", err)
+		return result
+	}
+	defer rows.Close()
+
+	var uri string
+	var count int
+	for rows.Next() {
+		if err := rows.Scan(&uri, &count); err == nil {
+			result[uri] = count
+		}
+	}
+	return result
 }
 
 // GetCacheStats returns current statistics about the metadata_cache

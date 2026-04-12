@@ -58,6 +58,17 @@ type Controller struct {
 	importer         *importer.JobManager                  // Background playlist import manager
 	userStreamSem    chan struct{}                         // limit total concurrent streams across all users
 	userStreamLimits sync.Map                              // per-user stream limiting (userID -> chan struct{})
+
+	// User preferences cache (L3) - warms on activity to eliminate repeated SQLite queries
+	userPrefsCache *cache.Cache[*userPreferences] // userID -> cached preferences
+}
+
+// userPreferences holds all user metadata (stars, ratings, plays) in memory
+type userPreferences struct {
+	Stars    map[string]time.Time // uri -> starDate
+	Ratings  map[string]int       // uri -> rating (1-5)
+	Plays    map[string]int       // uri -> playCount
+	LoadedAt time.Time            // for TTL checking
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
@@ -145,6 +156,12 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 			DefaultTTL:      24 * time.Hour, // 24 hours cooldown
 			CleanupInterval: 1 * time.Hour,
 		}),
+		userPrefsCache: cache.New[*userPreferences](cache.Config{
+			Name:            "user-prefs",
+			MaxSize:         100,              // 100 users
+			DefaultTTL:      10 * time.Minute, // Warm for 10 min of inactivity
+			CleanupInterval: 5 * time.Minute,
+		}),
 	}
 
 	chain := handlerutil.Chain(
@@ -153,6 +170,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 		withParams,
 		withRequiredParams,
 		withUser(dbc),
+		c.withWarmUserPrefs(), // Warm user preferences cache after auth (L3 cache)
 	)
 	chainRaw := handlerutil.Chain(
 		chain,
@@ -451,5 +469,71 @@ func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) erro
 			return err
 		}
 		return nil
+	}
+}
+
+// warmUserPreferences loads all user metadata (stars, ratings, plays) into memory cache
+// Call this on any user activity to "warm" the cache for subsequent requests
+func (c *Controller) warmUserPreferences(userID int) {
+	key := fmt.Sprintf("%d", userID)
+	if prefs := c.userPrefsCache.Get(key); prefs != nil {
+		return // Already warmed, TTL will refresh on access
+	}
+
+	// Load all preferences in 3 batch queries
+	prefs := userPreferences{
+		Stars:    make(map[string]time.Time),
+		Ratings:  make(map[string]int),
+		Plays:    make(map[string]int),
+		LoadedAt: time.Now(),
+	}
+
+	// Get all stars for this user
+	var stars []db.TrackStar
+	if err := c.dbc.Where("user_id = ?", userID).Find(&stars).Error; err == nil {
+		for _, s := range stars {
+			prefs.Stars[s.URI] = s.StarDate
+		}
+	}
+
+	// Get all ratings for this user
+	var ratings []db.TrackRating
+	if err := c.dbc.Where("user_id = ?", userID).Find(&ratings).Error; err == nil {
+		for _, r := range ratings {
+			prefs.Ratings[r.URI] = r.Rating
+		}
+	}
+
+	// Get all plays for this user
+	var plays []db.Play
+	if err := c.dbc.Where("user_id = ?", userID).Find(&plays).Error; err == nil {
+		for _, p := range plays {
+			prefs.Plays[p.URI] = p.Count
+		}
+	}
+
+	c.userPrefsCache.Set(key, &prefs, 0)
+}
+
+// getUserPreferences retrieves cached preferences or loads them if missing
+func (c *Controller) getUserPreferences(userID int) *userPreferences {
+	c.warmUserPreferences(userID)
+	key := fmt.Sprintf("%d", userID)
+	return c.userPrefsCache.Get(key)
+}
+
+// withWarmUserPrefs is a middleware that warms user preferences after authentication
+// This ensures any authenticated endpoint gets snappy L3 cache performance
+func (c *Controller) withWarmUserPrefs() handlerutil.Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Get user from context (set by withUser middleware which runs before this)
+			if user, ok := r.Context().Value(CtxUser).(*db.User); ok && user != nil {
+				// Fire-and-forget warm in background to not block the request
+				// If already warmed, this returns immediately
+				c.warmUserPreferences(user.ID)
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 }

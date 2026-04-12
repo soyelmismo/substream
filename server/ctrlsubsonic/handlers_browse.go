@@ -30,7 +30,7 @@ func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
 	artistIDs := extractIDsFromURIs(artistURIs)
 
 	artists := c.batchFetchArtists(r, artistIDs)
-	
+
 	// Filter out artists with 0 albums to avoid showing empty entries
 	filtered := make([]*spec.Artist, 0, len(artists))
 	for _, a := range artists {
@@ -81,7 +81,7 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 	artistIDs := extractIDsFromURIs(artistURIs)
 
 	artists := c.batchFetchArtists(r, artistIDs)
-	
+
 	// [Hydrate] Trigger background hydration for any starred artists found here.
 	// This ensures that even if an artist was just added via cache, their discography is fetched.
 	for _, a := range artists {
@@ -184,13 +184,14 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 		if tc.AlbumID == nil {
 			tc.AlbumID = a.ID
 		}
-		c.applyTrackStar(user.ID, tc)
-		uri := fmt.Sprintf("td:tr:%d", album.Items[i].ID)
-		tc.UserRating = c.getTrackRating(user.ID, uri)
-		c.applyTrackPlayCount(user.ID, tc)
 		a.Tracks[i] = tc
 		totalDuration += tc.Duration
 	}
+
+	// Batch apply user metadata (stars, ratings, play counts) in 3 queries instead of 3*N
+	c.applyTrackStarsBatch(user.ID, a.Tracks)
+	c.applyTrackRatingsBatch(user.ID, a.Tracks)
+	c.applyTrackPlayCountsBatch(user.ID, a.Tracks)
 	if a.Duration == 0 {
 		a.Duration = totalDuration
 	}
@@ -501,7 +502,6 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 	sub.AlbumsTwo = &spec.Albums{List: albums}
 	return sub
 }
-
 
 func (c *Controller) ServeGetSong(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)

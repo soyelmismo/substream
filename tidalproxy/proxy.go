@@ -7,7 +7,8 @@ type TidalProxy interface {
 	// Metadata
 	GetTrackInfo(ctx context.Context, trackID int) (*TidalTrack, error)
 	GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error)
-	GetAlbumMetadata(ctx context.Context, albumID int) (*TidalAlbum, error) // Added for partial cache access
+	GetAlbumMetadata(ctx context.Context, albumID int) (*TidalAlbum, error)     // Added for partial cache access
+	GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) map[int]*TidalAlbum // Batch fetch for efficiency
 	GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error)
 	GetArtistAlbums(ctx context.Context, artistID int, skipTracks bool) (*TidalArtistPage, error)
 	GetArtistAlbumCount(ctx context.Context, artistID int) int

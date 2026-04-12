@@ -104,15 +104,30 @@ func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.T
 	})
 }
 
-// batchFetchAlbums fetches metadata for multiple tidal album IDs concurrently
+// batchFetchAlbums fetches metadata for multiple tidal album IDs efficiently
+// Uses batch SQLite query (1 query) instead of N individual queries
 func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.Album {
 	user := r.Context().Value(CtxUser).(*db.User)
-	return batchFetch(r.Context(), c.proxySem, tidalIDs, c.proxy.GetAlbumMetadata, func(info *tidalproxy.TidalAlbum, tid int) *spec.Album {
-		a := spec.NewAlbumFromTidal(info)
-		c.applyAlbumStar(user.ID, a)
-		a.UserRating = c.getAlbumRating(user.ID, fmt.Sprintf("td:al:%d", tid))
-		return a
-	})
+	ctx := r.Context()
+
+	// Use batch method: single SQL query + parallel API fallback
+	albumMap := c.proxy.GetAlbumsInfoBatch(ctx, tidalIDs)
+	if albumMap == nil {
+		return nil
+	}
+
+	// Convert map to ordered slice
+	results := make([]*spec.Album, 0, len(albumMap))
+	for _, id := range tidalIDs {
+		if info, ok := albumMap[id]; ok {
+			a := spec.NewAlbumFromTidal(info)
+			c.applyAlbumStar(user.ID, a)
+			a.UserRating = c.getAlbumRating(user.ID, fmt.Sprintf("td:al:%d", id))
+			results = append(results, a)
+		}
+	}
+
+	return results
 }
 
 // prepareStream centralizes the logic for preparing a stream (quality, IP, URL, meta)

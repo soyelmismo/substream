@@ -51,49 +51,49 @@ func NewCachedProxy(base TidalProxy, dbc *db.DB, ttl time.Duration) *CachedProxy
 		db:         dbc,
 		tracks: cache.New[[]byte](cache.Config{
 			Name:            "tidal-tracks",
-			MaxSize:         500,
+			MaxSize:         5000,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
 		albums: cache.New[[]byte](cache.Config{
 			Name:            "tidal-albums",
-			MaxSize:         200,
+			MaxSize:         2000,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
 		artists: cache.New[[]byte](cache.Config{
 			Name:            "tidal-artists",
-			MaxSize:         100,
+			MaxSize:         1000,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
 		albumArt: cache.New[string](cache.Config{
 			Name:            "tidal-album-art",
-			MaxSize:         1000,
+			MaxSize:         3000,
 			DefaultTTL:      ttl * 2, // Album art changes less frequently
 			CleanupInterval: 10 * time.Minute,
 		}),
 		albumCount: cache.New[int](cache.Config{
 			Name:            "tidal-album-count",
-			MaxSize:         100,
+			MaxSize:         1000,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
 		artistAlbums: cache.New[[]byte](cache.Config{
 			Name:            "tidal-artist-albums",
-			MaxSize:         100,
+			MaxSize:         1000,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
 		artistTopTracks: cache.New[[]byte](cache.Config{
 			Name:            "tidal-artist-top-tracks",
-			MaxSize:         100,
+			MaxSize:         1000,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
 		similarArtists: cache.New[[]byte](cache.Config{
 			Name:            "tidal-similar-artists",
-			MaxSize:         100,
+			MaxSize:         1000,
 			DefaultTTL:      ttl,
 			CleanupInterval: 10 * time.Minute,
 		}),
@@ -346,6 +346,104 @@ func (c *CachedProxy) GetAlbumMetadata(ctx context.Context, albumID int) (*Tidal
 		c.cacheAlbumJSON(a)
 	}
 	return a, err
+}
+
+// GetAlbumsInfoBatch fetches multiple albums efficiently using batch SQLite query
+// Falls back to individual API calls for cache misses
+func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) map[int]*TidalAlbum {
+	if len(albumIDs) == 0 {
+		return nil
+	}
+
+	result := make(map[int]*TidalAlbum, len(albumIDs))
+	missingIDs := make([]int, 0)
+
+	// 1. Check in-memory LRU cache first
+	for _, id := range albumIDs {
+		key := fmt.Sprintf("td:al:%d", id)
+		if cached := c.albums.Get(key); cached != nil {
+			var a TidalAlbum
+			if err := json.Unmarshal(cached, &a); err == nil {
+				if len(a.Items) > 0 || a.NumberOfTracks == 0 {
+					result[id] = &a
+					continue
+				}
+			}
+		}
+		missingIDs = append(missingIDs, id)
+	}
+
+	if len(missingIDs) == 0 {
+		return result
+	}
+
+	// 2. Batch query SQLite for remaining IDs (single query vs N queries)
+	if c.db != nil {
+		keys := make([]string, len(missingIDs))
+		for i, id := range missingIDs {
+			keys[i] = fmt.Sprintf("td:al:%d", id)
+		}
+
+		batch := c.db.GetCachedMetadataBatch(keys)
+		if batch != nil {
+			// Check which ones we found and warm the LRU cache
+			foundIDs := make(map[int]struct{})
+			for key, data := range batch {
+				var a TidalAlbum
+				if err := json.Unmarshal(data, &a); err == nil {
+					if len(a.Items) > 0 || a.NumberOfTracks == 0 {
+						// Extract ID from key
+						var id int
+						fmt.Sscanf(key, "td:al:%d", &id)
+						if id > 0 {
+							result[id] = &a
+							c.albums.Set(key, data, 0) // Warm LRU
+							foundIDs[id] = struct{}{}
+						}
+					}
+				}
+			}
+
+			// Rebuild missingIDs excluding found ones
+			stillMissing := make([]int, 0, len(missingIDs))
+			for _, id := range missingIDs {
+				if _, found := foundIDs[id]; !found {
+					stillMissing = append(stillMissing, id)
+				}
+			}
+			missingIDs = stillMissing
+		}
+	}
+
+	if len(missingIDs) == 0 {
+		return result
+	}
+
+	// 3. Fetch missing from API concurrently (with semaphore)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // Limit concurrent API calls
+
+	for _, id := range missingIDs {
+		wg.Add(1)
+		go func(albumID int) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			a, err := c.TidalProxy.GetAlbumInfo(ctx, albumID)
+			if err == nil && a != nil {
+				c.cacheAlbumJSON(a)
+				mu.Lock()
+				result[albumID] = a
+				mu.Unlock()
+			}
+		}(id)
+	}
+
+	wg.Wait()
+	return result
 }
 
 func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error) {

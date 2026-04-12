@@ -147,11 +147,15 @@ func classifyError(err error) ErrorCategory {
 		return ErrorTransient
 	}
 
-	// 404 on trackManifests or track endpoints - might be proxy without track
-	// But if we've tried multiple proxies, it's likely track unavailable
+	// 404 on trackManifests, track, or album endpoints - resource unavailable
+	// These indicate the resource doesn't exist (deleted, region-blocked, etc.)
 	if strings.Contains(errStr, "404") {
-		// If the error specifically mentions the track endpoint, it might be unavailable
+		// Track endpoint: unavailable
 		if strings.Contains(lowerErr, "track") && strings.Contains(lowerErr, "manifest") {
+			return ErrorTrackUnavailable
+		}
+		// Album endpoint: unavailable (album deleted or doesn't exist)
+		if strings.Contains(lowerErr, "/album/") {
 			return ErrorTrackUnavailable
 		}
 		return ErrorTransient
@@ -528,6 +532,39 @@ func (p *Pool) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, erro
 	}
 
 	return &album, nil
+}
+
+// GetAlbumsInfoBatch fetches multiple albums concurrently
+// For Pool (base proxy), this just calls GetAlbumInfo for each ID
+func (p *Pool) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) map[int]*TidalAlbum {
+	if len(albumIDs) == 0 {
+		return nil
+	}
+
+	result := make(map[int]*TidalAlbum, len(albumIDs))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // Limit concurrent API calls
+
+	for _, id := range albumIDs {
+		wg.Add(1)
+		go func(albumID int) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			a, err := p.GetAlbumInfo(ctx, albumID)
+			if err == nil && a != nil {
+				mu.Lock()
+				result[albumID] = a
+				mu.Unlock()
+			}
+		}(id)
+	}
+
+	wg.Wait()
+	return result
 }
 
 func (p *Pool) GetAlbumMetadata(ctx context.Context, albumID int) (*TidalAlbum, error) {
