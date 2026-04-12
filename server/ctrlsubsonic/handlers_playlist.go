@@ -3,6 +3,7 @@ package ctrlsubsonic
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -135,21 +136,34 @@ func (c *Controller) ServeCreatePlaylist(r *http.Request) *spec.Response {
 			pl.UpdatedAt = time.Now()
 			c.dbc.Save(&pl)
 
-			// replace tracks if songId provided
-			if songIDs, err := p.GetIDList("songId"); err == nil {
-				c.dbc.Where("playlist_id=?", pl.ID).Delete(&db.PlaylistTrack{})
+			// append tracks if songId provided (compatible with psysonic/navydrome behavior)
+			songIDs, err := p.GetIDList("songId")
+			if err == nil {
+				log.Printf("[DEBUG] createPlaylist: adding %d tracks to playlist %d", len(songIDs), pl.ID)
+				var maxPos int
+				c.dbc.Model(&db.PlaylistTrack{}).Where("playlist_id=?", pl.ID).
+					Select("COALESCE(MAX(position), -1)").Row().Scan(&maxPos)
+				log.Printf("[DEBUG] createPlaylist: current max position is %d", maxPos)
 				for i, sid := range songIDs {
 					if sid.Type() == specid.Track {
-						c.dbc.Create(&db.PlaylistTrack{
+						trackURI := sid.String()
+						log.Printf("[DEBUG] createPlaylist: adding track %s at position %d", trackURI, maxPos+1+i)
+						result := c.dbc.Create(&db.PlaylistTrack{
 							PlaylistID: pl.ID,
-							URI:        fmt.Sprintf("td:tr:%d", sid.Value()),
-							Position:   i,
+							URI:        trackURI,
+							Position:   maxPos + 1 + i,
 						})
+						if result.Error != nil {
+							log.Printf("[DEBUG] createPlaylist: ERROR adding track: %v", result.Error)
+						}
 					}
 				}
+			} else {
+				log.Printf("[DEBUG] createPlaylist: no songId param found or error: %v", err)
 			}
 
-			return spec.NewResponse()
+			// Return updated playlist with songs (OpenSubsonic v1.14.0+ compatible)
+			return c.buildPlaylistResponse(r, &pl, user)
 		}
 	}
 
@@ -211,24 +225,72 @@ func (c *Controller) handleImportPlaylist(ctx context.Context, user *db.User, so
 var _ = importer.ImportedTrack{}
 var _ = context.Background
 
+// buildPlaylistResponse builds a full playlist response with tracks
+func (c *Controller) buildPlaylistResponse(r *http.Request, pl *db.Playlist, user *db.User) *spec.Response {
+	var tracks []db.PlaylistTrack
+	c.dbc.Where("playlist_id=?", pl.ID).Order("position ASC").Find(&tracks)
+
+	tidalIDs := make([]int, len(tracks))
+	for i, t := range tracks {
+		tidalIDs[i] = extractIDFromURI(t.URI)
+	}
+
+	trackList := c.batchFetchTracks(r, tidalIDs)
+
+	totalDuration := 0
+	for _, tc := range trackList {
+		totalDuration += tc.Duration
+	}
+
+	sub := spec.NewResponse()
+	sub.Playlist = &spec.Playlist{
+		ID:        specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
+		Name:      pl.Name,
+		Comment:   pl.Comment,
+		Owner:     user.Name,
+		SongCount: len(trackList),
+		Duration:  totalDuration,
+		Created:   pl.CreatedAt,
+		Changed:   pl.UpdatedAt,
+		Public:    pl.IsPublic,
+		List:      trackList,
+	}
+	return sub
+}
+
 func (c *Controller) ServeUpdatePlaylist(r *http.Request) *spec.Response {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[PANIC] updatePlaylist: %v", rec)
+		}
+	}()
+
 	user := r.Context().Value(CtxUser).(*db.User)
 	p := r.Context().Value(CtxParams).(params.Params)
 
+	log.Printf("[DEBUG] updatePlaylist: method=%s params=%v", r.Method, p)
+
+	plIDStr, _ := p.Get("playlistId")
+	log.Printf("[DEBUG] updatePlaylist: raw playlistId=%s", plIDStr)
+
+	log.Printf("[DEBUG] updatePlaylist: about to call p.GetID")
 	plID, err := p.GetID("playlistId")
+	log.Printf("[DEBUG] updatePlaylist: p.GetID returned, plID=%+v err=%v", plID, err)
 	if err != nil {
+		log.Printf("[DEBUG] updatePlaylist: playlistId error: %v", err)
 		return spec.NewError(10, "provide a `playlistId` parameter")
 	}
 
-	playlistID, _ := strconv.Atoi(plID.String())
-	if playlistID == 0 {
-		playlistID = plID.Value()
-	}
+	// Extract numeric ID from URI (td:pl:123 -> 123)
+	playlistID := extractIDFromURI(plID.String())
+	log.Printf("[DEBUG] updatePlaylist: extracted playlistID=%d from %s", playlistID, plID.String())
 
 	var pl db.Playlist
 	if err := c.dbc.Where("id=? AND user_id=?", playlistID, user.ID).First(&pl).Error; err != nil {
+		log.Printf("[DEBUG] updatePlaylist: playlist not found: %v", err)
 		return spec.NewError(70, "playlist not found")
 	}
+	log.Printf("[DEBUG] updatePlaylist: found playlist %d (name=%s)", pl.ID, pl.Name)
 
 	if name := p.GetOr("name", ""); name != "" {
 		pl.Name = name
@@ -241,33 +303,47 @@ func (c *Controller) ServeUpdatePlaylist(r *http.Request) *spec.Response {
 	}
 
 	// add tracks
-	if songIDsToAdd, err := p.GetIDList("songIdToAdd"); err == nil {
+	songIDsToAdd, err := p.GetIDList("songIdToAdd")
+	log.Printf("[DEBUG] updatePlaylist: songIdToAdd=%v err=%v", songIDsToAdd, err)
+	if err == nil {
 		var maxPos int
 		c.dbc.Model(&db.PlaylistTrack{}).Where("playlist_id=?", pl.ID).
 			Select("COALESCE(MAX(position), -1)").Row().Scan(&maxPos)
+		log.Printf("[DEBUG] updatePlaylist: adding %d tracks, maxPos=%d", len(songIDsToAdd), maxPos)
 		for i, sid := range songIDsToAdd {
 			if sid.Type() == specid.Track {
-				c.dbc.Create(&db.PlaylistTrack{
+				log.Printf("[DEBUG] updatePlaylist: adding track %s at position %d", sid.String(), maxPos+1+i)
+				result := c.dbc.Create(&db.PlaylistTrack{
 					PlaylistID: pl.ID,
 					URI:        sid.String(),
 					Position:   maxPos + 1 + i,
 				})
+				if result.Error != nil {
+					log.Printf("[DEBUG] updatePlaylist: ERROR adding track: %v", result.Error)
+				}
 			}
 		}
 	}
 
 	// remove tracks by index
-	if idxToRemove, err := p.GetIntList("songIndexToRemove"); err == nil {
+	idxToRemove, err := p.GetIntList("songIndexToRemove")
+	log.Printf("[DEBUG] updatePlaylist: songIndexToRemove=%v err=%v", idxToRemove, err)
+	if err == nil && len(idxToRemove) > 0 {
 		var tracks []db.PlaylistTrack
 		c.dbc.Where("playlist_id=?", pl.ID).Order("position ASC").Find(&tracks)
+		log.Printf("[DEBUG] updatePlaylist: removing %d tracks from %d total", len(idxToRemove), len(tracks))
 		for _, idx := range idxToRemove {
 			if idx >= 0 && idx < len(tracks) {
+				log.Printf("[DEBUG] updatePlaylist: deleting track at index %d (id=%d)", idx, tracks[idx].ID)
 				c.dbc.Delete(&tracks[idx])
+			} else {
+				log.Printf("[DEBUG] updatePlaylist: invalid index %d, only %d tracks", idx, len(tracks))
 			}
 		}
 		// reindex positions
 		var remaining []db.PlaylistTrack
 		c.dbc.Where("playlist_id=?", pl.ID).Order("position ASC").Find(&remaining)
+		log.Printf("[DEBUG] updatePlaylist: reindexing %d remaining tracks", len(remaining))
 		for i := range remaining {
 			remaining[i].Position = i
 			c.dbc.Save(&remaining[i])
@@ -277,7 +353,8 @@ func (c *Controller) ServeUpdatePlaylist(r *http.Request) *spec.Response {
 	pl.UpdatedAt = time.Now()
 	c.dbc.Save(&pl)
 
-	return spec.NewResponse()
+	log.Printf("[DEBUG] updatePlaylist: saved playlist %d, returning response", pl.ID)
+	return c.buildPlaylistResponse(r, &pl, user)
 }
 
 func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {

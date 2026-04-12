@@ -313,6 +313,74 @@ func MigrateFixBookmarks(db *gorm.DB) error {
 	})
 }
 
+// MigrateFixPlaylistTracks drops tidal_id column from playlist_tracks table
+func MigrateFixPlaylistTracks(db *gorm.DB) error {
+	// Check if migration has already been run
+	var setting Setting
+	err := db.Where("key = ?", "drop_playlist_tracks_tidal_id_completed").First(&setting).Error
+	if err == nil && setting.Value == "true" {
+		return nil
+	}
+
+	// Check if tidal_id column exists in playlist_tracks table
+	type columnInfo struct {
+		Name string
+	}
+	var columns []columnInfo
+	err = db.Raw(`SELECT name FROM pragma_table_info('playlist_tracks') WHERE name = 'tidal_id'`).Scan(&columns).Error
+	if err != nil {
+		return fmt.Errorf("check tidal_id column: %w", err)
+	}
+	if len(columns) == 0 {
+		// Column doesn't exist, mark as done
+		db.Exec(`
+			INSERT INTO settings (key, value) VALUES ('drop_playlist_tracks_tidal_id_completed', 'true')
+			ON CONFLICT(key) DO UPDATE SET value = 'true'
+		`)
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Dropping tidal_id column from playlist_tracks table...")
+
+	// Disable foreign keys temporarily
+	if err := db.Exec(`PRAGMA foreign_keys = OFF`).Error; err != nil {
+		return err
+	}
+	defer db.Exec(`PRAGMA foreign_keys = ON`)
+
+	// Recreate table without tidal_id
+	steps := []string{
+		`CREATE TABLE playlist_tracks_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+			uri TEXT NOT NULL,
+			position INTEGER NOT NULL
+		)`,
+		`INSERT INTO playlist_tracks_new (id, playlist_id, uri, position)
+		 SELECT id, playlist_id, uri, position FROM playlist_tracks`,
+		`DROP TABLE playlist_tracks`,
+		`ALTER TABLE playlist_tracks_new RENAME TO playlist_tracks`,
+		`CREATE INDEX idx_playlist_track_uri ON playlist_tracks(uri)`,
+	}
+
+	for _, step := range steps {
+		if err := db.Exec(step).Error; err != nil {
+			return fmt.Errorf("recreate playlist_tracks table: %w", err)
+		}
+	}
+
+	// Mark migration as completed
+	if err := db.Exec(`
+		INSERT INTO settings (key, value) VALUES ('drop_playlist_tracks_tidal_id_completed', 'true')
+		ON CONFLICT(key) DO UPDATE SET value = 'true'
+	`).Error; err != nil {
+		return fmt.Errorf("mark migration complete: %w", err)
+	}
+
+	log.Printf("[MIGRATION] Successfully removed tidal_id column from playlist_tracks table")
+	return nil
+}
+
 // migratePlayQueueTable handles the play_queues table with CurrentURI and Items as JSON array of URIs
 func migratePlayQueueTable(tx *gorm.DB) error {
 	// Add new columns
@@ -621,6 +689,11 @@ func (db *DB) Migrate() error {
 	// Fix bookmarks table (drop tidal_id NOT NULL constraint)
 	if err := MigrateFixBookmarks(db.DB); err != nil {
 		log.Printf("[MIGRATION] Bookmarks fix warning: %v", err)
+	}
+
+	// Fix playlist_tracks table (drop tidal_id column)
+	if err := MigrateFixPlaylistTracks(db.DB); err != nil {
+		log.Printf("[MIGRATION] Playlist tracks fix warning: %v", err)
 	}
 
 	// Fix tables that were accidentally pluralized by GORM (drop metadata_caches, track_metadatas)
