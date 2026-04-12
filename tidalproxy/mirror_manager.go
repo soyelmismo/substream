@@ -137,7 +137,7 @@ func (mm *MirrorManager) UpdateMirrors(urls []string) {
 			m := &Mirror{
 				URL:            url,
 				Weight:         100, // Default weight
-				HealthEndpoint: "/info/?id=1",
+				HealthEndpoint: "/", // Use root endpoint - just check if server responds
 			}
 			m.state.Store(int32(StateHealthy))
 			m.latencyEMA.Store(int64(100 * time.Millisecond))
@@ -457,22 +457,16 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 		return
 	}
 
-	// Success - verify HTTP status is in 2xx range
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Health check returned non-2xx, treat as failure
+	// Success - any HTTP response means the server is alive (even 4xx/5xx)
+	// Only connection errors (timeout, refused, etc) should mark as unhealthy
+	if resp.StatusCode < 100 {
+		// This shouldn't happen, but treat as failure just in case
 		m.lastHealthCheckFail.Store(time.Now().Unix())
-		m.consecutiveSuccess.Store(0) // Reset consecutive success counter
-		if m.GetState() == StateHealthy {
-			m.failCount.Add(1)
-			if int(m.failCount.Load()) >= mm.failureThreshold {
-				m.SetState(StateUnhealthy)
-				log.Printf("[MIRROR] %s health check returned %d, marked unhealthy", m.URL, resp.StatusCode)
-			}
-		}
+		m.consecutiveSuccess.Store(0)
 		return
 	}
 
-	// Health check passed with 200 OK
+	// Health check passed - server responded with HTTP (any status is OK for health)
 	consecutive := m.consecutiveSuccess.Add(1)
 
 	if m.GetState() == StateUnhealthy {
