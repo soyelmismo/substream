@@ -57,6 +57,7 @@ type Controller struct {
 	streamLocks      sync.Map                              // dedup concurrent stream serving per track+client
 	importer         *importer.JobManager                  // Background playlist import manager
 	userStreamSem    chan struct{}                         // limit total concurrent streams across all users
+	userStreamLimits sync.Map                              // per-user stream limiting (userID -> chan struct{})
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {

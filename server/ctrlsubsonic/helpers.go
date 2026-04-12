@@ -155,7 +155,9 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 	var track *tidalproxy.TidalTrack
 	var urlErr, trackErr error
 
-	cacheKey := fmt.Sprintf("stream:%d:%s", trackID, quality)
+	// [CRITICAL FIX] Include clientIP in cache key - Tidal returns IP-locked URLs!
+	// Without this, different users share invalid URLs causing 403 errors
+	cacheKey := fmt.Sprintf("stream:%d:%s:%s", trackID, quality, clientIP)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -185,7 +187,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 			lp.url, lp.err = url, urlErr
 			close(lp.done)
 			if urlErr == nil && url != "" {
-				c.streamURLCache.Set(cacheKey, url, 30*time.Minute) // Increased to 30m, safe within 1h window
+				c.streamURLCache.Set(cacheKey, url, 5*time.Minute) // Reduced to 5m, URLs are IP-locked
 			}
 			go func() {
 				time.Sleep(100 * time.Millisecond)

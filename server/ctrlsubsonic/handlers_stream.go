@@ -45,14 +45,62 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		return nil
 	}
 
+	// Per-user stream limiting - prevent a single user from consuming all slots
+	user := r.Context().Value(CtxUser).(*db.User)
+	const maxStreamsPerUser = 5
+	userSemVal, _ := c.userStreamLimits.LoadOrStore(user.ID, make(chan struct{}, maxStreamsPerUser))
+	userSem := userSemVal.(chan struct{})
+	select {
+	case userSem <- struct{}{}:
+		defer func() { <-userSem }()
+	case <-r.Context().Done():
+		return spec.NewError(0, "request cancelled")
+	default:
+		log.Printf("[STREAM] User %d at stream limit (%d), rejecting request", user.ID, maxStreamsPerUser)
+		return spec.NewError(0, "too many concurrent streams for this user")
+	}
+
+	// [Deduplication] Prevent concurrent identical stream requests from hitting upstream
+	// multiple times. If another request is already streaming this track, wait for it.
+	streamKey := fmt.Sprintf("stream:%s:%d", id.String(), p.GetOrInt("maxBitRate", 0))
+	type streamLock struct {
+		done chan struct{}
+		err  error // Propagate error from the first request to waiting requests
+	}
+	lockVal, loaded := c.streamLocks.LoadOrStore(streamKey, &streamLock{done: make(chan struct{})})
+	if loaded {
+		// Another request is already streaming this track, wait for it to complete
+		lock := lockVal.(*streamLock)
+		<-lock.done
+		// If the first request failed, propagate the error
+		if lock.err != nil {
+			log.Printf("[STREAM] Deduplicated request failed (original error: %v)", lock.err)
+			return spec.NewError(0, "stream failed: %v", lock.err)
+		}
+	}
+	// Cleanup lock when done - capture err in named return to propagate to waiters
+	var streamErr error
+	defer func() {
+		if !loaded {
+			// Only the first request cleans up and sets error if any
+			lockVal.(*streamLock).err = streamErr
+			close(lockVal.(*streamLock).done)
+			c.streamLocks.Delete(streamKey)
+		}
+	}()
+
 	prep, err := c.prepareStream(r.Context(), r, id.Value())
 	if err != nil {
+		streamErr = err
 		log.Printf("[STREAM] ERROR: prepare failed: %v", err)
 		return spec.NewError(0, "error preparing stream: %v", err)
 	}
 
+	// [Safety] Add 10-minute timeout for stream operations to prevent indefinite hangs
+	streamCtx, streamCancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer streamCancel()
+
 	// 1. Ingest metadata for virtual library
-	user := r.Context().Value(CtxUser).(*db.User)
 	trackURI := fmt.Sprintf("td:tr:%d", id.Value())
 	c.dbc.Exec(`INSERT OR REPLACE INTO track_metadata (uri, album_uri, artist_uri, updated_at) VALUES (?, ?, ?, ?)`,
 		trackURI, fmt.Sprintf("td:al:%d", prep.Track.Album.ID), fmt.Sprintf("td:ar:%d", prep.Track.Artist.ID), time.Now())
@@ -60,43 +108,60 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		user.ID, trackURI, time.Now(), time.Now())
 
 	// 2. Redirect if not proxying (force proxy for certain Android clients that can't seek with redirects)
+	// [FIX] Now allows redirects for HLS/DASH - MPV/Supersonic handles them natively
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
-	if proxyStreams != "true" && !prep.IsHLS && !prep.IsDASH && !needsForcedProxy(prep.ClientName) {
+	if proxyStreams != "true" && !needsForcedProxy(prep.ClientName) {
+		urlPreview := prep.StreamURL
+		if len(urlPreview) > 100 {
+			urlPreview = urlPreview[:100]
+		}
+		log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s",
+			id.Value(), prep.IsHLS, urlPreview)
 		http.Redirect(w, r, prep.StreamURL, http.StatusFound)
 		return nil
 	}
 
 	// 3. Proxy stream
-	contentType := "audio/flac"
-	if prep.Ext == "m4a" {
-		contentType = "audio/mp4"
-	}
-	w.Header().Set("Content-Type", contentType)
 	if !prep.IsHLS && !prep.IsDASH {
+		contentType := "audio/flac"
+		if prep.Ext == "m4a" {
+			contentType = "audio/mp4"
+		}
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Accept-Ranges", "bytes")
-	}
-	if strings.Contains(r.URL.Path, "download") {
-		cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s.%s", prep.Track.Artist.Name, prep.Track.Title, prep.Ext), "/", "_")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName))
+		if strings.Contains(r.URL.Path, "download") {
+			cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s.%s", prep.Track.Artist.Name, prep.Track.Title, prep.Ext), "/", "_")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName))
+		}
 	}
 
 	if prep.IsHLS {
-		err = c.downloadAndStitchHLS(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track, p.GetOrFloat("timeOffset", 0))
+		// [NEW] Serve HLS manifest directly to MPV - it handles HLS natively
+		urlPreview := prep.StreamURL
+		if len(urlPreview) > 100 {
+			urlPreview = urlPreview[:100]
+		}
+		log.Printf("[STREAM] DEBUG: proxying HLS manifest for track %d URL=%s", id.Value(), urlPreview)
+		err = c.proxyHLSManifest(streamCtx, prep.StreamURL, w, prep.ClientIP)
 		if err != nil {
-			log.Printf("[STREAM] ERROR: HLS stitch failed for track %d: %v", id.Value(), err)
-			http.Error(w, "stream unavailable", http.StatusBadGateway)
+			streamErr = err
+			log.Printf("[STREAM] ERROR: HLS proxy failed for track %d: %v", id.Value(), err)
+		} else {
+			log.Printf("[STREAM] DEBUG: HLS proxy succeeded for track %d", id.Value())
 		}
 	} else if prep.IsDASH {
-		err = c.downloadAndStitchDASH(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track)
+		// [NEW] Serve DASH manifest directly
+		err = c.proxyDASHManifest(streamCtx, prep.StreamURL, w, prep.ClientIP)
 		if err != nil {
-			log.Printf("[STREAM] ERROR: DASH stitch failed for track %d: %v", id.Value(), err)
-			http.Error(w, "stream unavailable", http.StatusBadGateway)
+			streamErr = err
+			log.Printf("[STREAM] ERROR: DASH proxy failed for track %d: %v", id.Value(), err)
 		}
 	} else {
 		// Direct proxy with proper error handling and header passthrough
-		if err := c.proxyDirectStream(r.Context(), w, r, prep); err != nil {
+		err = c.proxyDirectStream(streamCtx, w, r, prep)
+		if err != nil {
+			streamErr = err
 			log.Printf("[STREAM] ERROR: direct proxy failed for track %d: %v", id.Value(), err)
-			// Error already written to response by proxyDirectStream
 		}
 	}
 	return nil

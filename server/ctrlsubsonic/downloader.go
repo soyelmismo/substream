@@ -138,43 +138,121 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		return fmt.Errorf("no segments found in manifest")
 	}
 
-	// 3. Download and stream segments concurrently with progressive streaming
-	// Use the shared streaming client for connection reuse and optimal pooling
+	// 3. Download and stream segments
+	// CRITICAL: Download first segment(s) synchronously to ensure immediate playback start
+	// Then download remaining segments in parallel for throughput
 	client := c.streamClient
+	const maxConcurrency = 6
 
-	const maxConcurrency = 6 // Limit concurrent downloads
-
-	// Get flusher for low-latency streaming if writer supports it
 	flusher, canFlush := w.(http.Flusher)
 	tagger := &flacTagger{w: w, track: track}
 
-	// Download and stream segments in order with look-ahead buffering
-	// This allows us to start streaming immediately while downloading ahead
 	type segmentResult struct {
 		index int
 		data  []byte
 		err   error
 	}
 
-	results := make(chan segmentResult, maxConcurrency*2) // Buffer for look-ahead
+	// [CRITICAL FIX] Download first segment (or init+first media) SYNCHRONOUSLY
+	// This ensures we start streaming immediately without waiting for workers
+	hasInitSegment := len(segments) > 0 && segments[0].duration == 0
+	nextToWrite := startIdx
+
+	if hasInitSegment {
+		// fMP4: need init segment first, then start from media segment 1 or startIdx
+		firstMediaIdx := 1
+		if startIdx > 1 {
+			firstMediaIdx = startIdx
+		}
+		log.Printf("[DOWNLOAD] fMP4 with init segment detected, downloading init + segment %d first", firstMediaIdx)
+
+		// Download init segment (index 0) synchronously
+		segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		initData, err := downloadSegment(segmentCtx, client, segments[0].url, clientIP)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("init segment failed: %w", err)
+		}
+
+		// Download first media segment synchronously too
+		segmentCtx, cancel = context.WithTimeout(ctx, 45*time.Second)
+		firstData, err := downloadSegment(segmentCtx, client, segments[firstMediaIdx].url, clientIP)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("first media segment %d failed: %w", firstMediaIdx, err)
+		}
+
+		// [CRITICAL FIX] Correct Content-Type for fMP4 streams
+		// Tidal FLAC streams are now in fMP4 containers, not raw FLAC
+		// Without this fix, client receives audio/flac header but fMP4 data and fails
+		if rw, ok := w.(http.ResponseWriter); ok {
+			// Check for MP4 signature ("ftyp" at offset 4)
+			if len(initData) >= 8 && string(initData[4:8]) == "ftyp" {
+				rw.Header().Set("Content-Type", "audio/mp4")
+				// Remove any incorrect Content-Disposition from ServeStream
+				if rw.Header().Get("Content-Disposition") != "" {
+					cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s", track.Artist.Name, track.Title), "/", "_")
+					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
+				}
+				log.Printf("[DOWNLOAD] fMP4 container detected, corrected Content-Type to audio/mp4")
+			}
+		}
+
+		// Write init segment first (required for fMP4 decoding)
+		if _, err := w.Write(initData); err != nil {
+			return err
+		}
+		// Then write first media segment
+		if _, err := w.Write(firstData); err != nil {
+			return err
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+
+		// Set nextToWrite to the segment after the one we just wrote
+		nextToWrite = firstMediaIdx + 1
+	} else {
+		// No init segment - download first media segment synchronously
+		log.Printf("[DOWNLOAD] No init segment, downloading segment %d first", startIdx)
+		segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		firstData, err := downloadSegment(segmentCtx, client, segments[startIdx].url, clientIP)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("first segment %d failed: %w", startIdx, err)
+		}
+		// Try tagging if FLAC, then write
+		if err := tagger.process(bytes.NewReader(firstData), c); err != nil {
+			log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
+			if _, err := w.Write(firstData); err != nil {
+				return err
+			}
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		nextToWrite = startIdx + 1
+	}
+
+	// Parallel download for remaining segments
+	results := make(chan segmentResult, maxConcurrency*2)
 	var wg sync.WaitGroup
 
-	// Start worker pool
+	// Start from nextToWrite (already written) + distribute remaining
 	for i := 0; i < maxConcurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for idx := workerID; idx < len(segments); idx += maxConcurrency {
-				// Per-segment timeout to prevent hanging on slow CDN
+			// Start from nextToWrite + workerID, step by maxConcurrency
+			for idx := nextToWrite + workerID; idx < len(segments); idx += maxConcurrency {
 				segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 				data, err := downloadSegment(segmentCtx, client, segments[idx].url, clientIP)
 				cancel()
 
-				// Use select to prevent goroutine leak if context cancelled
 				select {
 				case results <- segmentResult{idx, data, err}:
 				case <-ctx.Done():
-					return // Context cancelled, exit worker
+					return
 				}
 			}
 		}(i)
@@ -186,53 +264,25 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		close(results)
 	}()
 
-	// Collect and write segments in order (start from startIdx for seeking)
+	// Collect and write remaining segments in order
+	// First segment(s) already written synchronously above
 	resultMap := make(map[int][]byte)
-	nextToWrite := startIdx
-	writtenInit := false
-	initSegmentData := []byte(nil)
 
 	for result := range results {
 		if result.err != nil {
 			return fmt.Errorf("segment %d failed: %w", result.index, result.err)
 		}
 
-		// Capture init segment (index 0, duration 0) immediately when it arrives
-		if result.index == 0 && len(segments) > 0 && segments[0].duration == 0 {
-			initSegmentData = result.data
-			continue // Don't store in resultMap, we'll write it at the right time
-		}
-
 		resultMap[result.index] = result.data
-
-		// Write init segment first if we have it and haven't written it yet
-		if initSegmentData != nil && !writtenInit {
-			if _, err := w.Write(initSegmentData); err != nil {
-				return err
-			}
-			writtenInit = true
-			initSegmentData = nil
-		}
 
 		// Write all consecutive segments that are ready
 		for {
 			if data, ok := resultMap[nextToWrite]; ok {
-				if nextToWrite == startIdx && track != nil {
-					// First media segment, try tagging if FLAC
-					if err := tagger.process(bytes.NewReader(data), c); err != nil {
-						log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
-						if _, err := w.Write(data); err != nil {
-							return err
-						}
-					}
-				} else {
-					if _, err := w.Write(data); err != nil {
-						return err
-					}
+				if _, err := w.Write(data); err != nil {
+					return err
 				}
 				delete(resultMap, nextToWrite)
 				nextToWrite++
-				// Flush after each segment for low-latency delivery
 				if canFlush {
 					flusher.Flush()
 				}
@@ -241,7 +291,6 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			}
 		}
 
-		// Safety check
 		if nextToWrite >= len(segments) {
 			break
 		}
@@ -328,7 +377,9 @@ func downloadSegmentOnce(ctx context.Context, client *http.Client, url, clientIP
 	return buf.Bytes(), err
 }
 
-func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack) error {
+// downloadAndStitchDASH fetches a DASH manifest and streams all segments to w
+// offsetSeconds allows time-based seeking (skip segments until offset)
+func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
 	if err != nil {
 		return err
@@ -368,6 +419,21 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 		return fmt.Errorf("no segments found in DASH")
 	}
 
+	// Calculate starting segment for time-based seeking
+	startIdx := 0
+	if offsetSeconds > 0 && track != nil && track.Duration > 0 {
+		// Estimate which segment to start from based on track duration
+		segmentDuration := float64(track.Duration) / float64(len(segments))
+		startIdx = int(offsetSeconds / segmentDuration)
+		if startIdx >= len(segments) {
+			startIdx = len(segments) - 1
+		}
+		if startIdx > 0 {
+			log.Printf("[DOWNLOAD] DASH time-based seek: offset=%.2fs, starting at segment %d/%d",
+				offsetSeconds, startIdx, len(segments))
+		}
+	}
+
 	log.Printf("[DOWNLOAD] DASH: %d segments found, starting parallel download", len(segments))
 
 	// Parallel download with worker pool (same pattern as HLS)
@@ -387,12 +453,17 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 	results := make(chan segmentResult, maxConcurrency*2)
 	var wg sync.WaitGroup
 
-	// Start worker pool
+	// Start worker pool - only download segments from startIdx onwards
 	for i := 0; i < maxConcurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for idx := workerID; idx < len(segments); idx += maxConcurrency {
+			// Start from startIdx instead of 0 for seeking support
+			firstIdx := startIdx + workerID
+			if firstIdx < startIdx {
+				firstIdx = startIdx
+			}
+			for idx := firstIdx; idx < len(segments); idx += maxConcurrency {
 				// Per-segment timeout
 				segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 				data, err := downloadSegment(segmentCtx, c.streamClient, segments[idx], clientIP)
@@ -414,9 +485,10 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 		close(results)
 	}()
 
-	// Collect and write segments in order
+	// Collect and write segments in order (start from startIdx for seeking)
 	resultMap := make(map[int][]byte)
-	nextToWrite := 0
+	nextToWrite := startIdx
+	firstWriteDone := false
 
 	for result := range results {
 		if result.err != nil {
@@ -429,8 +501,9 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 		// Write all consecutive segments that are ready
 		for {
 			if data, ok := resultMap[nextToWrite]; ok {
-				if nextToWrite == 0 {
-					// First segment: try tagging if it's FLAC
+				if !firstWriteDone {
+					// First segment written (may not be index 0 if seeking): try tagging if it's FLAC
+					firstWriteDone = true
 					if err := tagger.process(bytes.NewReader(data), c); err != nil {
 						log.Printf("[DOWNLOAD] DASH tagging failed, writing raw: %v", err)
 						if _, err := w.Write(data); err != nil {
@@ -662,4 +735,112 @@ func (t *flacTagger) makePictureBlock(c *Controller) []byte {
 	header[3] = byte(len(data))
 
 	return append(header, data...)
+}
+
+// proxyHLSManifest fetches the M3U8 manifest, rewrites relative URLs to absolute,
+// and serves it directly to the client as an HLS playlist.
+func (c *Controller) proxyHLSManifest(ctx context.Context, manifestURL string, w http.ResponseWriter, clientIP string) error {
+	urlPreview := manifestURL
+	if len(urlPreview) > 80 {
+		urlPreview = urlPreview[:80]
+	}
+	log.Printf("[HLS-PROXY-START] URL=%s", urlPreview)
+	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	resp, err := c.streamClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("manifest fetch failed: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	bodyStr := string(body)
+	// Log first 500 chars of manifest for debugging
+	previewLen := len(bodyStr)
+	if previewLen > 500 {
+		previewLen = 500
+	}
+	log.Printf("[HLS-MANIFEST] URL=%s ContentPreview=%s", manifestURL, bodyStr[:previewLen])
+
+	baseURL := manifestURL
+	if lastSlash := strings.LastIndex(baseURL, "/"); lastSlash != -1 {
+		baseURL = baseURL[:lastSlash+1]
+	}
+
+	var rewritten []string
+	for _, line := range strings.Split(bodyStr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			if strings.HasPrefix(trimmed, "#EXT-X-MAP:URI=") {
+				parts := strings.SplitN(trimmed, "\"", 3)
+				if len(parts) >= 3 && !strings.HasPrefix(parts[1], "http") {
+					parts[1] = baseURL + parts[1]
+					line = strings.Join(parts, "\"")
+				}
+			}
+			rewritten = append(rewritten, line)
+		} else {
+			if !strings.HasPrefix(trimmed, "http") {
+				trimmed = baseURL + trimmed
+			}
+			rewritten = append(rewritten, trimmed)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Content-Disposition", "inline; filename=\"stream.m3u8\"")
+	w.WriteHeader(http.StatusOK)
+
+	_, err = w.Write([]byte(strings.Join(rewritten, "\n")))
+	return err
+}
+
+func (c *Controller) proxyDASHManifest(ctx context.Context, manifestURL string, w http.ResponseWriter, clientIP string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	resp, err := c.streamClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("manifest fetch failed: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	w.Header().Set("Content-Type", "application/dash+xml")
+	w.Header().Set("Content-Disposition", "inline; filename=\"stream.mpd\"")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(body)
+	return err
 }

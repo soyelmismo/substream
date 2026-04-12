@@ -635,7 +635,17 @@ func (c *CachedProxy) GetStreamURL(ctx context.Context, trackID int, quality str
 
 	url, err := c.TidalProxy.GetStreamURL(ctx, trackID, quality, clientIP)
 	if err == nil && url != "" {
-		c.streamURLs.Set(key, url, 0)
+		// [CRITICAL] Only cache progressive/BTS URLs, NOT HLS manifests
+		// HLS URLs expire quickly and prevent BTS fallback from working
+		isHLS := strings.Contains(url, ".m3u8") ||
+			strings.Contains(url, "manifest") ||
+			strings.Contains(url, "/manifests/")
+		if !isHLS {
+			c.streamURLs.Set(key, url, 0)
+			log.Printf("[CACHE] Cached BTS URL for track=%d quality=%s (progressive)", trackID, quality)
+		} else {
+			log.Printf("[CACHE] Skipping cache for HLS URL track=%d (manifest expires quickly)", trackID)
+		}
 	} else if err != nil {
 		// Check if error indicates track is permanently unavailable
 		// This prevents wasting resources on region-blocked or deleted tracks

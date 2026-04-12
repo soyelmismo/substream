@@ -276,7 +276,13 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		resp.Body.Close()
 		err := fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
 		if m != nil {
-			p.mirrorMgr.ReportResult(m, latency, err)
+			// [FIX] Only penalize mirror for server errors (5xx) or rate limits (429)
+			// 4xx errors mean content unavailable, not mirror failure
+			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+				p.mirrorMgr.ReportResult(m, latency, err)
+			} else {
+				p.mirrorMgr.ReportResult(m, latency, nil)
+			}
 		}
 		return nil, err
 	}
@@ -333,7 +339,13 @@ func (p *Pool) doFetchRawWithMirror(ctx context.Context, path string, query url.
 		resp.Body.Close()
 		err := fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
 		if p.mirrorMgr != nil {
-			p.mirrorMgr.ReportResult(m, latency, err)
+			// [FIX] Only penalize mirror for server errors (5xx) or rate limits (429)
+			// 4xx errors mean content unavailable, not mirror failure
+			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+				p.mirrorMgr.ReportResult(m, latency, err)
+			} else {
+				p.mirrorMgr.ReportResult(m, latency, nil)
+			}
 		}
 		return err
 	}
@@ -673,196 +685,313 @@ func (p *Pool) SearchAlbums(ctx context.Context, query string, limit, offset int
 	return uniqueItems, nil
 }
 
-func (p *Pool) GetStreamURL(ctx context.Context, trackID int, quality string, clientIP string) (string, error) {
-	if quality == "" {
-		quality = p.quality
+type streamTask struct {
+	Mirror       *Mirror
+	ManifestType string
+	Quality      string
+	Formats      []string
+}
+
+type streamResult struct {
+	URL          string
+	Mirror       *Mirror
+	ManifestType string
+	Quality      string
+	Latency      time.Duration
+	Err          error
+}
+
+// filterMirrorError perdona al mirror si Tidal rechaza la pista por licencias/tier
+func filterMirrorError(err error) error {
+	if err == nil {
+		return nil
+	}
+	errStr := strings.ToLower(err.Error())
+	// Solo castigar por errores reales de red o rate limit (429, 5xx, timeouts)
+	if strings.Contains(errStr, "429") || strings.Contains(errStr, "500") ||
+		strings.Contains(errStr, "502") || strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "504") || strings.Contains(errStr, "timeout") {
+		return err
+	}
+	// Perdonar 400, 401, 403, 404, Previews, y context canceled (cuando SHOTGUN cancela peticiones pendientes)
+	if strings.Contains(errStr, "context canceled") {
+		return nil
+	}
+	return nil
+}
+
+func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID int, clientIP string) streamResult {
+	start := time.Now()
+
+	qV2 := url.Values{
+		"id":           {fmt.Sprint(trackID)},
+		"manifestType": {task.ManifestType},
+	}
+	for _, f := range task.Formats {
+		qV2.Add("formats", f)
 	}
 
-	qualities := []string{quality}
-	switch quality {
-	case "HI_RES_LOSSLESS":
-		qualities = append(qualities, "LOSSLESS", "HIGH")
-	case "LOSSLESS":
-		qualities = append(qualities, "HIGH")
+	var v2Response struct {
+		Data struct {
+			Attributes struct {
+				Manifest          string   `json:"manifest"`
+				ManifestMimeType  string   `json:"manifestMimeType"`
+				URI               string   `json:"uri"`
+				Formats           []string `json:"formats"`
+				TrackPresentation string   `json:"trackPresentation"`
+			} `json:"attributes"`
+		} `json:"data"`
 	}
 
-	var lastErr error
+	err := p.doFetchRawWithMirror(ctx, "/trackManifests/", qV2, clientIP, task.Mirror, &v2Response)
+	latency := time.Since(start)
 
-	// [Smart Mirror Exclusion] Track which mirrors we've already tried for this request
-	// to avoid wasting time on mirrors that already failed
-	triedMirrors := make(map[string]bool)
-
-	// Reduce retries if we use smart mirror selection
-	maxRetries := 3
-	for try := 0; try < maxRetries; try++ {
-		// Select next mirror, excluding ones we've already tried
-		var m *Mirror
-		p.mu.RLock()
-		if p.mirrorMgr != nil {
-			// Try to find a healthy mirror we haven't tried yet
-			for _, candidate := range p.mirrorMgr.GetMirrors() {
-				if triedMirrors[candidate.URL] {
-					continue
-				}
-				state := candidate.GetState()
-				if state == StateHealthy || state == StateProbing {
-					m = candidate
-					break
-				}
-			}
-			// If no untried healthy mirrors, fallback to any untried mirror
-			if m == nil {
-				for _, candidate := range p.mirrorMgr.GetMirrors() {
-					if !triedMirrors[candidate.URL] {
-						m = candidate
-						break
-					}
-				}
-			}
-		}
-		p.mu.RUnlock()
-
-		if m == nil {
-			// We've tried all available mirrors
-			log.Printf("[TIDAL] GetStreamURL track=%d exhausted all %d mirrors", trackID, len(triedMirrors))
-			break
-		}
-
-		// Mark this mirror as tried
-		triedMirrors[m.URL] = true
-		mirrorStart := time.Now() // Track start time for this mirror
-
-		for _, qStr := range qualities {
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-
-			log.Printf("[TIDAL] GetStreamURL track=%d try=%d/%d quality=%s mirror=%s", trackID, try, maxRetries-1, qStr, m.URL)
-
-			// 1. Try V2 OpenAPI Manifests first (HLS)
-			v2Ctx, v2Cancel := context.WithTimeout(ctx, 2*time.Second)
-			var formats []string
-			switch qStr {
-			case "HI_RES_LOSSLESS":
-				formats = []string{"FLAC_HIRES", "MQA"}
-			case "LOSSLESS":
-				formats = []string{"FLAC"}
-			case "HIGH":
-				formats = []string{"AACLC"}
-			case "LOW":
-				formats = []string{"HEAACV1"}
-			default:
-				formats = []string{"FLAC_HIRES", "FLAC", "AACLC"}
-			}
-
-			qV2 := url.Values{
-				"id":           {fmt.Sprint(trackID)},
-				"manifestType": {"HLS"},
-			}
-			for _, f := range formats {
-				qV2.Add("formats", f)
-			}
-			var v2Response struct {
-				Data struct {
-					Attributes struct {
-						Manifest          string   `json:"manifest"`
-						ManifestMimeType  string   `json:"manifestMimeType"`
-						URI               string   `json:"uri"`
-						Formats           []string `json:"formats"`
-						TrackPresentation string   `json:"trackPresentation"`
-					} `json:"attributes"`
-				} `json:"data"`
-			}
-
-			// Use specific mirror via doFetchRawWithMirror
-			err := p.doFetchRawWithMirror(v2Ctx, "/trackManifests/", qV2, clientIP, m, &v2Response)
-			v2Cancel()
-
-			// [Fail Fast] Check if error indicates track is permanently unavailable
-			if err != nil {
-				errCat := classifyError(err)
-				if errCat == ErrorTrackUnavailable {
-					log.Printf("[TIDAL] GetStreamURL track=%d is unavailable (quality=%s): %v", trackID, qStr, err)
-					// Don't retry other mirrors for unavailable tracks
-					return "", fmt.Errorf("track unavailable: %w", err)
-				}
-				// Report transient errors to mirror manager
-				// Use actual latency from context deadline or a reasonable estimate
-				latency := time.Since(mirrorStart)
-				if latency < 100*time.Millisecond {
-					latency = 100 * time.Millisecond // Minimum to avoid distorting metrics
-				}
-				if p.mirrorMgr != nil {
-					p.mirrorMgr.ReportResult(m, latency, err)
-				}
-				continue // Try next quality
-			}
-
-			if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
-				log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW (V2) - skipping quality %s", trackID, qStr)
-				continue
-			}
-			uri := v2Response.Data.Attributes.URI
-			if uri != "" && !strings.Contains(uri, "manifest.tidal.com") && !strings.Contains(uri, "/manifests/") {
-				if p.mirrorMgr != nil {
-					p.mirrorMgr.ReportResult(m, 0, nil)
-				}
-				return uri, nil
-			}
-			if uri != "" {
-				audioURL, err := p.downloadAndParseHLSManifest(ctx, uri, clientIP)
-				if err == nil && audioURL != "" {
-					if p.mirrorMgr != nil {
-						p.mirrorMgr.ReportResult(m, 0, nil)
-					}
-					return audioURL, nil
-				}
-			}
-
-			// 2. V1 fallback
-			q := url.Values{
-				"id":                {fmt.Sprint(trackID)},
-				"quality":           {qStr},
-				"playbackmode":      {"STREAM"},
-				"assetpresentation": {"FULL"},
-			}
-			var stream TidalStreamInfo
-			if err := p.doFetchRawWithMirror(ctx, "/track/", q, clientIP, m, &stream); err == nil {
-				if stream.TrackPresentation == "PREVIEW" {
-					log.Printf("[TIDAL] GetStreamURL track=%d PREVIEW (V1) - skipping quality %s", trackID, qStr)
-					continue
-				}
-				u, err := parseManifestURL(trackID, "V1", stream.ManifestMimeType, stream.Manifest)
-				if err == nil {
-					if p.mirrorMgr != nil {
-						p.mirrorMgr.ReportResult(m, 0, nil)
-					}
-					return u, nil
-				}
-				lastErr = err
-			} else {
-				lastErr = err
-				// Check if V1 error indicates track unavailable
-				errCat := classifyError(err)
-				if errCat == ErrorTrackUnavailable {
-					log.Printf("[TIDAL] GetStreamURL track=%d is unavailable (V1, quality=%s): %v", trackID, qStr, err)
-					return "", fmt.Errorf("track unavailable: %w", err)
-				}
-				if p.mirrorMgr != nil {
-					// Use actual latency instead of 0 to avoid corrupting EMA metrics
-					latency := time.Since(mirrorStart)
-					if latency < 100*time.Millisecond {
-						latency = 100 * time.Millisecond
-					}
-					p.mirrorMgr.ReportResult(m, latency, err)
-				}
-			}
-		}
-
-		log.Printf("[TIDAL] GetStreamURL track=%d mirror %s failed, will try next mirror", trackID, m.URL)
+	res := streamResult{
+		Mirror:       task.Mirror,
+		ManifestType: task.ManifestType,
+		Quality:      task.Quality,
+		Latency:      latency,
+		Err:          err,
 	}
 
-	return "", fmt.Errorf("could not get full stream after %d mirrors: %v", len(triedMirrors), lastErr)
+	if err != nil {
+		return res
+	}
+
+	if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
+		res.Err = fmt.Errorf("preview track")
+		return res
+	}
+
+	// Debug: Log what Tidal actually returned
+	uriPreview := v2Response.Data.Attributes.URI
+	if len(uriPreview) > 100 {
+		uriPreview = uriPreview[:100]
+	}
+	log.Printf("[SHOTGUN-DEBUG] track=%d mirror=%s manifest=%s quality=%s: Formats=%v MimeType=%s URI=%s",
+		trackID, task.Mirror.URL, task.ManifestType, task.Quality,
+		v2Response.Data.Attributes.Formats,
+		v2Response.Data.Attributes.ManifestMimeType,
+		uriPreview)
+
+	// 1. Extraer URL de un JSON Base64 (Típico de BTS)
+	manifestB64 := v2Response.Data.Attributes.Manifest
+	if manifestB64 != "" {
+		audioURL, parseErr := parseManifestURL(trackID, "V2-"+task.ManifestType, v2Response.Data.Attributes.ManifestMimeType, manifestB64)
+		if parseErr == nil && audioURL != "" {
+			res.URL = audioURL
+			return res
+		}
+	}
+
+	// 2. Extraer de URI directa (Devuelto por HLS)
+	// Como ahora MPV procesa HLS crudo, simplemente devolvemos esta URL
+	uri := v2Response.Data.Attributes.URI
+	if uri != "" {
+		res.URL = uri
+		return res
+	}
+
+	res.Err = fmt.Errorf("no valid stream url found in response")
+	return res
+}
+
+func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality string, clientIP string) (string, error) {
+	if requestedQuality == "" {
+		requestedQuality = p.quality
+	}
+
+	// Obtener mirrors sanos y en prueba
+	var mirrors []*Mirror
+	p.mu.RLock()
+	if p.mirrorMgr != nil {
+		for _, m := range p.mirrorMgr.GetMirrors() {
+			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
+				mirrors = append(mirrors, m)
+			}
+		}
+	}
+	p.mu.RUnlock()
+
+	if len(mirrors) == 0 {
+		return "", fmt.Errorf("no healthy mirrors available")
+	}
+
+	// Ordenar mirrors por latencia (los más rápidos primero)
+	for i := 0; i < len(mirrors)-1; i++ {
+		for j := i + 1; j < len(mirrors); j++ {
+			_, latI, _, _ := mirrors[i].GetStats()
+			_, latJ, _, _ := mirrors[j].GetStats()
+			if latJ < latI {
+				mirrors[i], mirrors[j] = mirrors[j], mirrors[i]
+			}
+		}
+	}
+
+	// Generar el arsenal de combinaciones (Calidad + Formato)
+	type combo struct {
+		mType   string
+		quality string
+		formats []string
+	}
+	var combos []combo
+
+	if requestedQuality == "HI_RES_LOSSLESS" {
+		combos = append(combos, combo{"BTS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES", "MQA"}})
+		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
+		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
+		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
+		combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
+	} else if requestedQuality == "LOSSLESS" {
+		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
+		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
+		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
+		combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
+	} else {
+		combos = append(combos, combo{"BTS", requestedQuality, []string{"AACLC", "HEAACV1"}})
+		combos = append(combos, combo{"HLS", requestedQuality, []string{"AACLC", "HEAACV1"}})
+	}
+
+	// Asignar combinaciones a los proxies disponibles
+	var tasks []streamTask
+	for i, c := range combos {
+		if i >= len(mirrors) {
+			break // No saturar si hay menos mirrors que combos
+		}
+		tasks = append(tasks, streamTask{
+			Mirror:       mirrors[i],
+			ManifestType: c.mType,
+			Quality:      c.quality,
+			Formats:      c.formats,
+		})
+	}
+
+	// Si sobran proxies, duplicamos las peticiones principales (BTS FLAC) para ganar la carrera
+	if len(mirrors) > len(combos) {
+		for i := len(combos); i < len(mirrors); i++ {
+			c := combos[(i-len(combos))%len(combos)] // Repartir en round-robin
+			tasks = append(tasks, streamTask{
+				Mirror:       mirrors[i],
+				ManifestType: c.mType,
+				Quality:      c.quality,
+				Formats:      c.formats,
+			})
+		}
+	}
+
+	// ¡DISPARAR EL ESCOPETAZO!
+	shotgunCtx, cancelShotgun := context.WithCancel(ctx)
+	defer cancelShotgun()
+
+	results := make(chan streamResult, len(tasks))
+	log.Printf("[SHOTGUN] Disparando %d peticiones paralelas para track %d", len(tasks), trackID)
+
+	for _, t := range tasks {
+		go func(task streamTask) {
+			results <- p.executeStreamTask(shotgunCtx, task, trackID, clientIP)
+		}(t)
+	}
+
+	// Evaluar resultados al vuelo
+	var errorsList []string
+	var isUnavailable bool
+
+	var bestResult *streamResult
+	gracePeriod := 300 * time.Millisecond // Esperar 300ms por un BTS si un HLS contesta primero
+	var graceTimer *time.Timer
+
+	for i := 0; i < len(tasks); i++ {
+		select {
+		case res := <-results:
+			// Reportar estado al manager (filtrando falsos positivos)
+			if p.mirrorMgr != nil {
+				p.mirrorMgr.ReportResult(res.Mirror, res.Latency, filterMirrorError(res.Err))
+			}
+
+			if res.Err == nil && res.URL != "" {
+				// ¿Es el match perfecto? (BTS crudo en la calidad solicitada)
+				if res.ManifestType == "BTS" && res.Quality == requestedQuality {
+					formatType := "AAC"
+					if strings.Contains(res.Quality, "LOSSLESS") || strings.Contains(res.Quality, "FLAC") {
+						formatType = "FLAC"
+					}
+					log.Printf("[SHOTGUN] 🎯 WINNER PERFECTO track %d: %s (%s/%s) desde %s en %v",
+						trackID, formatType, res.ManifestType, res.Quality, res.Mirror.URL, res.Latency)
+					return res.URL, nil
+				}
+
+				// No es el perfecto, pero funciona. Guardarlo.
+				if bestResult == nil {
+					bestResult = &res
+					// Iniciar periodo de gracia por si un BTS viene justo detrás
+					graceTimer = time.NewTimer(gracePeriod)
+				} else {
+					// Si este nuevo resultado es mejor, lo reemplazamos
+					// Mejor = BTS sobre HLS, o FLAC sobre AAC
+					isNewBetter := false
+					if res.ManifestType == "BTS" && bestResult.ManifestType == "HLS" {
+						isNewBetter = true
+					}
+					// Si ambos son HLS, priorizar FLAC sobre AAC
+					if res.ManifestType == "HLS" && bestResult.ManifestType == "HLS" {
+						if (res.Quality == "LOSSLESS" || res.Quality == "HI_RES_LOSSLESS") &&
+							(bestResult.Quality == "HIGH" || bestResult.Quality == "LOW") {
+							isNewBetter = true
+							log.Printf("[SHOTGUN] 🔄 UPGRADE: Reemplazando AAC por FLAC (%s -> %s)",
+								bestResult.Quality, res.Quality)
+						}
+					}
+					if isNewBetter {
+						bestResult = &res
+					}
+				}
+			} else if res.Err != nil {
+				errorsList = append(errorsList, fmt.Sprintf("%s (%s/%s): %v", res.Mirror.URL, res.ManifestType, res.Quality, res.Err))
+				if strings.Contains(strings.ToLower(res.Err.Error()), "preview") ||
+					strings.Contains(strings.ToLower(res.Err.Error()), "region") ||
+					strings.Contains(strings.ToLower(res.Err.Error()), "restricted") {
+					isUnavailable = true
+				}
+			}
+
+		case <-func() <-chan time.Time {
+			if graceTimer != nil {
+				return graceTimer.C
+			}
+			return nil
+		}():
+			// Expiró el periodo de gracia, devolver lo mejor que tengamos
+			if bestResult != nil {
+				formatType := "AAC/HLS"
+				if strings.Contains(bestResult.Quality, "LOSSLESS") || strings.Contains(bestResult.Quality, "FLAC") {
+					formatType = "FLAC"
+				}
+				log.Printf("[SHOTGUN] ⏱️ GRACIA AGOTADA track %d: Entregando %s (%s/%s) desde %s",
+					trackID, formatType, bestResult.ManifestType, bestResult.Quality, bestResult.Mirror.URL)
+				return bestResult.URL, nil
+			}
+
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	// Terminaron todas las tareas. Si hay un ganador rezagado, devolverlo.
+	if bestResult != nil {
+		formatType := "AAC/HLS"
+		if strings.Contains(bestResult.Quality, "LOSSLESS") || strings.Contains(bestResult.Quality, "FLAC") {
+			formatType = "FLAC"
+		}
+		log.Printf("[SHOTGUN] 🏆 CONSOLACION track %d: %s (%s/%s) desde %s en %v",
+			trackID, formatType, bestResult.ManifestType, bestResult.Quality, bestResult.Mirror.URL, bestResult.Latency)
+		return bestResult.URL, nil
+	}
+
+	if isUnavailable {
+		log.Printf("[SHOTGUN] 🚫 Track %d no disponible globalmente (Preview/Region Locked)", trackID)
+	}
+
+	return "", fmt.Errorf("escopetazo fallido, %d peticiones dieron error. Logs: %s", len(tasks), strings.Join(errorsList, " | "))
 }
 
 // downloadAndParseHLSManifest downloads a Tidal manifest and extracts the audio stream URL

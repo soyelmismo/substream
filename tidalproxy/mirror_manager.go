@@ -274,17 +274,28 @@ func (mm *MirrorManager) ReportResult(m *Mirror, latency time.Duration, err erro
 	m.requestCount.Add(1)
 
 	if err != nil {
+		errStr := strings.ToLower(err.Error())
+
+		// DO NOT penalize the mirror for API rejections (Track unavailable, Preview, 400, 401, 403, 404)
+		// Also don't penalize for context canceled (when SHOTGUN cancels pending requests after finding winner)
+		// 429 is rate limit, so we DO penalize for 429 to trigger cooldown
+		if strings.Contains(errStr, "preview") ||
+			(strings.Contains(errStr, "400") && !strings.Contains(errStr, "429")) ||
+			strings.Contains(errStr, "401") ||
+			strings.Contains(errStr, "403") ||
+			strings.Contains(errStr, "404") ||
+			strings.Contains(errStr, "context canceled") {
+			// Es una respuesta sana, Tidal simplemente denegó la pista o SHOTGUN canceló la petición
+			// Actualizamos el success rate para que el mirror no pierda puntaje
+			mm.updateSuccessRate(m, true)
+			m.lastSuccess.Store(time.Now().Unix())
+			return
+		}
+
 		failCount := int(m.failCount.Add(1))
 		m.lastFail.Store(time.Now().Unix())
 
-		errStr := err.Error()
 		isRateLimit := strings.Contains(errStr, "429")
-		isServerError := strings.Contains(errStr, "502") || strings.Contains(errStr, "503") ||
-			strings.Contains(errStr, "504") || strings.Contains(errStr, "403")
-
-		// Check if we should circuit break
-		// [New] 429 (Rate Limit) causes immediate unhealthy state
-		// [New] 5xx and 403 errors also count toward threshold but don't immediately circuit break
 		shouldCircuitBreak := isRateLimit || failCount >= mm.failureThreshold
 		if shouldCircuitBreak && m.GetState() == StateHealthy {
 			m.SetState(StateUnhealthy)
@@ -293,8 +304,12 @@ func (mm *MirrorManager) ReportResult(m *Mirror, latency time.Duration, err erro
 				reason = "rate limited (429)"
 			}
 			log.Printf("[MIRROR] %s marked unhealthy: %s (failCount=%d)", m.URL, reason, failCount)
-		} else if isServerError && m.GetState() == StateHealthy {
-			// Log server errors for monitoring but don't circuit break immediately
+		} else if m.GetState() == StateHealthy {
+			// Truncate error message to avoid log spam from HTML responses
+			maxErrLen := 200
+			if len(errStr) > maxErrLen {
+				errStr = errStr[:maxErrLen] + "... [truncated]"
+			}
 			log.Printf("[MIRROR] %s server error (will count toward threshold): %s (failCount=%d/%d)",
 				m.URL, errStr, failCount, mm.failureThreshold)
 		}
@@ -308,18 +323,14 @@ func (mm *MirrorManager) ReportResult(m *Mirror, latency time.Duration, err erro
 	oldEMA := m.latencyEMA.Load()
 	newSample := int64(latency)
 
-	// EMA: 0.7 * old + 0.3 * new
 	newEMA := int64(0.7*float64(oldEMA) + 0.3*float64(newSample))
 	m.latencyEMA.Store(newEMA)
 
-	// Calculate success rate for weighted selection
 	mm.updateSuccessRate(m, true)
 
-	// Recovery logic: unhealthy -> probing, probing -> healthy, or direct unhealthy -> healthy if was succeeding
 	state := m.GetState()
 	switch state {
 	case StateUnhealthy:
-		// Check if cooldown has passed
 		lastFail := time.Unix(m.lastFail.Load(), 0)
 		if time.Since(lastFail) > mm.cooldownDuration {
 			m.SetState(StateProbing)

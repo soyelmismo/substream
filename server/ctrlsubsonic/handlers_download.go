@@ -20,7 +20,7 @@ import (
 // OpenSubsonic extension: https://opensubsonic.netlify.app/docs/endpoints/download/
 func (c *Controller) ServeDownload(w http.ResponseWriter, r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
-	
+
 	id, err := p.GetID("id")
 	if err != nil {
 		return spec.NewError(10, "please provide an 'id' parameter")
@@ -101,7 +101,7 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 			log.Printf("[DOWNLOAD] Error getting stream URL for track %d: %v", track.ID, err)
 			continue
 		}
-		
+
 		// Determine extension based on quality setting, not stream URL
 		// Tidal returns manifests that don't reflect the actual codec in URL
 		ext := "m4a" // Default AAC/MP4
@@ -118,7 +118,7 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 				ext = "mp3"
 			}
 		}
-		
+
 		trackFile := fmt.Sprintf("%02d - %s.%s", track.TrackNumber, track.Title, ext)
 		trackFile = sanitizeFilename(trackFile)
 
@@ -178,16 +178,16 @@ func (c *Controller) downloadAndAddToZip(ctx context.Context, streamURL string, 
 	// Check if this is a manifest that needs proxy/stitching
 	isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
 	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
-	
+
 	if isHLS {
 		// Use HLS stitcher - download and concatenate all segments (no seeking for downloads)
 		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, nil, 0)
 	}
 	if isDASH {
-		// Use DASH stitcher
-		return c.downloadAndStitchDASH(ctx, streamURL, w, clientIP, nil)
+		// Use DASH stitcher (no seeking for downloads, offset=0)
+		return c.downloadAndStitchDASH(ctx, streamURL, w, clientIP, nil, 0)
 	}
-	
+
 	// Direct download for non-manifest URLs
 	// Use shared client with keep-alive for better performance
 	client := &http.Client{
