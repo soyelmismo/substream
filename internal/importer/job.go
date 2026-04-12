@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/internal/matchutil"
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
@@ -22,8 +23,8 @@ const (
 // JobManager manages background import jobs
 type JobManager struct {
 	registry   *Registry
-	semaphore  chan struct{}        // Limits concurrent jobs
-	activeJobs sync.Map             // playlistID -> context.CancelFunc
+	semaphore  chan struct{} // Limits concurrent jobs
+	activeJobs sync.Map      // playlistID -> context.CancelFunc
 	db         *db.DB
 	proxy      tidalproxy.TidalProxy
 }
@@ -228,7 +229,7 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title, album str
 		// Check if we got good matches
 		best := 0.0
 		for _, t := range results {
-			score := matchScoreWithAlbum(artist, title, album, t)
+			score := matchutil.MatchScoreWithAlbum(artist, title, album, t)
 			if score > best {
 				best = score
 			}
@@ -249,7 +250,7 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title, album str
 	anyScore := 0.0
 
 	for _, t := range results {
-		score := matchScore(artist, title, t)
+		score := matchutil.MatchScore(artist, title, t)
 		if score > bestScore {
 			bestScore = score
 			bestMatch = t.ID
@@ -279,14 +280,14 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title, album str
 		for _, t := range results {
 			qTitle := strings.ToLower(title)
 			tTitle := strings.ToLower(t.Title)
-			
+
 			// Exact match
 			if qTitle == tTitle {
 				return t.ID
 			}
-			
+
 			// Check title similarity
-			titleSim := similarity(qTitle, tTitle)
+			titleSim := matchutil.Similarity(qTitle, tTitle)
 			if titleSim > bestTitleMatch && titleSim >= 0.7 { // Require 70% title match
 				bestTitleMatch = titleSim
 				bestTitleTrack = t.ID
@@ -309,163 +310,6 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title, album str
 	}
 
 	return 0
-}
-
-// matchScore calculates similarity between search query and result
-// Returns 0.0-1.0 where 1.0 is perfect match
-func matchScore(queryArtist, queryTitle string, track tidalproxy.TidalTrack) float64 {
-	return matchScoreWithAlbum(queryArtist, queryTitle, "", track)
-}
-
-// matchScoreWithAlbum includes album name in matching for better precision
-func matchScoreWithAlbum(queryArtist, queryTitle, queryAlbum string, track tidalproxy.TidalTrack) float64 {
-	// Normalize strings for comparison
-	normalize := func(s string) string {
-		s = strings.ToLower(s)
-		// Remove common suffixes/prefixes that might differ
-		s = strings.ReplaceAll(s, " (feat.", " ")
-		s = strings.ReplaceAll(s, " (ft.", " ")
-		s = strings.ReplaceAll(s, " (featuring", " ")
-		s = strings.ReplaceAll(s, " - ", " ")
-		s = strings.ReplaceAll(s, "  ", " ")
-		return strings.TrimSpace(s)
-	}
-
-	qArtist := normalize(queryArtist)
-	qTitle := normalize(queryTitle)
-	tArtist := normalize(track.Artist.Name)
-	tTitle := normalize(track.Title)
-
-	// Check all artists if available
-	artistMatch := similarity(qArtist, tArtist)
-	for _, a := range track.Artists {
-		s := similarity(qArtist, normalize(a.Name))
-		if s > artistMatch {
-			artistMatch = s
-		}
-	}
-
-	titleMatch := similarity(qTitle, tTitle)
-
-	// Check album match if provided (strong signal for correct track)
-	albumMatch := 0.0
-	if queryAlbum != "" {
-		qAlbum := normalize(queryAlbum)
-		tAlbum := normalize(track.Album.Title)
-		albumMatch = similarity(qAlbum, tAlbum)
-		// Bonus for album match
-		if albumMatch > 0.8 {
-			// If album matches well, boost the score significantly
-			titleMatch = maxFloat(titleMatch, 0.9)
-		}
-	}
-
-	// Bonus for exact or near-exact title match (prevents wrong track from same album)
-	if qTitle == tTitle || strings.EqualFold(qTitle, tTitle) {
-		titleMatch = 1.0 // Perfect title match
-	}
-
-	// If artist matches well but title is poor, reduce score significantly
-	// This prevents picking wrong track from same album
-	if artistMatch > 0.7 && titleMatch < 0.5 {
-		// Penalize - likely wrong track from same album
-		return artistMatch * 0.3 // Very low score
-	}
-
-	// PRIORITY: If title matches perfectly (100%), be lenient with artist
-	// This handles cases where artist name format differs (e.g., "豊平区民Toyohirakumin" vs "豊平区民")
-	if titleMatch >= 0.99 {
-		// Perfect title match - artist just needs to be somewhat related
-		// Or album needs to match
-		if artistMatch >= 0.2 || strings.Contains(qArtist, tArtist) || strings.Contains(tArtist, qArtist) {
-			return 0.9 + (artistMatch * 0.1) // 90-100% score
-		}
-		// If album matches well, also accept
-		if albumMatch > 0.7 {
-			return 0.85 // Good score for perfect title + matching album
-		}
-		// Even with poor artist match, if title is perfect, accept it
-		return 0.75 // 75% score for perfect title, unknown artist
-	}
-
-	// Weight: artist 25%, title 65%, album 10% (if provided)
-	score := (artistMatch*0.25 + titleMatch*0.65)
-	if queryAlbum != "" {
-		score = score*0.9 + albumMatch*0.1 // 10% weight to album
-	}
-	return score
-}
-
-func maxFloat(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// similarity calculates string similarity
-// Returns 0.0-1.0 where 1.0 is identical
-func similarity(a, b string) float64 {
-	if a == "" || b == "" {
-		return 0.0
-	}
-	if a == b {
-		return 1.0
-	}
-
-	// Case-insensitive comparison (handles Unicode better than ToLower for some chars)
-	if strings.EqualFold(a, b) {
-		return 0.98 // Almost perfect
-	}
-
-	// Check for substring match (strong signal)
-	if strings.Contains(a, b) || strings.Contains(b, a) {
-		longer := float64(max(len([]rune(a)), len([]rune(b))))
-		shorter := float64(min(len([]rune(a)), len([]rune(b))))
-		return 0.75 + (0.25 * shorter / longer) // 0.75-1.0 based on length ratio
-	}
-
-	// Contains word match (check if any word from a is in b)
-	aWords := strings.Fields(a)
-	bWords := strings.Fields(b)
-	if len(aWords) == 0 || len(bWords) == 0 {
-		return 0.0
-	}
-
-	// Count matching words (case-insensitive)
-	matches := 0
-	for _, aw := range aWords {
-		awLower := strings.ToLower(aw)
-		for _, bw := range bWords {
-			bwLower := strings.ToLower(bw)
-			// Exact match
-			if awLower == bwLower {
-				matches++
-				break
-			}
-			// One contains the other (for partial matches)
-			if strings.Contains(awLower, bwLower) || strings.Contains(bwLower, awLower) {
-				matches++
-				break
-			}
-		}
-	}
-
-	return float64(matches) / float64(max(len(aWords), len(bWords)))
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // trackResult represents the result of processing a single track
@@ -575,8 +419,8 @@ func (jm *JobManager) updatePlaylistError(playlistID int, message string) {
 	jm.db.Model(&db.Playlist{}).
 		Where("id = ?", playlistID).
 		Updates(map[string]interface{}{
-			"name":    "Import Failed",
-			"comment": message,
+			"name":       "Import Failed",
+			"comment":    message,
 			"updated_at": time.Now(),
 		})
 }

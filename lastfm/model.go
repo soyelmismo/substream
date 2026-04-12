@@ -128,10 +128,28 @@ type (
 	}
 
 	SimilarTracks struct {
-		XMLName xml.Name `xml:"similartracks"`
-		Artist  string   `xml:"artist,attr"`
-		Track   string   `xml:"track,attr"`
-		Tracks  []Track  `xml:"track"`
+		XMLName xml.Name       `xml:"similartracks"`
+		Artist  string         `xml:"artist,attr"`
+		Track   string         `xml:"track,attr"`
+		Tracks  []SimilarTrack `xml:"track"`
+	}
+
+	// SimilarTrack is used in track.getSimilar response
+	SimilarTrack struct {
+		Name       string  `xml:"name"`
+		MBID       string  `xml:"mbid"`
+		Match      float64 `xml:"match"`
+		URL        string  `xml:"url"`
+		Streamable struct {
+			Text      string `xml:",chardata"`
+			Fulltrack string `xml:"fulltrack,attr"`
+		} `xml:"streamable"`
+		Artist struct {
+			Name string `xml:"name"`
+			MBID string `xml:"mbid"`
+			URL  string `xml:"url"`
+		} `xml:"artist"`
+		Image []Image `xml:"image"`
 	}
 
 	SimilarArtists struct {
