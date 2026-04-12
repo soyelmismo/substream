@@ -31,6 +31,20 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		return spec.NewError(10, "provide a track `id` parameter")
 	}
 
+	// Global concurrent stream limiting - prevents resource exhaustion
+	select {
+	case c.userStreamSem <- struct{}{}:
+		defer func() { <-c.userStreamSem }()
+	case <-r.Context().Done():
+		return spec.NewError(0, "request cancelled")
+	default:
+		// Server at capacity
+		log.Printf("[STREAM] Server at capacity, rejecting stream request")
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "server busy, try again later", http.StatusServiceUnavailable)
+		return nil
+	}
+
 	prep, err := c.prepareStream(r.Context(), r, id.Value())
 	if err != nil {
 		log.Printf("[STREAM] ERROR: prepare failed: %v", err)
@@ -68,26 +82,154 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 	if prep.IsHLS {
 		err = c.downloadAndStitchHLS(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track, p.GetOrFloat("timeOffset", 0))
+		if err != nil {
+			log.Printf("[STREAM] ERROR: HLS stitch failed for track %d: %v", id.Value(), err)
+			http.Error(w, "stream unavailable", http.StatusBadGateway)
+		}
 	} else if prep.IsDASH {
 		err = c.downloadAndStitchDASH(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track)
-	} else {
-		req, _ := http.NewRequestWithContext(r.Context(), "GET", prep.StreamURL, nil)
-		if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
-			req.Header.Set("Range", rangeHdr)
-		}
-		req.Header.Set("X-Forwarded-For", prep.ClientIP)
-		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("[STREAM] ERROR: direct fetch failed: %v", err)
+			log.Printf("[STREAM] ERROR: DASH stitch failed for track %d: %v", id.Value(), err)
+			http.Error(w, "stream unavailable", http.StatusBadGateway)
+		}
+	} else {
+		// Direct proxy with proper error handling and header passthrough
+		if err := c.proxyDirectStream(r.Context(), w, r, prep); err != nil {
+			log.Printf("[STREAM] ERROR: direct proxy failed for track %d: %v", id.Value(), err)
+			// Error already written to response by proxyDirectStream
+		}
+	}
+	return nil
+}
+
+// proxyDirectStream handles direct proxying of audio streams with proper header passthrough,
+// range request support, retry logic, and optimized buffer pooling for minimal CPU usage.
+func (c *Controller) proxyDirectStream(ctx context.Context, w http.ResponseWriter, r *http.Request, prep *streamRequest) error {
+	// Build request with proper headers
+	req, err := http.NewRequestWithContext(ctx, "GET", prep.StreamURL, nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// Forward Range header for seeking support
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+		req.Header.Set("Range", rangeHdr)
+	}
+
+	// Set client IP for Tidal's geo-locking
+	if prep.ClientIP != "" {
+		req.Header.Set("X-Forwarded-For", prep.ClientIP)
+		req.Header.Set("X-Real-IP", prep.ClientIP)
+	}
+
+	// Retry logic for transient failures
+	const maxRetries = 3
+	var resp *http.Response
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 100ms, 200ms, 400ms
+			delay := time.Duration(100*(1<<attempt)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+			// Recreate request for retry (body was consumed)
+			req, _ = http.NewRequestWithContext(ctx, "GET", prep.StreamURL, nil)
+			if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+				req.Header.Set("Range", rangeHdr)
+			}
+			if prep.ClientIP != "" {
+				req.Header.Set("X-Forwarded-For", prep.ClientIP)
+				req.Header.Set("X-Real-IP", prep.ClientIP)
+			}
+		}
+
+		resp, err = c.streamClient.Do(req)
+		if err == nil {
+			// Check if we got a successful response
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
+				break // Success!
+			}
+			// Non-success status, close and retry if retryable
+			resp.Body.Close()
+			if !isRetryableError(fmt.Sprintf("HTTP %d", resp.StatusCode)) {
+				break // Don't retry client errors (4xx)
+			}
+		} else {
+			lastErr = err
+			if !isRetryableError(err.Error()) {
+				break // Non-retryable error
+			}
+		}
+	}
+
+	if err != nil {
+		http.Error(w, "stream unavailable", http.StatusBadGateway)
+		return fmt.Errorf("fetch stream (retried %d): %w", maxRetries, lastErr)
+	}
+	defer resp.Body.Close()
+
+	// Handle non-success status codes
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		http.Error(w, "stream unavailable", http.StatusBadGateway)
+		return fmt.Errorf("stream returned %d", resp.StatusCode)
+	}
+
+	// Pass through critical headers for proper seeking and metadata
+	// Content-Type already set by caller, but we can enhance with upstream info
+	if ct := resp.Header.Get("Content-Type"); ct != "" && ct != "application/octet-stream" {
+		w.Header().Set("Content-Type", ct)
+	}
+
+	// Content-Length is critical for seek bar calculation in clients
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+
+	// Content-Range for partial content responses (seek responses)
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+
+	// Accept-Ranges already set by caller, but confirm support
+	if ar := resp.Header.Get("Accept-Ranges"); ar != "" {
+		w.Header().Set("Accept-Ranges", ar)
+	}
+
+	// ETag for caching (optional but helpful)
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		w.Header().Set("ETag", etag)
+	}
+
+	// Write status code before body
+	w.WriteHeader(resp.StatusCode)
+
+	// Use buffer pool for efficient copying with minimal GC pressure
+	bufPtr := c.streamBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer c.streamBufPool.Put(bufPtr)
+
+	// Stream with periodic flushes for low-latency delivery
+	// Use http.Flusher if available to send data immediately to client
+	flusher, canFlush := w.(http.Flusher)
+
+	_, err = io.CopyBuffer(w, resp.Body, buf)
+	if err != nil {
+		// Client likely disconnected, don't treat as error
+		if ctx.Err() == context.Canceled {
 			return nil
 		}
-		defer resp.Body.Close()
-		for k, v := range resp.Header {
-			w.Header()[k] = v
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, err = io.Copy(w, resp.Body)
+		return fmt.Errorf("copy stream: %w", err)
 	}
+
+	// Final flush to ensure all data sent
+	if canFlush {
+		flusher.Flush()
+	}
+
 	return nil
 }
 

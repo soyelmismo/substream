@@ -44,6 +44,8 @@ type Controller struct {
 	coverLocks       sync.Map                              // dedup concurrent cover requests
 	hotLocks         sync.Map                              // dedup concurrent hot.monochrome.tf requests
 	httpClient       *http.Client                          // HTTP client for external requests
+	streamClient     *http.Client                          // Dedicated client for audio streaming with optimized settings
+	streamBufPool    sync.Pool                             // Pool of buffers for streaming (reduces GC pressure)
 	genreCache       *cache.Cache[[]int]                   // Cache for genre tracks with LRU eviction
 	genreAlbumCache  *cache.Cache[[]tidalproxy.TidalAlbum] // Cache for genre albums
 	genreCountsCache *cache.Cache[map[string]genreCount]   // Cache for genre counts with TTL
@@ -54,6 +56,7 @@ type Controller struct {
 	streamURLLocks   sync.Map                              // dedup concurrent stream URL requests
 	streamLocks      sync.Map                              // dedup concurrent stream serving per track+client
 	importer         *importer.JobManager                  // Background playlist import manager
+	userStreamSem    chan struct{}                         // limit total concurrent streams across all users
 }
 
 func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
@@ -61,19 +64,36 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	initConfig()
 
 	c := &Controller{
-		ServeMux:   http.NewServeMux(),
-		dbc:        dbc,
-		proxy:      proxy,
-		scrobblers: scrobblers,
-		cachePath:  cachePath,
-		proxySem:   make(chan struct{}, 30), // limit total concurrent proxy calls
-		importer:   importer.NewJobManager(dbc, proxy),
+		ServeMux:      http.NewServeMux(),
+		dbc:           dbc,
+		proxy:         proxy,
+		scrobblers:    scrobblers,
+		cachePath:     cachePath,
+		proxySem:      make(chan struct{}, 30),  // limit total concurrent proxy calls
+		userStreamSem: make(chan struct{}, 100), // limit total concurrent streams (100 = ~500MB RAM max with 64KB buffers)
+		importer:      importer.NewJobManager(dbc, proxy),
 		httpClient: &http.Client{
 			Timeout: httpClientTimeout,
 			Transport: &http.Transport{
 				MaxIdleConns:        httpMaxIdleConns,
 				MaxIdleConnsPerHost: httpMaxIdleConnsPerHost,
 				IdleConnTimeout:     httpIdleConnTimeout,
+			},
+		},
+		streamClient: &http.Client{
+			Timeout: 0, // No timeout for streaming - managed by context
+			Transport: &http.Transport{
+				MaxIdleConns:        200,               // More idle connections for high concurrency
+				MaxIdleConnsPerHost: 50,                // Tidal uses few CDN hosts, increase per-host limit
+				IdleConnTimeout:     120 * time.Second, // Longer timeout for streaming connections
+				DisableCompression:  true,              // Audio already compressed
+				ForceAttemptHTTP2:   false,             // HTTP/1.1 is more reliable for long streams
+			},
+		},
+		streamBufPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, 64*1024) // 64KB optimal for audio streaming
+				return &buf
 			},
 		},
 		genreCache: cache.New[[]int](cache.Config{

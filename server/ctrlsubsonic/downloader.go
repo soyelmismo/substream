@@ -35,7 +35,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		req.Header.Set("X-Forwarded-For", clientIP)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.streamClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -49,6 +49,11 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	var segments []segmentInfo
 	var variantURL string
 	scanner := bufio.NewScanner(resp.Body)
+	// Increase scanner buffer to handle large manifests (default 64KB may be too small)
+	const maxCapacity = 512 * 1024 // 512KB
+	buf := make([]byte, maxCapacity)
+	scanner.Buffer(buf, maxCapacity)
+
 	baseURL := manifestURL
 	if lastSlash := strings.LastIndex(baseURL, "/"); lastSlash != -1 {
 		baseURL = baseURL[:lastSlash+1]
@@ -98,6 +103,11 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		currentDuration = 0
 	}
 
+	// Check for scanner errors (buffer overflow, etc.)
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("manifest parse error: %w", err)
+	}
+
 	if isMaster && variantURL != "" {
 		log.Printf("[DOWNLOAD] HLS Master detected, following variant: %s", variantURL)
 		return c.downloadAndStitchHLS(ctx, variantURL, w, clientIP, track, offsetSeconds)
@@ -115,7 +125,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			elapsed += seg.duration
 		}
 		if startIdx > 0 {
-			log.Printf("[DOWNLOAD] Time-based seek: offset=%.2fs, skipping %d/%d segments (%.2fs elapsed)", 
+			log.Printf("[DOWNLOAD] Time-based seek: offset=%.2fs, skipping %d/%d segments (%.2fs elapsed)",
 				offsetSeconds, startIdx, len(segments), elapsed)
 		}
 	}
@@ -129,18 +139,13 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	}
 
 	// 3. Download and stream segments concurrently with progressive streaming
-	// Start sending data to client as soon as first segment is ready
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  true,
-		},
-	}
+	// Use the shared streaming client for connection reuse and optimal pooling
+	client := c.streamClient
 
 	const maxConcurrency = 6 // Limit concurrent downloads
+
+	// Get flusher for low-latency streaming if writer supports it
+	flusher, canFlush := w.(http.Flusher)
 	tagger := &flacTagger{w: w, track: track}
 
 	// Download and stream segments in order with look-ahead buffering
@@ -160,8 +165,17 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		go func(workerID int) {
 			defer wg.Done()
 			for idx := workerID; idx < len(segments); idx += maxConcurrency {
-				data, err := downloadSegment(ctx, client, segments[idx].url, clientIP)
-				results <- segmentResult{idx, data, err}
+				// Per-segment timeout to prevent hanging on slow CDN
+				segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+				data, err := downloadSegment(segmentCtx, client, segments[idx].url, clientIP)
+				cancel()
+
+				// Use select to prevent goroutine leak if context cancelled
+				select {
+				case results <- segmentResult{idx, data, err}:
+				case <-ctx.Done():
+					return // Context cancelled, exit worker
+				}
 			}
 		}(i)
 	}
@@ -176,26 +190,34 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	resultMap := make(map[int][]byte)
 	nextToWrite := startIdx
 	writtenInit := false
+	initSegmentData := []byte(nil)
 
 	for result := range results {
 		if result.err != nil {
 			return fmt.Errorf("segment %d failed: %w", result.index, result.err)
 		}
 
+		// Capture init segment (index 0, duration 0) immediately when it arrives
+		if result.index == 0 && len(segments) > 0 && segments[0].duration == 0 {
+			initSegmentData = result.data
+			continue // Don't store in resultMap, we'll write it at the right time
+		}
+
 		resultMap[result.index] = result.data
+
+		// Write init segment first if we have it and haven't written it yet
+		if initSegmentData != nil && !writtenInit {
+			if _, err := w.Write(initSegmentData); err != nil {
+				return err
+			}
+			writtenInit = true
+			initSegmentData = nil
+		}
 
 		// Write all consecutive segments that are ready
 		for {
 			if data, ok := resultMap[nextToWrite]; ok {
-				// For time-based seeking, skip writing init segment (index 0) if we start later
-				// UNLESS it's the init segment for fMP4 which is always needed
-				if nextToWrite == 0 && segments[0].duration == 0 {
-					// This is an init segment (fMP4), always write it
-					if _, err := w.Write(data); err != nil {
-						return err
-					}
-					writtenInit = true
-				} else if nextToWrite == startIdx && track != nil && !writtenInit {
+				if nextToWrite == startIdx && track != nil {
 					// First media segment, try tagging if FLAC
 					if err := tagger.process(bytes.NewReader(data), c); err != nil {
 						log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)
@@ -210,6 +232,10 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 				}
 				delete(resultMap, nextToWrite)
 				nextToWrite++
+				// Flush after each segment for low-latency delivery
+				if canFlush {
+					flusher.Flush()
+				}
 			} else {
 				break
 			}
@@ -224,7 +250,55 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	return nil
 }
 
+// downloadSegment fetches a single segment with retry logic for transient failures
 func downloadSegment(ctx context.Context, client *http.Client, url, clientIP string) ([]byte, error) {
+	const maxRetries = 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 100ms, 200ms, 400ms
+			delay := time.Duration(100*(1<<attempt)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		data, err := downloadSegmentOnce(ctx, client, url, clientIP)
+		if err == nil {
+			return data, nil
+		}
+
+		lastErr = err
+		// Only retry on transient errors (network, 5xx, timeout)
+		errStr := err.Error()
+		if !isRetryableError(errStr) {
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// isRetryableError returns true for transient errors that are worth retrying
+func isRetryableError(errStr string) bool {
+	lower := strings.ToLower(errStr)
+	retryable := []string{
+		"timeout", "deadline exceeded", "connection refused",
+		"connection reset", "no such host", "temporary",
+		"502", "503", "504", "429",
+	}
+	for _, pattern := range retryable {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadSegmentOnce(ctx context.Context, client *http.Client, url, clientIP string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -264,7 +338,7 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 		req.Header.Set("X-Forwarded-For", clientIP)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.streamClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -294,37 +368,98 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 		return fmt.Errorf("no segments found in DASH")
 	}
 
+	log.Printf("[DOWNLOAD] DASH: %d segments found, starting parallel download", len(segments))
+
+	// Parallel download with worker pool (same pattern as HLS)
+	const maxConcurrency = 6
+
+	// Get flusher for low-latency streaming if writer supports it
+	flusher, canFlush := w.(http.Flusher)
+
 	tagger := &flacTagger{w: w, track: track}
-	for i, segmentURL := range segments {
-		if ctx.Err() != nil {
-			return ctx.Err()
+
+	type segmentResult struct {
+		index int
+		data  []byte
+		err   error
+	}
+
+	results := make(chan segmentResult, maxConcurrency*2)
+	var wg sync.WaitGroup
+
+	// Start worker pool
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for idx := workerID; idx < len(segments); idx += maxConcurrency {
+				// Per-segment timeout
+				segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+				data, err := downloadSegment(segmentCtx, c.streamClient, segments[idx], clientIP)
+				cancel()
+
+				// Prevent goroutine leak on context cancellation
+				select {
+				case results <- segmentResult{idx, data, err}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Close results channel when all workers done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect and write segments in order
+	resultMap := make(map[int][]byte)
+	nextToWrite := 0
+
+	for result := range results {
+		if result.err != nil {
+			// Fail fast like HLS - don't create corrupted audio files
+			return fmt.Errorf("DASH segment %d failed: %w", result.index, result.err)
 		}
-		sReq, _ := http.NewRequestWithContext(ctx, "GET", segmentURL, nil)
-		sReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-		if clientIP != "" {
-			sReq.Header.Set("X-Forwarded-For", clientIP)
-		}
-		sResp, err := http.DefaultClient.Do(sReq)
-		if err == nil {
-			if i == 0 {
-				if err := tagger.process(sResp.Body, c); err != nil {
-					_, err = io.Copy(w, sResp.Body)
-					if err != nil {
-						sResp.Body.Close()
+
+		resultMap[result.index] = result.data
+
+		// Write all consecutive segments that are ready
+		for {
+			if data, ok := resultMap[nextToWrite]; ok {
+				if nextToWrite == 0 {
+					// First segment: try tagging if it's FLAC
+					if err := tagger.process(bytes.NewReader(data), c); err != nil {
+						log.Printf("[DOWNLOAD] DASH tagging failed, writing raw: %v", err)
+						if _, err := w.Write(data); err != nil {
+							return err
+						}
+					}
+				} else {
+					if _, err := w.Write(data); err != nil {
 						return err
 					}
 				}
-			} else {
-				_, err := io.Copy(w, sResp.Body)
-				if err != nil {
-					sResp.Body.Close()
-					return err
+				delete(resultMap, nextToWrite)
+				nextToWrite++
+				// Flush after each segment for low-latency delivery
+				if canFlush {
+					flusher.Flush()
 				}
+			} else {
+				break
 			}
-			sResp.Body.Close()
+		}
+
+		// Safety check
+		if nextToWrite >= len(segments) {
+			break
 		}
 	}
 
+	log.Printf("[DOWNLOAD] DASH: completed %d/%d segments", nextToWrite, len(segments))
 	return nil
 }
 
@@ -478,8 +613,22 @@ func (t *flacTagger) makePictureBlock(c *Controller) []byte {
 	}
 
 	coverURL := c.proxy.GetCoverURL(coverUUID, 640)
-	resp, err := http.Get(coverURL)
+
+	// Use controller's HTTP client with proper timeout instead of default http.Get
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", coverURL, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return nil
 	}
 	defer resp.Body.Close()
