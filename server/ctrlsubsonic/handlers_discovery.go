@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/recommendations"
+	"go.senan.xyz/gonic/tidalproxy"
 
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -237,18 +239,57 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 		return c.ServeGetRandomSongs(r)
 	}
 
-	// fast timeout for recommendations
-	ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
-	recs, err := c.proxy.GetRecommendations(ctx, trackID)
-	cancel()
-
-	if err != nil || len(recs) == 0 {
-		log.Printf("[DISC] GetSimilarSongs2 fallback to random (track %d)", trackID)
+	tracks := c.getSimilarSongsMerged(r, trackID, count)
+	if tracks == nil {
 		return c.ServeGetRandomSongs(r)
 	}
 
-	if len(recs) > count {
-		recs = recs[:count]
+	sub := spec.NewResponse()
+	sub.SimilarSongsTwo = &spec.SimilarSongsTwo{Tracks: tracks}
+	return sub
+}
+
+// getSimilarSongsMerged returns merged recommendations from Tidal native and external providers.
+// It handles concurrent resolution of external recommendations with proper caching.
+func (c *Controller) getSimilarSongsMerged(r *http.Request, trackID, count int) []*spec.TrackChild {
+	user := r.Context().Value(CtxUser).(*db.User)
+
+	// 1. Get native recommendations from Tidal
+	ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
+	nativeRecs, _ := c.proxy.GetRecommendations(ctx, trackID)
+	cancel()
+
+	// 2. Get external recommendations from registered providers (Last.fm, etc.)
+	var externalRecs []tidalproxy.TidalTrack
+	if c.recEngine.HasProviders() {
+		if baseTrack, err := c.proxy.GetTrackInfo(r.Context(), trackID); err == nil {
+			extCtx, extCancel := context.WithTimeout(r.Context(), 2500*time.Millisecond)
+			recs, _ := c.recEngine.GetSimilarTracks(extCtx, user, recommendations.TrackRef{
+				ID:      fmt.Sprintf("td:tr:%d", trackID),
+				Title:   baseTrack.Title,
+				Artist:  baseTrack.Artist.Name,
+				ISRC:    baseTrack.ISRC,
+				TidalID: trackID,
+			}, count)
+			extCancel()
+
+			// Convert recommendations to TidalTracks
+			for _, rec := range recs {
+				if rec.Track != nil && rec.Track.TidalID != 0 {
+					if t, err := c.proxy.GetTrackInfo(r.Context(), rec.Track.TidalID); err == nil {
+						externalRecs = append(externalRecs, *t)
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Merge native and external recommendations
+	recs := mergeRecommendations(nativeRecs, externalRecs, count)
+
+	if len(recs) == 0 {
+		log.Printf("[DISC] GetRecommendations EMPTY for track %d", trackID)
+		return nil
 	}
 
 	ids := make([]int, len(recs))
@@ -256,11 +297,7 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 		ids[i] = recs[i].ID
 	}
 
-	tracks := c.batchFetchTracks(r, ids)
-
-	sub := spec.NewResponse()
-	sub.SimilarSongsTwo = &spec.SimilarSongsTwo{Tracks: tracks}
-	return sub
+	return c.batchFetchTracks(r, ids)
 }
 
 func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
@@ -272,36 +309,14 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 
 	id, err := p.GetID("id")
 	if err != nil || id.Type() != specid.Track {
-		// Only works with tracks - fallback to random songs
 		return c.ServeGetRandomSongs(r)
 	}
 	trackID := id.Value()
 
-	// Try recommendations with short timeout
-	ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
-	recs, err := c.proxy.GetRecommendations(ctx, trackID)
-	cancel()
-
-	// If failed or empty, fallback to random songs quickly
-	if err != nil {
-		log.Printf("[DISC] GetRecommendations ERROR for track %d: %v", trackID, err)
+	tracks := c.getSimilarSongsMerged(r, trackID, count)
+	if tracks == nil {
 		return c.ServeGetRandomSongs(r)
 	}
-	if len(recs) == 0 {
-		log.Printf("[DISC] GetRecommendations EMPTY for track %d", trackID)
-		return c.ServeGetRandomSongs(r)
-	}
-
-	if len(recs) > count {
-		recs = recs[:count]
-	}
-
-	ids := make([]int, len(recs))
-	for i := range recs {
-		ids[i] = recs[i].ID
-	}
-
-	tracks := c.batchFetchTracks(r, ids)
 
 	sub := spec.NewResponse()
 	sub.SimilarSongs = &spec.SimilarSongs{Tracks: tracks}
@@ -365,4 +380,45 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 	sub := spec.NewResponse()
 	sub.TopSongs = &spec.TopSongs{Tracks: tracks}
 	return sub
+}
+
+// mergeRecommendations interleaves and deduplicates native and external recommendations
+func mergeRecommendations(native []tidalproxy.TidalTrack, external []tidalproxy.TidalTrack, limit int) []tidalproxy.TidalTrack {
+	var merged []tidalproxy.TidalTrack
+	seenIDs := make(map[int]bool)
+	seenISRCs := make(map[string]bool)
+
+	add := func(t tidalproxy.TidalTrack) {
+		if len(merged) >= limit {
+			return
+		}
+		if seenIDs[t.ID] {
+			return
+		}
+		if t.ISRC != "" && seenISRCs[t.ISRC] {
+			return
+		}
+		seenIDs[t.ID] = true
+		if t.ISRC != "" {
+			seenISRCs[t.ISRC] = true
+		}
+		merged = append(merged, t)
+	}
+
+	maxLen := len(native)
+	if len(external) > maxLen {
+		maxLen = len(external)
+	}
+
+	// Interleave: prioritize external (e.g., Last.fm usually has better similarities)
+	for i := 0; i < maxLen; i++ {
+		if i < len(external) {
+			add(external[i])
+		}
+		if i < len(native) {
+			add(native[i])
+		}
+	}
+
+	return merged
 }

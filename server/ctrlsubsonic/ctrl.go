@@ -21,6 +21,9 @@ import (
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/internal/cache"
 	"go.senan.xyz/gonic/internal/importer"
+	lfmclient "go.senan.xyz/gonic/lastfm"
+	lastfmprovider "go.senan.xyz/gonic/providers/lastfm"
+	"go.senan.xyz/gonic/recommendations"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -62,6 +65,7 @@ type Controller struct {
 	importer         *importer.JobManager                  // Background playlist import manager
 	userStreamSem    chan struct{}                         // limit total concurrent streams across all users
 	userStreamLimits sync.Map                              // per-user stream limiting (userID -> chan struct{})
+	recEngine        *recommendations.Engine               // Recommendation engine for external providers
 
 	// User preferences cache (L3) - warms on activity to eliminate repeated SQLite queries
 	userPrefsCache *cache.Cache[*userPreferences] // userID -> cached preferences
@@ -166,6 +170,18 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 			DefaultTTL:      10 * time.Minute, // Warm for 10 min of inactivity
 			CleanupInterval: 5 * time.Minute,
 		}),
+	}
+
+	// Initialize recommendation engine and register external providers
+	c.recEngine = recommendations.NewEngine(dbc)
+
+	// Register Last.fm provider if a lastfm client is available in scrobblers
+	for _, s := range scrobblers {
+		if lfmClient, ok := s.(*lfmclient.Client); ok {
+			c.recEngine.Register(lastfmprovider.New(lfmClient, proxy))
+			log.Println("[CTRL] Last.fm recommendation provider registered")
+			break
+		}
 	}
 
 	chain := handlerutil.Chain(
