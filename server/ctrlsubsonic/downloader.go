@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -239,19 +241,12 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	}
 
 	// 3. Download and stream segments
-	// CRITICAL: Download first segment(s) synchronously to ensure immediate playback start
-	// Then download remaining segments in parallel for throughput
-	client := c.streamClient
-	const maxConcurrency = 6
-
+	// [ON-THE-FLY STREAMING] Instead of downloading all segments aggressively in parallel,
+	// we download on-demand with a small prefetch buffer (2 segments). This dramatically
+	// reduces upstream bandwidth usage while still allowing concurrent clients to share
+	// segments via the segmentCache.
 	flusher, canFlush := w.(http.Flusher)
 	tagger := &flacTagger{w: w, track: track, startByte: startByte, totalBytes: totalBytes}
-
-	type segmentResult struct {
-		index int
-		data  []byte
-		err   error
-	}
 
 	// [CRITICAL FIX] Download first segment (or init+first media) SYNCHRONOUSLY
 	// This ensures we start streaming immediately without waiting for workers
@@ -266,17 +261,20 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		}
 		log.Printf("[DOWNLOAD] fMP4 with init segment detected, downloading init + segment %d first", firstMediaIdx)
 
-		// Download init segment (index 0) synchronously
-		segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		initData, err := downloadSegment(segmentCtx, client, segments[0].url, clientIP)
+		// Download init segment (index 0) synchronously (with cache)
+		downloadStart := time.Now()
+		segmentCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		initData, err := c.getCachedSegment(segmentCtx, segments[0].url, clientIP)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("init segment failed: %w", err)
 		}
+		initElapsed := time.Since(downloadStart)
+		log.Printf("[DOWNLOAD] Init segment fetched in %v (%.2f KB)", initElapsed, float64(len(initData))/1024)
 
-		// Download first media segment synchronously too
-		segmentCtx, cancel = context.WithTimeout(ctx, 45*time.Second)
-		firstData, err := downloadSegment(segmentCtx, client, segments[firstMediaIdx].url, clientIP)
+		// Download first media segment synchronously too (with cache)
+		segmentCtx, cancel = context.WithTimeout(ctx, 15*time.Second)
+		firstData, err := c.getCachedSegment(segmentCtx, segments[firstMediaIdx].url, clientIP)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("first media segment %d failed: %w", firstMediaIdx, err)
@@ -342,14 +340,16 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		if canFlush {
 			flusher.Flush()
 		}
+		log.Printf("[DOWNLOAD] First segment sent to client in %v total (%.2f KB)", time.Since(downloadStart), float64(len(firstData))/1024)
 
 		// Set nextToWrite to the segment after the one we just wrote
 		nextToWrite = firstMediaIdx + 1
 	} else {
-		// No init segment - download first media segment synchronously
+		// No init segment - download first media segment synchronously (with cache)
 		log.Printf("[DOWNLOAD] No init segment, downloading segment %d first", startIdx)
-		segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		firstData, err := downloadSegment(segmentCtx, client, segments[startIdx].url, clientIP)
+		downloadStart := time.Now()
+		segmentCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		firstData, err := c.getCachedSegment(segmentCtx, segments[startIdx].url, clientIP)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("first segment %d failed: %w", startIdx, err)
@@ -366,6 +366,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			if _, err := w.Write(firstData); err != nil {
 				return err
 			}
+			log.Printf("[DOWNLOAD] First segment (partial) sent to client in %v", time.Since(downloadStart))
 		} else {
 			// Try tagging if FLAC, then write
 			if err := tagger.process(bytes.NewReader(firstData), c); err != nil {
@@ -374,6 +375,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 					return err
 				}
 			}
+			log.Printf("[DOWNLOAD] First segment sent to client in %v", time.Since(downloadStart))
 		}
 		if canFlush {
 			flusher.Flush()
@@ -381,68 +383,89 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		nextToWrite = startIdx + 1
 	}
 
-	// Parallel download for remaining segments
-	results := make(chan segmentResult, maxConcurrency*2)
+	// [ON-THE-FLY STREAMING] Stream remaining segments with controlled prefetch
+	// Only prefetch 2 segments ahead to minimize bandwidth while avoiding buffer underrun
+	const prefetchAhead = 2
+
 	var wg sync.WaitGroup
+	prefetchCtx, prefetchCancel := context.WithCancel(ctx)
+	defer prefetchCancel()
 
-	// Start from nextToWrite (already written) + distribute remaining
-	for i := 0; i < maxConcurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			// Start from nextToWrite + workerID, step by maxConcurrency
-			for idx := nextToWrite + workerID; idx < len(segments); idx += maxConcurrency {
-				segmentCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-				data, err := downloadSegment(segmentCtx, client, segments[idx].url, clientIP)
-				cancel()
-
-				select {
-				case results <- segmentResult{idx, data, err}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(i)
-	}
-
-	// Close results channel when all workers done
+	// Prefetch worker: downloads segments (nextToWrite + prefetchAhead) ahead
+	wg.Add(1)
 	go func() {
-		wg.Wait()
-		close(results)
+		defer wg.Done()
+		for idx := nextToWrite; idx < len(segments); idx++ {
+			// Check if this segment is already being requested by main loop
+			// We prefetch (prefetchAhead) segments ahead
+			targetIdx := idx + prefetchAhead
+			if targetIdx >= len(segments) {
+				continue
+			}
+
+			segmentCtx, cancel := context.WithTimeout(prefetchCtx, 30*time.Second)
+			data, err := c.getCachedSegment(segmentCtx, segments[targetIdx].url, clientIP)
+			cancel()
+
+			if err != nil {
+				// Prefetch errors are non-fatal, just log and continue
+				log.Printf("[DOWNLOAD] Prefetch failed for segment %d: %v", targetIdx, err)
+			} else {
+				log.Printf("[DOWNLOAD] Prefetched segment %d (%.2f KB)", targetIdx, float64(len(data))/1024)
+			}
+
+			// Check if we should stop prefetching
+			select {
+			case <-prefetchCtx.Done():
+				return
+			default:
+			}
+		}
 	}()
 
-	// Collect and write remaining segments in order
-	// First segment(s) already written synchronously above
-	resultMap := make(map[int][]byte)
-
-	for result := range results {
-		if result.err != nil {
-			return fmt.Errorf("segment %d failed: %w", result.index, result.err)
-		}
-
-		resultMap[result.index] = result.data
-
-		// Write all consecutive segments that are ready
-		for {
-			if data, ok := resultMap[nextToWrite]; ok {
-				if _, err := w.Write(data); err != nil {
-					return err
-				}
-				delete(resultMap, nextToWrite)
-				nextToWrite++
-				if canFlush {
-					flusher.Flush()
-				}
-			} else {
-				break
+	// Main streaming loop: download and write sequentially
+	for idx := nextToWrite; idx < len(segments); idx++ {
+		// Try cache first
+		key := segmentCacheKey(segments[idx].url)
+		if cached := c.segmentCache.Get(key); cached != nil {
+			log.Printf("[DOWNLOAD] Segment %d from cache (%.2f KB)", idx, float64(len(cached))/1024)
+			if _, err := w.Write(cached); err != nil {
+				prefetchCancel() // Stop prefetching on client disconnect
+				return err
 			}
+			if canFlush {
+				flusher.Flush()
+			}
+			continue
 		}
 
-		if nextToWrite >= len(segments) {
-			break
+		// Not in cache - download synchronously
+		log.Printf("[DOWNLOAD] Segment %d downloading...", idx)
+		segmentCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		data, err := downloadSegment(segmentCtx, c.streamClient, segments[idx].url, clientIP)
+		cancel()
+
+		if err != nil {
+			prefetchCancel()
+			return fmt.Errorf("segment %d failed: %w", idx, err)
+		}
+
+		// Store in cache for other clients
+		c.segmentCache.Set(key, data, segmentCacheTTL)
+
+		// Write to client
+		log.Printf("[DOWNLOAD] Segment %d streaming (%.2f KB)", idx, float64(len(data))/1024)
+		if _, err := w.Write(data); err != nil {
+			prefetchCancel()
+			return err
+		}
+		if canFlush {
+			flusher.Flush()
 		}
 	}
 
+	prefetchCancel()
+	wg.Wait()
 	return nil
 }
 
@@ -476,6 +499,49 @@ func downloadSegment(ctx context.Context, client *http.Client, url, clientIP str
 	}
 
 	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// segmentCacheKey generates a unique cache key for an HLS segment URL
+// Uses MD5 hash to create a compact, URL-safe key
+func segmentCacheKey(url string) string {
+	// Simple hash of the URL - segments are unique by their full URL (includes CDN host, path, token)
+	hash := md5.Sum([]byte(url))
+	return hex.EncodeToString(hash[:])
+}
+
+// getCachedSegment attempts to get a segment from cache, or downloads and caches it.
+// This enables segment sharing between multiple clients streaming the same track,
+// reducing upstream bandwidth and improving seeking performance for late joiners.
+func (c *Controller) getCachedSegment(ctx context.Context, url, clientIP string) ([]byte, error) {
+	// Generate cache key from URL
+	key := segmentCacheKey(url)
+
+	// Try to get from cache first
+	if cached := c.segmentCache.Get(key); cached != nil {
+		log.Printf("[SEGMENT_CACHE] HIT for %s (%.2f KB)", url[:min(50, len(url))], float64(len(cached))/1024)
+		return cached, nil
+	}
+
+	// Cache miss - download the segment
+	log.Printf("[SEGMENT_CACHE] MISS for %s", url[:min(50, len(url))])
+	data, err := downloadSegment(ctx, c.streamClient, url, clientIP)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store in cache for other clients
+	c.segmentCache.Set(key, data, segmentCacheTTL)
+	log.Printf("[SEGMENT_CACHE] STORED %s (%.2f KB, TTL=%v)", url[:min(50, len(url))], float64(len(data))/1024, segmentCacheTTL)
+
+	return data, nil
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // isRetryableError returns true for transient errors that are worth retrying

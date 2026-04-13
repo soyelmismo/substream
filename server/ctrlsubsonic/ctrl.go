@@ -64,6 +64,7 @@ type Controller struct {
 	hydratedCache    *cache.Cache[bool]                    // Prevent duplicate background hydrations
 	streamURLLocks   sync.Map                              // dedup concurrent stream URL requests
 	streamLocks      sync.Map                              // dedup concurrent stream serving per track+client
+	segmentCache     *cache.Cache[[]byte]                  // Cache for HLS segments (shared between clients)
 	importer         *importer.JobManager                  // Background playlist import manager
 	userStreamSem    chan struct{}                         // limit total concurrent streams across all users
 	userStreamLimits sync.Map                              // per-user stream limiting (userID -> chan struct{})
@@ -171,6 +172,12 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 			MaxSize:         100,              // 100 users
 			DefaultTTL:      10 * time.Minute, // Warm for 10 min of inactivity
 			CleanupInterval: 5 * time.Minute,
+		}),
+		segmentCache: cache.New[[]byte](cache.Config{
+			Name:            "hls-segments",
+			MaxSize:         segmentCacheMaxSize,
+			DefaultTTL:      segmentCacheTTL,
+			CleanupInterval: 30 * time.Second,
 		}),
 	}
 
@@ -380,15 +387,9 @@ func withLogging(next http.Handler) http.Handler {
 			}
 		}
 
-		// Suppress logs if user has an active mass sync in progress
-		suppressLogs := false
-		if isNoisyEndpoint {
-			if user, ok := r.Context().Value(CtxUser).(*db.User); ok && user != nil {
-				if IsMassSyncActive(user.ID) {
-					suppressLogs = true
-				}
-			}
-		}
+		// Suppress logs for noisy endpoints (getAlbumInfo2, getAlbumInfo, getAlbum)
+		// These generate excessive spam during Symfonium sync - always hide them
+		suppressLogs := isNoisyEndpoint
 
 		if !suppressLogs {
 			if runningUnderSystemd {
@@ -583,7 +584,12 @@ func writeResp(w http.ResponseWriter, r *http.Request, resp *spec.Response) erro
 	if resp.Error != nil {
 		status = fmt.Sprintf("error %d: %s", resp.Error.Code, resp.Error.Message)
 	}
-	log.Printf("[SUBS] Writing response status=%s", status)
+	// Suppress response logs for noisy endpoints (getAlbumInfo2, getAlbumInfo, getAlbum)
+	path := r.URL.Path
+	isNoisy := strings.HasPrefix(path, "/getAlbumInfo2") || strings.HasPrefix(path, "/getAlbumInfo") || strings.HasPrefix(path, "/getAlbum")
+	if !isNoisy {
+		log.Printf("[SUBS] Writing response status=%s", status)
+	}
 
 	var res struct {
 		XMLName        xml.Name `xml:"subsonic-response" json:"-"`

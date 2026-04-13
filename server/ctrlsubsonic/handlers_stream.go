@@ -25,13 +25,40 @@ import (
 func doesntSupportHLS(clientName string) bool {
 	lower := strings.ToLower(clientName)
 	switch lower {
-	case "psysonic", "tempus", "symfonium", "supersonic":
+	case "psysonic", "tempus", "symfonium":
 		// These clients don't properly handle HLS manifests yet
 		// Note: supersonic CAN handle HLS but stitching provides better gapless
 		return true
 	default:
 		return false
 	}
+}
+
+// isClientDisconnectError returns true when the error is caused by the client
+// closing the connection (not an upstream/server error). These should NOT be
+// propagated to deduplicated requests.
+func isClientDisconnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	clientErrors := []string{
+		"connection reset by peer",
+		"broken pipe",
+		"write: connection reset",
+		"read: connection reset",
+		"http: request body closed",
+	}
+	for _, pattern := range clientErrors {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+	// Also check for context cancellation from the request
+	if err == context.Canceled || strings.Contains(errStr, "context canceled") {
+		return true
+	}
+	return false
 }
 
 func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.Response {
@@ -73,6 +100,11 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// [Deduplication] Prevent concurrent identical stream requests from hitting upstream
 	// multiple times. If another request is already streaming this track, wait for it.
 	// Key matches prepareStream cacheKey format for consistency
+	// [LATENCY PRIORITY] For clients that need HLS stitching (supersonic, symfonium, etc.)
+	// we skip deduplication entirely. Each client gets their own stitched stream immediately
+	// rather than waiting for another request to complete. This prioritizes latency over bandwidth.
+	clientNeedsHelp := doesntSupportHLS(p.GetOr("c", ""))
+
 	streamKey := fmt.Sprintf("stream:%s:%d:dedup", id.String(), p.GetOrInt("maxBitRate", 0))
 	type streamLock struct {
 		done   chan struct{}
@@ -80,37 +112,42 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		prep   *streamRequest // Cached result for gapless playback
 		cached time.Time      // When the result was cached
 	}
-	lockVal, loaded := c.streamLocks.LoadOrStore(streamKey, &streamLock{done: make(chan struct{})})
+
+	// Skip deduplication for clients that need stitching - prioritize latency
+	var lockVal interface{}
+	var loaded bool
+	if clientNeedsHelp {
+		// For HLS-stitching clients, don't wait - process immediately
+		log.Printf("[STREAM] LATENCY PRIORITY: Processing track=%d immediately for %s (no dedup)", id.Value(), p.GetOr("c", ""))
+		loaded = false
+	} else {
+		lockVal, loaded = c.streamLocks.LoadOrStore(streamKey, &streamLock{done: make(chan struct{})})
+	}
+
 	if loaded {
 		// Another request is already streaming this track, wait for it to complete
 		lock := lockVal.(*streamLock)
 		<-lock.done
-		// If the first request failed, propagate the error
+		// If the first request failed, propagate the error (unless it's a client disconnect)
 		if lock.err != nil {
 			log.Printf("[STREAM] Deduplicated request failed (original error: %v)", lock.err)
 			c.streamLocks.Delete(streamKey)
 			return spec.NewError(0, "stream failed: %v", lock.err)
 		}
+		// Note: Client disconnection errors (connection reset, broken pipe) are NOT stored
+		// in lock.err, so they won't propagate to other waiting requests
 		// [GAPLESS] Return cached result if within 10-minute window (HLS manifests last ~10 min)
 		if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute {
-			// Check if client can handle the cached stream type
-			clientNeedsHelp := doesntSupportHLS(p.GetOr("c", ""))
-			if lock.prep.IsHLS && clientNeedsHelp {
-				// Client doesn't support HLS natively - can't redirect to HLS manifest
-				// Proceed with normal processing to do HLS stitching
-				log.Printf("[STREAM] GAPLESS cache hit for HLS track=%d, but client needs stitching - processing normally", id.Value())
-			} else {
-				// Safe to redirect to cached URL
-				log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
-				urlPreview := lock.prep.StreamURL
-				if len(urlPreview) > 100 {
-					urlPreview = urlPreview[:100]
-				}
-				log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s (cached)",
-					id.Value(), lock.prep.IsHLS, urlPreview)
-				http.Redirect(w, r, lock.prep.StreamURL, http.StatusFound)
-				return nil
+			// Safe to redirect to cached URL (client supports HLS natively)
+			log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
+			urlPreview := lock.prep.StreamURL
+			if len(urlPreview) > 100 {
+				urlPreview = urlPreview[:100]
 			}
+			log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s (cached)",
+				id.Value(), lock.prep.IsHLS, urlPreview)
+			http.Redirect(w, r, lock.prep.StreamURL, http.StatusFound)
+			return nil
 		}
 		// Cache expired, clean up and proceed with new request
 		c.streamLocks.Delete(streamKey)
@@ -119,10 +156,18 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	var streamErr error
 	var streamPrep *streamRequest
 	defer func() {
-		if !loaded {
+		if !loaded && lockVal != nil {
 			// Only the first request cleans up and sets error if any
+			// (lockVal is nil when we skipped dedup for latency priority)
 			lock := lockVal.(*streamLock)
-			lock.err = streamErr
+			// Don't propagate client disconnection errors to other waiting requests
+			// If a client closes the connection, that doesn't mean the stream is broken
+			if isClientDisconnectError(streamErr) {
+				log.Printf("[STREAM] Client disconnected for track=%d, not propagating error to waiters", id.Value())
+				lock.err = nil // Don't store client errors
+			} else {
+				lock.err = streamErr
+			}
 			lock.prep = streamPrep
 			lock.cached = time.Now()
 			close(lock.done)
@@ -156,7 +201,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 	// 2. Route based on client HLS support
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
-	clientNeedsHelp := doesntSupportHLS(prep.ClientName)
+	clientNeedsHelp = doesntSupportHLS(prep.ClientName) // Already declared earlier
 	streamURL := prep.StreamURL
 
 	if clientNeedsHelp && prep.IsHLS {

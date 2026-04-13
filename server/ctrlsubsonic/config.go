@@ -75,6 +75,15 @@ var (
 	// Search results can become stale as library changes, so 5 minutes is reasonable.
 	searchCacheTTL = 5 * time.Minute
 
+	// segmentCacheTTL is the time-to-live for cached HLS segments.
+	// Segments are small (~6 seconds of audio), cached for 2 minutes to allow
+	// seeking and late joiner optimization while keeping memory usage reasonable.
+	segmentCacheTTL = 2 * time.Minute
+
+	// segmentCacheMaxSize is the maximum number of segments to cache.
+	// Each segment is typically 100-500KB. 500 entries = ~100-250MB max.
+	segmentCacheMaxSize = 500
+
 	// genreFetchTimeout is the timeout for genre track fetching from hot.monochrome.tf.
 	// Short timeout ensures quick fallback to local content.
 	genreFetchTimeout = 3 * time.Second
