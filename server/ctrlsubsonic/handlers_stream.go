@@ -74,8 +74,10 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// Key matches prepareStream cacheKey format for consistency
 	streamKey := fmt.Sprintf("stream:%s:%d:dedup", id.String(), p.GetOrInt("maxBitRate", 0))
 	type streamLock struct {
-		done chan struct{}
-		err  error // Propagate error from the first request to waiting requests
+		done   chan struct{}
+		err    error          // Propagate error from the first request to waiting requests
+		prep   *streamRequest // Cached result for gapless playback
+		cached time.Time      // When the result was cached
 	}
 	lockVal, loaded := c.streamLocks.LoadOrStore(streamKey, &streamLock{done: make(chan struct{})})
 	if loaded {
@@ -85,17 +87,41 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		// If the first request failed, propagate the error
 		if lock.err != nil {
 			log.Printf("[STREAM] Deduplicated request failed (original error: %v)", lock.err)
+			c.streamLocks.Delete(streamKey)
 			return spec.NewError(0, "stream failed: %v", lock.err)
 		}
+		// [GAPLESS] Return cached result if within 10-minute window (HLS manifests last ~10 min)
+		if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute {
+			log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
+			// Redirect using cached URL
+			urlPreview := lock.prep.StreamURL
+			if len(urlPreview) > 100 {
+				urlPreview = urlPreview[:100]
+			}
+			log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s (cached)",
+				id.Value(), lock.prep.IsHLS, urlPreview)
+			http.Redirect(w, r, lock.prep.StreamURL, http.StatusFound)
+			return nil
+		}
+		// Cache expired, clean up and proceed with new request
+		c.streamLocks.Delete(streamKey)
 	}
 	// Cleanup lock when done - capture err in named return to propagate to waiters
 	var streamErr error
+	var streamPrep *streamRequest
 	defer func() {
 		if !loaded {
 			// Only the first request cleans up and sets error if any
-			lockVal.(*streamLock).err = streamErr
-			close(lockVal.(*streamLock).done)
-			c.streamLocks.Delete(streamKey)
+			lock := lockVal.(*streamLock)
+			lock.err = streamErr
+			lock.prep = streamPrep
+			lock.cached = time.Now()
+			close(lock.done)
+			// Keep the lock entry for 10 minutes for gapless playback, then clean up
+			go func() {
+				time.Sleep(10 * time.Minute)
+				c.streamLocks.Delete(streamKey)
+			}()
 		}
 	}()
 
@@ -105,6 +131,8 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		log.Printf("[STREAM] ERROR: prepare failed: %v", err)
 		return spec.NewError(0, "error preparing stream: %v", err)
 	}
+	// [GAPLESS] Capture successful prep for deduplication cache
+	streamPrep = prep
 
 	// [Safety] Add 10-minute timeout for stream operations to prevent indefinite hangs
 	streamCtx, streamCancel := context.WithTimeout(r.Context(), 10*time.Minute)
