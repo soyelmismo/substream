@@ -191,7 +191,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 			url  string
 			err  error
 		}
-		lockVal, loaded := c.streamURLLocks.LoadOrStore(cacheKey, &lockPair{done: make(chan struct{})})
+		lockVal, loaded := c.streamURLLocks.LoadOrStore(cacheKey+":lock", &lockPair{done: make(chan struct{})})
 		lp := lockVal.(*lockPair)
 
 		if loaded {
@@ -202,11 +202,11 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 			lp.url, lp.err = url, urlErr
 			close(lp.done)
 			if urlErr == nil && url != "" {
-				c.streamURLCache.Set(cacheKey, url, 5*time.Minute) // Reduced to 5m, URLs are IP-locked
+				c.streamURLCache.Set(cacheKey, url, 5*time.Minute) // Manifests expire quickly
 			}
 			go func() {
 				time.Sleep(100 * time.Millisecond)
-				c.streamURLLocks.Delete(cacheKey)
+				c.streamURLLocks.Delete(cacheKey + ":lock")
 			}()
 		}
 	}()

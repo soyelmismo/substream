@@ -71,7 +71,8 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 	// [Deduplication] Prevent concurrent identical stream requests from hitting upstream
 	// multiple times. If another request is already streaming this track, wait for it.
-	streamKey := fmt.Sprintf("stream:%s:%d", id.String(), p.GetOrInt("maxBitRate", 0))
+	// Key matches prepareStream cacheKey format for consistency
+	streamKey := fmt.Sprintf("stream:%s:%d:dedup", id.String(), p.GetOrInt("maxBitRate", 0))
 	type streamLock struct {
 		done chan struct{}
 		err  error // Propagate error from the first request to waiting requests
