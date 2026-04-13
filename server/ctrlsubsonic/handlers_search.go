@@ -4,6 +4,9 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
@@ -15,6 +18,46 @@ type cachedSearch struct {
 	tracks  []spec.TrackChild
 	artists []spec.Artist
 	albums  []spec.Album
+}
+
+// syncSession tracks a mass library sync operation (e.g., Symfonium)
+type syncSession struct {
+	userID        int
+	username      string
+	client        string
+	startTime     time.Time
+	lastActivity  time.Time
+	totalTracks   int
+	currentOffset int
+}
+
+const (
+	syncDetectionThreshold = 5000 // Offset above which we consider it a mass sync
+	syncProgressInterval   = 3000 // Log progress every N tracks
+	syncSessionTimeout     = 30 * time.Second
+)
+
+var (
+	activeSyncSessions sync.Map // userID -> *syncSession
+	syncSuppressCache  atomic.Bool
+)
+
+// init registers the cache log suppression callback with the db package
+func init() {
+	// Register callback to suppress cache hit logs during mass sync operations
+	db.CacheLogSuppress = func() bool {
+		return syncSuppressCache.Load()
+	}
+}
+
+// IsMassSyncActive checks if there's an active mass sync session for the given user
+func IsMassSyncActive(userID int) bool {
+	sessionRaw, ok := activeSyncSessions.Load(userID)
+	if !ok {
+		return false
+	}
+	session := sessionRaw.(*syncSession)
+	return time.Since(session.lastActivity) < syncSessionTimeout
 }
 
 func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
@@ -29,7 +72,15 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	// Return virtual library content only (NOT full Tidal catalog) to prevent infinite loops
 	trimmedQuery := strings.TrimSpace(query)
 	if trimmedQuery == "" || trimmedQuery == `""` || trimmedQuery == `''` {
-		log.Printf("[SUBS] Empty query detected - returning virtual library only (Symfonium sync)")
+		// Check if this is a mass sync (will be logged as grouped progress)
+		p := r.Context().Value(CtxParams).(params.Params)
+		songOffset := p.GetOrInt("songOffset", 0)
+		client, _ := p.Get("c")
+		isMassSync := songOffset >= syncDetectionThreshold
+		isSymfonium := strings.EqualFold(client, "Symfonium")
+		if !isMassSync || !isSymfonium {
+			log.Printf("[SUBS] Empty query detected - returning virtual library only (Symfonium sync)")
+		}
 		return c.searchVirtualLibrary(r)
 	}
 
@@ -334,6 +385,13 @@ func (c *Controller) searchVirtualLibrary(r *http.Request) *spec.Response {
 	albumOffset := p.GetOrInt("albumOffset", 0)
 	songOffset := p.GetOrInt("songOffset", 0)
 
+	// Detect client type (e.g., Symfonium)
+	client, _ := p.Get("c")
+
+	// Check if this is a mass sync operation (large offset indicates bulk enumeration)
+	isMassSync := songOffset >= syncDetectionThreshold || albumOffset >= syncDetectionThreshold || artistOffset >= syncDetectionThreshold
+	isSymfonium := strings.EqualFold(client, "Symfonium")
+
 	results := &spec.SearchResultThree{
 		Artists: []*spec.Artist{},
 		Albums:  []*spec.Album{},
@@ -344,6 +402,11 @@ func (c *Controller) searchVirtualLibrary(r *http.Request) *spec.Response {
 	artistURIs := c.dbc.GetVirtualLibraryArtistIDs(user.ID)
 	albumURIs := c.dbc.GetVirtualLibraryAlbumIDs(user.ID)
 	trackURIs := c.dbc.GetVirtualLibraryTrackIDs(user.ID)
+
+	// Enable cache suppression for mass sync operations
+	if isMassSync && isSymfonium {
+		syncSuppressCache.Store(true)
+	}
 
 	// Apply pagination and fetch artists
 	if artistCount > 0 && artistOffset < len(artistURIs) {
@@ -384,8 +447,53 @@ func (c *Controller) searchVirtualLibrary(r *http.Request) *spec.Response {
 		}
 	}
 
-	log.Printf("[SUBS] Virtual library search: artists=%d/%d, albums=%d/%d, tracks=%d/%d",
-		len(results.Artists), len(artistURIs), len(results.Albums), len(albumURIs), len(results.Tracks), len(trackURIs))
+	// Handle logging: group mass sync operations, show individual for normal searches
+	if isMassSync && isSymfonium {
+		// Update or create sync session
+		sessionRaw, _ := activeSyncSessions.Load(user.ID)
+		var session *syncSession
+		now := time.Now()
+
+		if sessionRaw != nil {
+			session = sessionRaw.(*syncSession)
+			// Check if session expired (different user or timeout)
+			if now.Sub(session.lastActivity) > syncSessionTimeout || session.username != user.Name {
+				session = nil
+			}
+		}
+
+		if session == nil {
+			session = &syncSession{
+				userID:      user.ID,
+				username:    user.Name,
+				client:      client,
+				startTime:   now,
+				totalTracks: len(trackURIs),
+			}
+			activeSyncSessions.Store(user.ID, session)
+		}
+
+		session.lastActivity = now
+		session.currentOffset = songOffset + len(results.Tracks)
+
+		// Log progress at intervals or when completing
+		if session.currentOffset%syncProgressInterval < songCount || session.currentOffset >= session.totalTracks {
+			log.Printf("[SUBS] User %s syncing from %s (%d/%d tracks)",
+				session.username, session.client, session.currentOffset, session.totalTracks)
+		}
+	} else {
+		// Normal search - show detailed results
+		log.Printf("[SUBS] Virtual library search: artists=%d/%d, albums=%d/%d, tracks=%d/%d",
+			len(results.Artists), len(artistURIs), len(results.Albums), len(albumURIs), len(results.Tracks), len(trackURIs))
+	}
+
+	// Disable cache suppression after a delay (allows next request to reset if sync continues)
+	if isMassSync && isSymfonium {
+		go func() {
+			time.Sleep(syncSessionTimeout)
+			syncSuppressCache.Store(false)
+		}()
+	}
 
 	sub := spec.NewResponse()
 	sub.SearchResultThree = results

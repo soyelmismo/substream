@@ -368,17 +368,48 @@ func withLogging(next http.Handler) http.Handler {
 		// Check if running under systemd (no colors)
 		runningUnderSystemd := os.Getenv("JOURNAL_STREAM") != "" || os.Getenv("INVOCATION_ID") != ""
 
-		if runningUnderSystemd {
-			log.Printf("[SUBS:%s] IN  %s %s", reqID, r.Method, r.URL.RequestURI())
-			next.ServeHTTP(w, r)
-			log.Printf("[SUBS:%s] OUT %s %s (%v)", reqID, r.Method, r.URL.Path, time.Since(start))
-		} else {
-			// Color the request ID with unique rotating color for visual tracing
-			reset := "\033[0m"
-			colorID := reqColor + reqID + reset
-			log.Printf("[SUBS:%s] IN  %s %s", colorID, r.Method, r.URL.RequestURI())
-			next.ServeHTTP(w, r)
-			log.Printf("[SUBS:%s] OUT %s %s (%v)", colorID, r.Method, r.URL.Path, time.Since(start))
+		// Check if this is a noisy endpoint during mass sync operations
+		// These endpoints generate excessive logs when Symfonium syncs the library
+		noisyEndpoints := []string{"/getAlbumInfo2", "/getAlbumInfo", "/getAlbum"}
+		path := r.URL.Path
+		isNoisyEndpoint := false
+		for _, endpoint := range noisyEndpoints {
+			if strings.HasPrefix(path, endpoint) {
+				isNoisyEndpoint = true
+				break
+			}
+		}
+
+		// Suppress logs if user has an active mass sync in progress
+		suppressLogs := false
+		if isNoisyEndpoint {
+			if user, ok := r.Context().Value(CtxUser).(*db.User); ok && user != nil {
+				if IsMassSyncActive(user.ID) {
+					suppressLogs = true
+				}
+			}
+		}
+
+		if !suppressLogs {
+			if runningUnderSystemd {
+				log.Printf("[SUBS:%s] IN  %s %s", reqID, r.Method, r.URL.RequestURI())
+			} else {
+				reset := "\033[0m"
+				colorID := reqColor + reqID + reset
+				log.Printf("[SUBS:%s] IN  %s %s", colorID, r.Method, r.URL.RequestURI())
+			}
+		}
+
+		next.ServeHTTP(w, r)
+
+		if !suppressLogs {
+			if runningUnderSystemd {
+				log.Printf("[SUBS:%s] OUT %s %s (%v)", reqID, r.Method, r.URL.Path, time.Since(start))
+			} else {
+				reset := "\033[0m"
+				colorID := reqColor + reqID + reset
+				log.Printf("[SUBS:%s] OUT %s %s (%v)", colorID, r.Method, r.URL.Path, time.Since(start))
+			}
 		}
 	})
 }

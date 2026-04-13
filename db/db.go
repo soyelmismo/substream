@@ -149,6 +149,9 @@ func (db *DB) GetVirtualLibraryTrackIDs(userID int) []string {
 	return uris
 }
 
+// CacheLogSuppress is an optional callback that returns true if cache hit logging should be suppressed
+var CacheLogSuppress func() bool
+
 // GetCachedMetadata retrieves cached metadata from SQLite
 // Returns nil if not found or expired
 var cacheHitCounter atomic.Int64
@@ -170,9 +173,15 @@ func (db *DB) GetCachedMetadata(key string) []byte {
 	}
 
 	// Batch logging: log every 100 cache hits to reduce I/O spam
-	count := cacheHitCounter.Add(1)
-	if count%100 == 0 {
-		log.Printf("[CACHE HIT] %s (%d bytes, age: %v) [batch: %d hits]", key, len(cache.Value), time.Since(cache.FetchedAt), count)
+	// Skip if sync suppression is active
+	if CacheLogSuppress == nil || !CacheLogSuppress() {
+		count := cacheHitCounter.Add(1)
+		if count%100 == 0 {
+			log.Printf("[CACHE HIT] %s (%d bytes, age: %v) [batch: %d hits]", key, len(cache.Value), time.Since(cache.FetchedAt), count)
+		}
+	} else {
+		// Still increment counter but don't log
+		cacheHitCounter.Add(1)
 	}
 	return cache.Value
 }

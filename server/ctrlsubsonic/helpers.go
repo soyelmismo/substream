@@ -410,3 +410,50 @@ func (c *Controller) hydrateArtistBackground(artistID int) {
 		log.Printf("[HYDRATE] Completed deep hydration for artist %d (%d albums)", artistID, len(page.Albums.Items))
 	}()
 }
+
+// hydratePlaylistBackground fetches and caches all tracks in a playlist
+// This ensures playlist tracks are always available in the cache for offline playback
+func (c *Controller) hydratePlaylistBackground(playlistID int, trackIDs []int) {
+	key := fmt.Sprintf("pl:%d", playlistID)
+	if c.hydratedCache.Has(key) {
+		return // Already hydrated recently
+	}
+	c.hydratedCache.Set(key, true, 0)
+
+	if len(trackIDs) == 0 {
+		return
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond) // yield
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
+		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
+
+		log.Printf("[HYDRATE] Hydrating playlist %d with %d tracks...", playlistID, len(trackIDs))
+
+		hydrated := 0
+		for i, trackID := range trackIDs {
+			if trackID == 0 {
+				continue
+			}
+
+			// Sleep between fetches to avoid hammering
+			if i > 0 {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			// Fetch track info - this caches the track metadata
+			_, err := c.proxy.GetTrackInfo(ctx, trackID)
+			if err != nil {
+				// Non-critical: track may be unavailable, continue with others
+				continue
+			}
+			hydrated++
+		}
+
+		log.Printf("[HYDRATE] Completed playlist %d hydration (%d/%d tracks cached)", playlistID, hydrated, len(trackIDs))
+	}()
+}

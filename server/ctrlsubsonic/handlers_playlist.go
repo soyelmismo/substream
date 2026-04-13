@@ -95,6 +95,10 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 
 	trackList := c.batchFetchTracks(r, tidalIDs)
 
+	// [Hydrate] Trigger background hydration for all tracks in the playlist
+	// This ensures tracks are cached for offline playback and faster subsequent access
+	c.hydratePlaylistBackground(pl.ID, tidalIDs)
+
 	totalDuration := 0
 	for _, tc := range trackList {
 		totalDuration += tc.Duration
