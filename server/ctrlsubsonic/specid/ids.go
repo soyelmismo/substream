@@ -113,15 +113,20 @@ func New(in string) (ID, error) {
 		}
 	}
 
-	// Legacy format support: type-value (e.g., "tr-12345", "pl-abc123")
+	// Legacy format support: type-value (e.g., "tr-12345", "pl-abc123") or type:value (e.g., "pl:24")
+	// Try separator "-" first, then ":" for backwards compatibility
 	partType, partValue, ok := strings.Cut(in, separator)
+	if !ok {
+		// Try ":" as separator for formats like "pl:24"
+		partType, partValue, ok = strings.Cut(in, ":")
+	}
 	if !ok {
 		return ID{}, ErrBadSeparator
 	}
 
 	switch IDT(partType) {
 	case Playlist:
-		// Playlists use string IDs
+		// Playlists use string IDs (numeric or string)
 		return ID{URI: fmt.Sprintf("%s:%s:%s", defaultProvider, Playlist, partValue)}, nil
 	}
 

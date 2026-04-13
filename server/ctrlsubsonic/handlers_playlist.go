@@ -36,7 +36,7 @@ func (c *Controller) ServeGetPlaylists(r *http.Request) *spec.Response {
 		var owner db.User
 		c.dbc.Where("id=?", pl.UserID).First(&owner)
 
-		sub.Playlists.List[i] = &spec.Playlist{
+		playlist := &spec.Playlist{
 			ID:        specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
 			Name:      pl.Name,
 			Comment:   pl.Comment,
@@ -46,6 +46,11 @@ func (c *Controller) ServeGetPlaylists(r *http.Request) *spec.Response {
 			Changed:   pl.UpdatedAt,
 			Public:    pl.IsPublic,
 		}
+		// Include cover art if playlist has an image (external URL or local path)
+		if pl.CoverURL != "" || pl.CoverPath != "" {
+			playlist.CoverID = &specid.ID{URI: fmt.Sprintf("pl:%d", pl.ID)}
+		}
+		sub.Playlists.List[i] = playlist
 	}
 
 	return sub
@@ -96,7 +101,7 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 	}
 
 	sub := spec.NewResponse()
-	sub.Playlist = &spec.Playlist{
+	playlist := &spec.Playlist{
 		ID:        specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
 		Name:      pl.Name,
 		Comment:   pl.Comment,
@@ -108,6 +113,11 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 		Public:    pl.IsPublic,
 		List:      trackList,
 	}
+	// Include cover art if playlist has an image
+	if pl.CoverURL != "" || pl.CoverPath != "" {
+		playlist.CoverID = &specid.ID{URI: fmt.Sprintf("pl:%d", pl.ID)}
+	}
+	sub.Playlist = playlist
 
 	return sub
 }
@@ -243,7 +253,7 @@ func (c *Controller) buildPlaylistResponse(r *http.Request, pl *db.Playlist, use
 	}
 
 	sub := spec.NewResponse()
-	sub.Playlist = &spec.Playlist{
+	playlist := &spec.Playlist{
 		ID:        specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
 		Name:      pl.Name,
 		Comment:   pl.Comment,
@@ -255,6 +265,11 @@ func (c *Controller) buildPlaylistResponse(r *http.Request, pl *db.Playlist, use
 		Public:    pl.IsPublic,
 		List:      trackList,
 	}
+	// Include cover art if playlist has an image
+	if pl.CoverURL != "" || pl.CoverPath != "" {
+		playlist.CoverID = &specid.ID{URI: fmt.Sprintf("pl:%d", pl.ID)}
+	}
+	sub.Playlist = playlist
 	return sub
 }
 

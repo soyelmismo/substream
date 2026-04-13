@@ -1,10 +1,19 @@
 package importer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/jpeg"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,16 +36,47 @@ type JobManager struct {
 	activeJobs sync.Map      // playlistID -> context.CancelFunc
 	db         *db.DB
 	proxy      tidalproxy.TidalProxy
+	cachePath  string // Path for storing generated playlist covers
+}
+
+// coverInfo holds info for creating composite covers
+type coverInfo struct {
+	url     string
+	albumID int
 }
 
 // NewJobManager creates a new import job manager
-func NewJobManager(dbc *db.DB, proxy tidalproxy.TidalProxy) *JobManager {
+func NewJobManager(dbc *db.DB, proxy tidalproxy.TidalProxy, cachePath string) *JobManager {
 	return &JobManager{
 		registry:  NewRegistry(proxy),
 		semaphore: make(chan struct{}, maxConcurrentImports),
 		db:        dbc,
 		proxy:     proxy,
+		cachePath: cachePath,
 	}
+}
+
+// extractIDFromURI extracts the numeric ID from a URI string (e.g., "td:tr:12345" -> 12345)
+func extractIDFromURI(uri string) int {
+	if uri == "" {
+		return 0
+	}
+	parts := strings.Split(uri, ":")
+	if len(parts) >= 3 {
+		id, err := strconv.Atoi(parts[len(parts)-1])
+		if err == nil {
+			return id
+		}
+	}
+	// Try legacy format "tr-12345"
+	parts = strings.Split(uri, "-")
+	if len(parts) >= 2 {
+		id, err := strconv.Atoi(parts[len(parts)-1])
+		if err == nil {
+			return id
+		}
+	}
+	return 0
 }
 
 // StartImport begins a background import job
@@ -59,13 +99,14 @@ func (jm *JobManager) StartImport(ctx context.Context, userID int, sourceURL str
 		UserID:    userID,
 		Name:      fmt.Sprintf("Importing: %s...", truncate(playlist.Title, 40)),
 		Comment:   fmt.Sprintf("Importing %d tracks from %s...", len(playlist.Tracks), provider.Name()),
+		CoverURL:  playlist.CoverURL, // Store cover URL from source (Tidal, etc.)
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-
 	if err := jm.db.Create(&placeholder).Error; err != nil {
 		return nil, fmt.Errorf("create placeholder playlist: %w", err)
 	}
+	log.Printf("[IMPORT] Playlist created: ID=%d Name=%s CoverURL=%q Tracks=%d", placeholder.ID, placeholder.Name, playlist.CoverURL, len(playlist.Tracks))
 
 	// Check if already importing
 	if _, exists := jm.activeJobs.Load(placeholder.ID); exists {
@@ -455,6 +496,15 @@ func (jm *JobManager) finalizePlaylist(playlistID int, title, description string
 			// Fallback message
 			finalDescription = fmt.Sprintf("Imported from external source (%d tracks)", trackCount)
 		}
+
+		// Generate composite cover if no cover exists and we have tracks
+		if pl.CoverURL == "" && pl.CoverPath == "" {
+			if coverPath := jm.generateCompositeCover(playlistID); coverPath != "" {
+				pl.CoverPath = coverPath
+				jm.db.Save(&pl)
+				log.Printf("[IMPORT] Generated composite cover for playlist %d", playlistID)
+			}
+		}
 	} else {
 		// DB error, just use what we have
 		if description != "" {
@@ -474,6 +524,173 @@ func (jm *JobManager) finalizePlaylist(playlistID int, title, description string
 	jm.db.Model(&db.Playlist{}).
 		Where("id = ?", playlistID).
 		Updates(updates)
+}
+
+// generateCompositeCover creates a 2x2 grid cover from the first 4 tracks' album art
+func (jm *JobManager) generateCompositeCover(playlistID int) string {
+	// Get first 4 tracks from playlist
+	var tracks []db.PlaylistTrack
+	jm.db.Where("playlist_id = ?", playlistID).Order("position ASC").Limit(4).Find(&tracks)
+
+	if len(tracks) == 0 {
+		return ""
+	}
+
+	// Collect album cover URLs from tracks
+	var covers []coverInfo
+
+	for _, track := range tracks {
+		tidalID := extractIDFromURI(track.URI)
+		if tidalID == 0 {
+			continue
+		}
+
+		// Get track info to find album
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		trackInfo, err := jm.proxy.GetTrackInfo(ctx, tidalID)
+		cancel()
+
+		if err == nil && trackInfo.Album.ID > 0 {
+			// Get album cover
+			albumID := trackInfo.Album.ID
+			coverUUID := jm.proxy.GetCoverUUIDForAlbum(context.Background(), albumID)
+			if coverUUID != "" {
+				coverURL := jm.proxy.GetCoverURL(coverUUID, 320) // Medium size for grid
+				if coverURL != "" {
+					covers = append(covers, coverInfo{url: coverURL, albumID: albumID})
+				}
+			}
+		}
+	}
+
+	if len(covers) == 0 {
+		return ""
+	}
+
+	// Generate composite image
+	compositePath := filepath.Join(jm.cachePath, "playlist-covers", fmt.Sprintf("pl-%d.jpg", playlistID))
+	if err := os.MkdirAll(filepath.Dir(compositePath), 0755); err != nil {
+		return ""
+	}
+
+	if err := createCompositeImage(covers, compositePath); err != nil {
+		log.Printf("[IMPORT] Failed to create composite cover for playlist %d: %v", playlistID, err)
+		return ""
+	}
+
+	return compositePath
+}
+
+// createCompositeImage creates a 2x2 grid from up to 4 cover URLs
+func createCompositeImage(covers []coverInfo, outputPath string) error {
+	if len(covers) == 0 {
+		return fmt.Errorf("no covers provided")
+	}
+
+	const gridSize = 2
+	const tileSize = 320  // Each tile is 320x320
+	const finalSize = 640 // Final image is 640x640
+
+	// Create blank canvas
+	canvas := image.NewRGBA(image.Rect(0, 0, finalSize, finalSize))
+
+	// Download and draw each cover
+	client := &http.Client{Timeout: 10 * time.Second}
+	drawn := 0
+
+	for i, cover := range covers {
+		if drawn >= 4 {
+			break
+		}
+
+		// Download cover
+		resp, err := client.Get(cover.url)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		// Decode image
+		img, _, err := image.Decode(bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+
+		// Resize to tile size
+		resized := resizeImage(img, tileSize, tileSize)
+
+		// Calculate position in 2x2 grid
+		row := i / gridSize
+		col := i % gridSize
+		x := col * tileSize
+		y := row * tileSize
+
+		// Draw onto canvas
+		draw.Draw(canvas, image.Rect(x, y, x+tileSize, y+tileSize), resized, image.Point{}, draw.Over)
+		drawn++
+	}
+
+	if drawn == 0 {
+		return fmt.Errorf("no covers could be drawn")
+	}
+
+	// If only 1 cover, use it directly (no need for grid)
+	if drawn == 1 {
+		// Just save the single cover we downloaded
+		resp, _ := client.Get(covers[0].url)
+		if resp != nil && resp.StatusCode == http.StatusOK {
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(data) > 0 {
+				return os.WriteFile(outputPath, data, 0644)
+			}
+		}
+	}
+
+	// Save composite
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	return jpeg.Encode(file, canvas, &jpeg.Options{Quality: 85})
+}
+
+// resizeImage scales an image to fit within maxWidth x maxHeight while maintaining aspect ratio
+func resizeImage(src image.Image, maxWidth, maxHeight int) image.Image {
+	bounds := src.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+
+	// Calculate scale to fit within max dimensions
+	scaleX := float64(maxWidth) / float64(srcW)
+	scaleY := float64(maxHeight) / float64(srcH)
+	scale := scaleX
+	if scaleY < scaleX {
+		scale = scaleY
+	}
+
+	newW := int(float64(srcW) * scale)
+	newH := int(float64(srcH) * scale)
+
+	// Use simple nearest-neighbor for speed (could use better interpolation)
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+
+	for y := 0; y < newH; y++ {
+		for x := 0; x < newW; x++ {
+			srcX := int(float64(x) / scale)
+			srcY := int(float64(y) / scale)
+			dst.Set(x, y, src.At(srcX+bounds.Min.X, srcY+bounds.Min.Y))
+		}
+	}
+
+	return dst
 }
 
 // CancelImport cancels an active import job

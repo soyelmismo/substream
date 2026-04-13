@@ -24,6 +24,15 @@ var (
 	nextDataRegex        = regexp.MustCompile(`<script id="__NEXT_DATA__"[^>]*>([^<]+)</script>`)
 )
 
+// getKeys returns all keys from a map[string]interface{}
+func getKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // SpotifyProvider implements anonymous playlist extraction from Spotify
 type SpotifyProvider struct {
 	client      *http.Client
@@ -145,8 +154,8 @@ func (s *SpotifyProvider) fetchFromSpclient(ctx context.Context, playlistID stri
 		return nil, fmt.Errorf("no token available")
 	}
 
-	url := fmt.Sprintf(spotifySpclient, playlistID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	apiURL := fmt.Sprintf(spotifySpclient, playlistID)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -170,6 +179,23 @@ func (s *SpotifyProvider) fetchFromSpclient(ctx context.Context, playlistID stri
 		return nil, err
 	}
 
+	// Debug: print attributes structure to find correct image field
+	if attrs, ok := data["attributes"].(map[string]interface{}); ok {
+		log.Printf("[SPOTIFY:DEBUG] ===== ATTRIBUTES =====")
+		for k, v := range attrs {
+			log.Printf("[SPOTIFY:DEBUG] %s = %v (type: %T)", k, v, v)
+		}
+		log.Printf("[SPOTIFY:DEBUG] ====================")
+	}
+	// Check top-level fields
+	log.Printf("[SPOTIFY:DEBUG] ===== TOP LEVEL =====")
+	for k, v := range data {
+		if k != "attributes" && k != "contents" {
+			log.Printf("[SPOTIFY:DEBUG] %s = %v (type: %T)", k, v, v)
+		}
+	}
+	log.Printf("[SPOTIFY:DEBUG] ====================")
+
 	result := &ImportedPlaylist{
 		Tracks: []ImportedTrack{},
 	}
@@ -183,10 +209,17 @@ func (s *SpotifyProvider) fetchFromSpclient(ctx context.Context, playlistID stri
 		if desc, ok := attrs["description"].(string); ok && desc != "" {
 			result.Description = desc
 		}
-		// Extract cover from attributes.picture
-		if pic, ok := attrs["picture"].(string); ok && pic != "" {
-			// Convert picture ID to full URL
-			result.CoverURL = fmt.Sprintf("https://i.scdn.co/image/%s", pic)
+		// Extract cover from attributes.picture (only if it's a full URL)
+		if pic, ok := attrs["picture"].(string); ok && pic != "" && strings.HasPrefix(pic, "http") {
+			result.CoverURL = pic
+			log.Printf("[SPOTIFY:DEBUG] Using picture URL from attributes: %s", pic)
+		}
+		// If no valid cover URL, try to get from embed as fallback
+		if result.CoverURL == "" {
+			if embedCover := s.fetchCoverFromEmbed(playlistID); embedCover != "" {
+				result.CoverURL = embedCover
+				log.Printf("[SPOTIFY:DEBUG] Using embed cover: %s", embedCover)
+			}
 		}
 	}
 
@@ -300,6 +333,65 @@ func (s *SpotifyProvider) fetchFromEmbed(ctx context.Context, playlistID string)
 	}
 
 	return result, nil
+}
+
+// fetchCoverFromEmbed fetches just the cover image from embed page
+func (s *SpotifyProvider) fetchCoverFromEmbed(playlistID string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	embedURL := fmt.Sprintf(spotifyEmbedURL, playlistID)
+	req, err := http.NewRequestWithContext(ctx, "GET", embedURL, nil)
+	if err != nil {
+		return ""
+	}
+
+	req.Header.Set("User-Agent", spotifyUserAgent)
+	req.Header.Set("Accept", "text/html")
+
+	resp, err := s.getClient().Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	match := nextDataRegex.FindSubmatch(body)
+	if match == nil {
+		return ""
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(match[1], &data); err != nil {
+		return ""
+	}
+
+	entity, err := extractEntity(data)
+	if err != nil {
+		return ""
+	}
+
+	// Get cover from coverArt.sources
+	if coverArt, ok := entity["coverArt"].(map[string]interface{}); ok {
+		if sources, ok := coverArt["sources"].([]interface{}); ok && len(sources) > 0 {
+			// Use the largest image (last one)
+			if last, ok := sources[len(sources)-1].(map[string]interface{}); ok {
+				if url, ok := last["url"].(string); ok {
+					return url
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 // fetchTrackMetadata gets track details from embed page

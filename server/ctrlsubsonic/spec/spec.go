@@ -336,6 +336,7 @@ type Playlist struct {
 	Changed   time.Time     `xml:"changed,attr"    json:"changed"`
 	Duration  int           `xml:"duration,attr"   json:"duration"`
 	Public    bool          `xml:"public,attr"     json:"public,omitempty"`
+	CoverID   *specid.ID    `xml:"coverArt,attr,omitempty" json:"coverArt,omitempty"`
 	List      []*TrackChild `xml:"entry,omitempty" json:"entry,omitempty"`
 }
 
@@ -511,8 +512,6 @@ type OpenSubsonicExtension struct {
 }
 
 type OpenSubsonicExtensions []OpenSubsonicExtension
-
-
 
 var doublePuncExpr = regexp.MustCompile(`\.\s+\.\s+`)
 var licenceExpr = regexp.MustCompile(`(?i)\buser-contributed text.*`)

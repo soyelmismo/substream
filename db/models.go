@@ -63,6 +63,8 @@ type Playlist struct {
 	Name      string    `gorm:"not null"`
 	Comment   string    `sql:"default: ''"`
 	IsPublic  bool      `gorm:"not null" sql:"DEFAULT:false"`
+	CoverURL  string    `sql:"default: ''"` // External cover URL (from Tidal, etc.)
+	CoverPath string    `sql:"default: ''"` // Local path for custom uploaded covers
 	CreatedAt time.Time `sql:"DEFAULT:current_timestamp"`
 	UpdatedAt time.Time `sql:"DEFAULT:current_timestamp"`
 }

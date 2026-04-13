@@ -93,7 +93,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 		cachePath:     cachePath,
 		proxySem:      make(chan struct{}, 30),  // limit total concurrent proxy calls
 		userStreamSem: make(chan struct{}, 100), // limit total concurrent streams (100 = ~500MB RAM max with 64KB buffers)
-		importer:      importer.NewJobManager(dbc, proxy),
+		importer:      importer.NewJobManager(dbc, proxy, cachePath),
 		httpClient: &http.Client{
 			Timeout: httpClientTimeout,
 			Transport: &http.Transport{

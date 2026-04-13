@@ -86,11 +86,13 @@ func (t *TidalProvider) convertTidalPlaylist(playlist *tidalproxy.TidalPlaylist)
 		Tracks:      make([]ImportedTrack, 0, len(playlist.Tracks)),
 	}
 
+	// Capture playlist cover image - prefer square image, fallback to regular
 	if playlist.SquareImage != "" {
 		result.CoverURL = playlist.SquareImage
 	} else if playlist.Image != "" {
 		result.CoverURL = playlist.Image
 	}
+	// CoverData will be populated by the job manager if we want to download/cache it
 
 	for _, track := range playlist.Tracks {
 		artist := track.Artist.Name

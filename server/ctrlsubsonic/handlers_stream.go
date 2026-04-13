@@ -497,6 +497,8 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 func (c *Controller) fetchAndCacheCover(ctx context.Context, id *specid.ID, size int, cachePath, negKey string) ([]byte, error) {
 	// resolve cover UUID
 	var coverUUID string
+	var coverURL string
+
 	switch id.Type() {
 	case specid.Album:
 		coverUUID = c.proxy.GetCoverUUIDForAlbum(ctx, id.Value())
@@ -510,14 +512,55 @@ func (c *Controller) fetchAndCacheCover(ctx context.Context, id *specid.ID, size
 		if err == nil {
 			coverUUID = track.Album.Cover
 		}
+	case specid.Playlist:
+		// Fetch playlist cover from DB
+		var pl db.Playlist
+		if err := c.dbc.Where("id = ?", id.Value()).First(&pl).Error; err == nil {
+			log.Printf("[COVER] Playlist %d: CoverURL=%q CoverPath=%q", id.Value(), pl.CoverURL, pl.CoverPath)
+			if pl.CoverPath != "" {
+				// Local custom cover - read from filesystem
+				if data, err := os.ReadFile(pl.CoverPath); err == nil {
+					log.Printf("[COVER] Serving local cover from %s", pl.CoverPath)
+					os.MkdirAll(filepath.Dir(cachePath), 0755)
+					os.WriteFile(cachePath, data, 0644)
+					return data, nil
+				}
+				log.Printf("[COVER] Failed to read local cover: %v", err)
+			}
+			if pl.CoverURL != "" {
+				// Check if CoverURL is a UUID (not a full URL)
+				if !strings.HasPrefix(pl.CoverURL, "http") {
+					// It's a UUID, convert to full URL using proxy
+					coverURL = c.proxy.GetCoverURL(pl.CoverURL, size)
+					log.Printf("[COVER] Converted UUID %s to URL: %s", pl.CoverURL, coverURL)
+				} else {
+					// It's already a full URL
+					coverURL = pl.CoverURL
+					log.Printf("[COVER] Using external URL: %s", coverURL)
+				}
+			}
+			// Check for auto-generated composite cover
+			compositePath := filepath.Join(c.cachePath, "playlist-covers", fmt.Sprintf("pl-%d.jpg", id.Value()))
+			if data, err := os.ReadFile(compositePath); err == nil {
+				log.Printf("[COVER] Serving composite cover from %s", compositePath)
+				os.MkdirAll(filepath.Dir(cachePath), 0755)
+				os.WriteFile(cachePath, data, 0644)
+				return data, nil
+			}
+			log.Printf("[COVER] No composite cover found at %s", compositePath)
+		} else {
+			log.Printf("[COVER] Playlist %d not found in DB: %v", id.Value(), err)
+		}
 	}
 
-	if coverUUID == "" {
+	if coverUUID == "" && coverURL == "" {
 		c.negCoverCache.Set(negKey, true, 0)
 		return nil, fmt.Errorf("no cover found")
 	}
 
-	coverURL := c.proxy.GetCoverURL(coverUUID, size)
+	if coverURL == "" {
+		coverURL = c.proxy.GetCoverURL(coverUUID, size)
+	}
 	if coverURL == "" {
 		return nil, fmt.Errorf("no cover URL")
 	}

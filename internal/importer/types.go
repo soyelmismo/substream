@@ -13,6 +13,7 @@ type ImportedTrack struct {
 type ImportedPlaylist struct {
 	Title       string
 	Description string
-	CoverURL    string
+	CoverURL    string // Cover image URL from source (Tidal, Spotify, etc.)
+	CoverData   []byte // Raw cover image data (for processing/compression)
 	Tracks      []ImportedTrack
 }
