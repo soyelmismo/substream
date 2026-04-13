@@ -93,16 +93,24 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		}
 		// [GAPLESS] Return cached result if within 10-minute window (HLS manifests last ~10 min)
 		if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute {
-			log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
-			// Redirect using cached URL
-			urlPreview := lock.prep.StreamURL
-			if len(urlPreview) > 100 {
-				urlPreview = urlPreview[:100]
+			// Check if client can handle the cached stream type
+			clientNeedsHelp := doesntSupportHLS(p.GetOr("c", ""))
+			if lock.prep.IsHLS && clientNeedsHelp {
+				// Client doesn't support HLS natively - can't redirect to HLS manifest
+				// Proceed with normal processing to do HLS stitching
+				log.Printf("[STREAM] GAPLESS cache hit for HLS track=%d, but client needs stitching - processing normally", id.Value())
+			} else {
+				// Safe to redirect to cached URL
+				log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
+				urlPreview := lock.prep.StreamURL
+				if len(urlPreview) > 100 {
+					urlPreview = urlPreview[:100]
+				}
+				log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s (cached)",
+					id.Value(), lock.prep.IsHLS, urlPreview)
+				http.Redirect(w, r, lock.prep.StreamURL, http.StatusFound)
+				return nil
 			}
-			log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s (cached)",
-				id.Value(), lock.prep.IsHLS, urlPreview)
-			http.Redirect(w, r, lock.prep.StreamURL, http.StatusFound)
-			return nil
 		}
 		// Cache expired, clean up and proceed with new request
 		c.streamLocks.Delete(streamKey)
