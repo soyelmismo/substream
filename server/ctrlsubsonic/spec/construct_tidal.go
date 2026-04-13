@@ -55,13 +55,14 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", coverIDValue)}
 
 	// Determine quality and suffix first
-	suffix := "flac"
-	bitrate := 1411
-	contentType := "audio/flac"
-	if t.AudioQuality == "HIGH" || t.AudioQuality == "LOW" {
-		bitrate = 320
-		contentType = "audio/mp4"
-		suffix = "m4a"
+	// [NOTE] For LOSSLESS/HI_RES_LOSSLESS, we use .m4a extension in path because
+	// we don't know if the stream will be BTS (native FLAC) or HLS (fMP4 container).
+	// The actual audio quality is lossless in both cases.
+	suffix := "m4a"
+	bitrate := 320
+	contentType := "audio/mp4"
+	if t.AudioQuality == "LOSSLESS" || t.AudioQuality == "HI_RES_LOSSLESS" {
+		bitrate = 1411
 	}
 
 	// Build user-friendly path: audio/artista/NN. artista - titulo.formato

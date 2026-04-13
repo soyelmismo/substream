@@ -107,22 +107,26 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 			continue
 		}
 
-		// Determine extension based on stream type and quality
-		// HLS streams use fMP4 container even for LOSSLESS, so always .m4a for HLS
+		// Determine extension based on quality and stream type
+		// HLS LOSSLESS uses fMP4 container, BTS LOSSLESS uses native FLAC
 		isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
 		ext := "m4a" // Default AAC/MP4
-		if !isHLS {
-			// For non-HLS (BTS/progressive), FLAC is actually FLAC
-			switch tidalQuality {
-			case "LOSSLESS", "HI_RES_LOSSLESS":
-				ext = "flac"
+		switch tidalQuality {
+		case "LOSSLESS", "HI_RES_LOSSLESS":
+			if isHLS {
+				ext = "m4a" // fMP4 container for HLS
+			} else {
+				ext = "flac" // Native FLAC for BTS
 			}
-		}
-		// Fallback to URL detection
-		if strings.Contains(streamURL, ".flac") {
-			ext = "flac"
-		} else if strings.Contains(streamURL, ".mp3") {
-			ext = "mp3"
+		case "LOW", "HIGH":
+			ext = "m4a"
+		default:
+			// Fallback to URL detection for unknown qualities
+			if strings.Contains(streamURL, ".flac") {
+				ext = "flac"
+			} else if strings.Contains(streamURL, ".mp3") {
+				ext = "mp3"
+			}
 		}
 
 		trackFile := fmt.Sprintf("%02d - %s.%s", track.TrackNumber, track.Title, ext)

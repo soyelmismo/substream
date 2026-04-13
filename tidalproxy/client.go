@@ -1201,12 +1201,17 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 
 	switch requestedQuality {
 	case "HI_RES_LOSSLESS":
+		// [CRITICAL] For HI_RES_LOSSLESS, prioritize BTS for native FLAC.
+		// Fallback to HLS if BTS fails (same quality, fMP4 container).
 		combos = append(combos, combo{"BTS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES", "MQA"}})
 		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
+		combos = append(combos, combo{"HLS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES", "MQA"}})
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
 		combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
 	case "LOSSLESS":
+		// [CRITICAL] For LOSSLESS, prioritize BTS for native FLAC.
+		// Fallback to HLS if BTS fails (same quality, fMP4 container).
 		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
