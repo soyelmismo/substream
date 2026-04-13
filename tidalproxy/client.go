@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+// highKarmaThreshold es el StreamScore mínimo para considerar un mirror de "alta confianza".
+// Cuando el mejor mirror supera este umbral, usamos solo 1 concurrente en lugar del shotgun de 3.
+// Esto reduce la carga en mirrors confiables mientras mantenemos el shotgun para mirrors nuevos o inestables.
+const highKarmaThreshold = 0.0
+
 // PoolConfig holds configuration for the proxy pool
 type PoolConfig struct {
 	HealthInterval time.Duration
@@ -1301,20 +1306,43 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 
 	// ¡DISPARAR EL ESCOPETAZO CON BATCHING PROGRESIVO!
 	// Procesar en batches de 3 para no saturar Tidal (mismo patrón que playlists)
-	const batchSize = 3
+	// [OPTIMIZACIÓN KARMA] Si el mejor mirror tiene alto karma, usamos solo 1 concurrente
+	// ya que tenemos suficiente evidencia histórica de que es confiable.
+	defaultBatchSize := 3
+	batchSize := defaultBatchSize
+
+	// Verificar si el primer mirror tiene alto karma (alto StreamScore) y es BTS
+	if len(tasks) > 0 && len(mirrors) > 0 {
+		bestMirror := mirrors[0]
+		bestScore := bestMirror.GetStreamScore()
+		if bestScore >= highKarmaThreshold && tasks[0].ManifestType == "BTS" {
+			// El mejor mirror tiene alto karma y la primera tarea es BTS (progresivo)
+			// Reducimos a 1 concurrente para no saturar mirrors confiables
+			batchSize = 1
+			log.Printf("[SHOTGUN] 🎖️ ALTO KARMA detectado: %s (score=%.1f >= %.1f). Usando 1 concurrente en lugar de 3",
+				bestMirror.URL, bestScore, highKarmaThreshold)
+		}
+	}
+
 	var errorsList []string
 	var isUnavailable bool
 	var bestResult *streamResult
+	highKarmaFailed := false
 
-	for batchNum := 0; batchNum < len(tasks); batchNum += batchSize {
+	// Usar índice manual para permitir cambio dinámico de batchSize
+	batchNum := 0
+	batchCount := 0
+	for batchNum < len(tasks) {
+		batchCount++
 		end := batchNum + batchSize
 		if end > len(tasks) {
 			end = len(tasks)
 		}
 		batch := tasks[batchNum:end]
 
+		actualBatchSize := len(batch)
 		log.Printf("[SHOTGUN] Batch %d/%d: Disparando %d peticiones para track %d",
-			batchNum/batchSize+1, (len(tasks)+batchSize-1)/batchSize, len(batch), trackID)
+			batchCount, (len(tasks)+defaultBatchSize-1)/defaultBatchSize, actualBatchSize, trackID)
 
 		// Procesar este batch
 		batchResult, batchErrors, batchUnavailable, foundExact := p.executeBatch(ctx, batch, trackID, clientIP, requestedQuality, bestResult)
@@ -1337,8 +1365,21 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 			}
 		}
 
+		// [FALLBACK KARMA] Si estábamos en modo alto karma (batchSize=1) y falló,
+		// expandir a shotgun completo con los mirrors restantes
+		if batchSize == 1 && batchResult == nil && !highKarmaFailed {
+			log.Printf("[SHOTGUN] 🔄 Fallback: Mirror de alto karma falló, expandiendo a shotgun de %d", defaultBatchSize)
+			batchSize = defaultBatchSize
+			highKarmaFailed = true
+			// No incrementar batchNum - reintentar desde el inicio con shotgun completo
+			continue
+		}
+
+		// Avanzar al siguiente batch
+		batchNum += batchSize
+
 		// Breve pausa entre batches para no saturar (excepto si es el último)
-		if end < len(tasks) {
+		if batchNum < len(tasks) && !(highKarmaFailed && batchSize == defaultBatchSize && batchNum == defaultBatchSize) {
 			select {
 			case <-time.After(50 * time.Millisecond):
 				// Pausa entre batches
