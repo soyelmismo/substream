@@ -273,6 +273,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	c.Handle("/getPodcasts", chain(resp(c.ServeGetPodcasts)))
 
 	// Lyrics
+	c.Handle("/getLyrics", chain(resp(c.ServeGetLyrics)))
 	c.Handle("/getLyricsBySongId", chain(resp(c.ServeGetLyricsBySongID)))
 
 	c.Handle("/", chain(resp(c.ServeNotFound)))

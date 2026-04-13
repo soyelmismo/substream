@@ -42,12 +42,12 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	var favArtists []*spec.Artist
 	var favAlbums []*spec.Album
 
-	// Check cache
+	// Check cache - only use if there are exact matches (avoid fuzzy false positives)
 	if cached := c.searchCache.Get(query); len(cached.tracks) > 0 || len(cached.artists) > 0 || len(cached.albums) > 0 {
-		tracks = cached.tracks
-		artists = cached.artists
-		albums = cached.albums
-		fromCache = true
+		tracks = filterExactMatches(cached.tracks, query, func(t spec.TrackChild) string { return t.Title + " " + t.Artist })
+		artists = filterExactMatches(cached.artists, query, func(a spec.Artist) string { return a.Name })
+		albums = filterExactMatches(cached.albums, query, func(a spec.Album) string { return a.Name + " " + a.Artist })
+		fromCache = len(tracks) > 0 || len(artists) > 0 || len(albums) > 0
 	}
 
 	// Respect counts from client. If 0 is sent, don't search that type.
@@ -760,4 +760,26 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	sub := spec.NewResponse()
 	sub.StarredTwo = results
 	return sub
+}
+
+// filterExactMatches returns only items where getText(item) contains all query terms
+func filterExactMatches[T any](items []T, query string, getText func(T) string) []T {
+	queryLower := strings.ToLower(query)
+	queryTerms := strings.Fields(queryLower)
+
+	var filtered []T
+	for _, item := range items {
+		text := strings.ToLower(getText(item))
+		matchesAll := true
+		for _, term := range queryTerms {
+			if !strings.Contains(text, term) {
+				matchesAll = false
+				break
+			}
+		}
+		if matchesAll {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }

@@ -1261,7 +1261,7 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 			batchNum/batchSize+1, (len(tasks)+batchSize-1)/batchSize, len(batch), trackID)
 
 		// Procesar este batch
-		batchResult, batchErrors, batchUnavailable := p.executeBatch(ctx, batch, trackID, clientIP, requestedQuality, bestResult)
+		batchResult, batchErrors, batchUnavailable, foundExact := p.executeBatch(ctx, batch, trackID, clientIP, requestedQuality, bestResult)
 
 		// Acumular errores
 		errorsList = append(errorsList, batchErrors...)
@@ -1269,10 +1269,12 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 			isUnavailable = true
 		}
 
-		// executeBatch ya retorna inmediatamente si encuentra fast path (calidad exacta o upgrade FLAC)
-		// Si tenemos un resultado válido aquí, es porque no era fast path pero podría ser útil para batches siguientes
+		// FAST PATH: Si encontramos calidad exacta, retornar inmediatamente sin más batches
+		if foundExact && batchResult != nil && batchResult.URL != "" {
+			return batchResult.URL, nil
+		}
 
-		// Actualizar bestResult si este batch tiene algo mejor
+		// Actualizar bestResult si este batch tiene algo mejor (para fallback si no hay exact match)
 		if batchResult != nil && batchResult.URL != "" {
 			if bestResult == nil || isBetterResult(batchResult, bestResult) {
 				bestResult = batchResult
@@ -1319,7 +1321,8 @@ func min(a, b int) int {
 
 // executeBatch processes a batch of stream tasks with grace period logic
 // Returns immediately (fast path) if the requested quality is found
-func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int, clientIP string, requestedQuality string, currentBest *streamResult) (*streamResult, []string, bool) {
+// Returns (result, errors, isUnavailable, foundExact) where foundExact indicates if the exact requested quality was matched
+func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int, clientIP string, requestedQuality string, currentBest *streamResult) (*streamResult, []string, bool, bool) {
 	shotgunCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1354,7 +1357,7 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 					log.Printf("[SHOTGUN] 🎯 FAST PATH track %d: %s (%s/%s) desde %s en %v",
 						trackID, formatType, res.ManifestType, res.Quality, res.Mirror.URL, res.Latency)
 					cancel() // Cancelar otras peticiones del batch
-					return &res, errorsList, isUnavailable
+					return &res, errorsList, isUnavailable, true
 				}
 
 				// BONUS: FLAC encontrado cuando se pidió AAC
@@ -1362,7 +1365,7 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 					log.Printf("[SHOTGUN] 🎯 BONUS UPGRADE track %d: FLAC encontrado (pidió AAC), desde %s en %v",
 						trackID, res.Mirror.URL, res.Latency)
 					cancel()
-					return &res, errorsList, isUnavailable
+					return &res, errorsList, isUnavailable, true
 				}
 
 				// Guardar mejor resultado del batch
@@ -1387,15 +1390,15 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 			return nil
 		}():
 			// Grace period expirado, devolver lo mejor del batch
-			return batchBest, errorsList, isUnavailable
+			return batchBest, errorsList, isUnavailable, false
 
 		case <-ctx.Done():
-			return nil, errorsList, isUnavailable
+			return nil, errorsList, isUnavailable, false
 		}
 	}
 
 	// Batch completado
-	return batchBest, errorsList, isUnavailable
+	return batchBest, errorsList, isUnavailable, false
 }
 
 // isBetterResult determina si un resultado de stream es mejor que otro
