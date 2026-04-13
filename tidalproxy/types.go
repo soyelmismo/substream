@@ -17,8 +17,8 @@ type TidalTrack struct {
 
 // TidalAlbumRef is the inline album reference inside a track
 type TidalAlbumRef struct {
-	ID    int    `json:"id"`
-	Title string `json:"title"`
+	ID          int    `json:"id"`
+	Title       string `json:"title"`
 	Cover       string `json:"cover"`
 	ReleaseDate string `json:"releaseDate"`
 }
@@ -103,4 +103,18 @@ type TidalSearchResult struct {
 
 type TidalSearchItems struct {
 	Items []interface{} `json:"items"`
+}
+
+// TidalPlaylist maps to hifi-api /playlist/ response
+type TidalPlaylist struct {
+	UUID        string       `json:"uuid"`
+	Title       string       `json:"title"`
+	Description string       `json:"description"`
+	Image       string       `json:"image"`
+	SquareImage string       `json:"squareImage"`
+	Tracks      []TidalTrack `json:"tracks"`
+	// Raw items from hifi-api response (may contain extra metadata)
+	Items []struct {
+		Item TidalTrack `json:"item"`
+	} `json:"items,omitempty"`
 }

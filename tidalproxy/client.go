@@ -174,6 +174,12 @@ func classifyError(err error) ErrorCategory {
 		return ErrorTrackUnavailable
 	}
 
+	// 400 with "upstream api error" usually means proxy's Tidal credentials expired
+	// Retry with another proxy instead of failing permanently
+	if strings.Contains(errStr, "400") && strings.Contains(lowerErr, "upstream api error") {
+		return ErrorAuthExpired
+	}
+
 	// Network/timeout errors - retry
 	if strings.Contains(lowerErr, "timeout") ||
 		strings.Contains(lowerErr, "deadline exceeded") ||
@@ -1237,84 +1243,136 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 		}
 	}
 
-	// ¡DISPARAR EL ESCOPETAZO!
-	shotgunCtx, cancelShotgun := context.WithCancel(ctx)
-	defer cancelShotgun()
+	// ¡DISPARAR EL ESCOPETAZO CON BATCHING PROGRESIVO!
+	// Procesar en batches de 3 para no saturar Tidal (mismo patrón que playlists)
+	const batchSize = 3
+	var errorsList []string
+	var isUnavailable bool
+	var bestResult *streamResult
+
+	for batchNum := 0; batchNum < len(tasks); batchNum += batchSize {
+		end := batchNum + batchSize
+		if end > len(tasks) {
+			end = len(tasks)
+		}
+		batch := tasks[batchNum:end]
+
+		log.Printf("[SHOTGUN] Batch %d/%d: Disparando %d peticiones para track %d",
+			batchNum/batchSize+1, (len(tasks)+batchSize-1)/batchSize, len(batch), trackID)
+
+		// Procesar este batch
+		batchResult, batchErrors, batchUnavailable := p.executeBatch(ctx, batch, trackID, clientIP, requestedQuality, bestResult)
+
+		// Acumular errores
+		errorsList = append(errorsList, batchErrors...)
+		if batchUnavailable {
+			isUnavailable = true
+		}
+
+		// executeBatch ya retorna inmediatamente si encuentra fast path (calidad exacta o upgrade FLAC)
+		// Si tenemos un resultado válido aquí, es porque no era fast path pero podría ser útil para batches siguientes
+
+		// Actualizar bestResult si este batch tiene algo mejor
+		if batchResult != nil && batchResult.URL != "" {
+			if bestResult == nil || isBetterResult(batchResult, bestResult) {
+				bestResult = batchResult
+			}
+		}
+
+		// Breve pausa entre batches para no saturar (excepto si es el último)
+		if end < len(tasks) {
+			select {
+			case <-time.After(50 * time.Millisecond):
+				// Pausa entre batches
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+	}
+
+	// Todos los batches procesados. Retornar el mejor resultado si lo hay.
+	if bestResult != nil {
+		formatType := "AAC/HLS"
+		if strings.Contains(bestResult.Quality, "LOSSLESS") || strings.Contains(bestResult.Quality, "FLAC") {
+			formatType = "FLAC"
+		}
+		log.Printf("[SHOTGUN] 🏆 track %d: %s (%s/%s) desde %s en %v",
+			trackID, formatType, bestResult.ManifestType, bestResult.Quality, bestResult.Mirror.URL, bestResult.Latency)
+		return bestResult.URL, nil
+	}
+
+	if isUnavailable {
+		log.Printf("[SHOTGUN] 🚫 Track %d no disponible globalmente (Preview/Region Locked)", trackID)
+	}
+
+	return "", fmt.Errorf("escopetazo fallido, %d batches procesados. Logs: %s",
+		(len(tasks)+batchSize-1)/batchSize, strings.Join(errorsList, " | "))
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// executeBatch processes a batch of stream tasks with grace period logic
+// Returns immediately (fast path) if the requested quality is found
+func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int, clientIP string, requestedQuality string, currentBest *streamResult) (*streamResult, []string, bool) {
+	shotgunCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	results := make(chan streamResult, len(tasks))
-	log.Printf("[SHOTGUN] Disparando %d peticiones paralelas para track %d", len(tasks), trackID)
-
 	for _, t := range tasks {
 		go func(task streamTask) {
 			results <- p.executeStreamTask(shotgunCtx, task, trackID, clientIP)
 		}(t)
 	}
 
-	// Evaluar resultados al vuelo
 	var errorsList []string
 	var isUnavailable bool
-
-	var bestResult *streamResult
-	gracePeriod := 300 * time.Millisecond // Esperar 300ms por un BTS si un HLS contesta primero
+	var batchBest *streamResult
+	gracePeriod := 300 * time.Millisecond
 	var graceTimer *time.Timer
 
 	for i := 0; i < len(tasks); i++ {
 		select {
 		case res := <-results:
-			// Reportar estado al manager (filtrando falsos positivos)
+			// Reportar estado al manager
 			if p.mirrorMgr != nil {
 				p.mirrorMgr.ReportResult(res.Mirror, res.Latency, filterMirrorError(res.Err))
 			}
 
 			if res.Err == nil && res.URL != "" {
-				formatType := "AAC"
-				if strings.Contains(res.Quality, "LOSSLESS") || strings.Contains(res.Quality, "FLAC") {
-					formatType = "FLAC"
-				}
-
-				// FAST PATH: Si encontramos la calidad solicitada, entregar inmediatamente
-				// sin esperar grace period. El usuario ya tiene lo que pidió.
+				// FAST PATH: Calidad solicitada encontrada
 				if res.Quality == requestedQuality {
+					formatType := "AAC"
+					if strings.Contains(res.Quality, "LOSSLESS") || strings.Contains(res.Quality, "FLAC") {
+						formatType = "FLAC"
+					}
 					log.Printf("[SHOTGUN] 🎯 FAST PATH track %d: %s (%s/%s) desde %s en %v",
 						trackID, formatType, res.ManifestType, res.Quality, res.Mirror.URL, res.Latency)
-					return res.URL, nil
+					cancel() // Cancelar otras peticiones del batch
+					return &res, errorsList, isUnavailable
 				}
 
-				// BONUS: Si encontramos FLAC pero el usuario pidió AAC, igual entregamos
-				// (mejor calidad de la solicitada = win inmediato)
+				// BONUS: FLAC encontrado cuando se pidió AAC
 				if (res.Quality == "LOSSLESS" || res.Quality == "HI_RES_LOSSLESS") && requestedQuality == "HIGH" {
 					log.Printf("[SHOTGUN] 🎯 BONUS UPGRADE track %d: FLAC encontrado (pidió AAC), desde %s en %v",
 						trackID, res.Mirror.URL, res.Latency)
-					return res.URL, nil
+					cancel()
+					return &res, errorsList, isUnavailable
 				}
 
-				// No es lo solicitado, pero funciona. Guardarlo y esperar grace period.
-				if bestResult == nil {
-					bestResult = &res
-					// Iniciar periodo de gracia por si viene la calidad solicitada
+				// Guardar mejor resultado del batch
+				if batchBest == nil || isBetterResult(&res, batchBest) {
+					batchBest = &res
 					graceTimer = time.NewTimer(gracePeriod)
-				} else {
-					// Si este nuevo resultado es mejor, lo reemplazamos
-					// Mejor = BTS sobre HLS, o FLAC sobre AAC
-					isNewBetter := false
-					if res.ManifestType == "BTS" && bestResult.ManifestType == "HLS" {
-						isNewBetter = true
-					}
-					// Si ambos son HLS, priorizar FLAC sobre AAC
-					if res.ManifestType == "HLS" && bestResult.ManifestType == "HLS" {
-						if (res.Quality == "LOSSLESS" || res.Quality == "HI_RES_LOSSLESS") &&
-							(bestResult.Quality == "HIGH" || bestResult.Quality == "LOW") {
-							isNewBetter = true
-							log.Printf("[SHOTGUN] 🔄 UPGRADE: Reemplazando AAC por FLAC (%s -> %s)",
-								bestResult.Quality, res.Quality)
-						}
-					}
-					if isNewBetter {
-						bestResult = &res
-					}
 				}
 			} else if res.Err != nil {
-				errorsList = append(errorsList, fmt.Sprintf("%s (%s/%s): %v", res.Mirror.URL, res.ManifestType, res.Quality, res.Err))
+				errorsList = append(errorsList, fmt.Sprintf("%s (%s/%s): %v",
+					res.Mirror.URL, res.ManifestType, res.Quality, res.Err))
 				if strings.Contains(strings.ToLower(res.Err.Error()), "preview") ||
 					strings.Contains(strings.ToLower(res.Err.Error()), "region") ||
 					strings.Contains(strings.ToLower(res.Err.Error()), "restricted") {
@@ -1328,46 +1386,31 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 			}
 			return nil
 		}():
-			// Expiró el periodo de gracia, devolver lo mejor que tengamos
-			if bestResult != nil {
-				formatType := "AAC/HLS"
-				if strings.Contains(bestResult.Quality, "LOSSLESS") || strings.Contains(bestResult.Quality, "FLAC") {
-					formatType = "FLAC"
-				}
-				log.Printf("[SHOTGUN] ⏱️ GRACIA AGOTADA track %d: Entregando %s (%s/%s) desde %s",
-					trackID, formatType, bestResult.ManifestType, bestResult.Quality, bestResult.Mirror.URL)
-				return bestResult.URL, nil
-			}
+			// Grace period expirado, devolver lo mejor del batch
+			return batchBest, errorsList, isUnavailable
 
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return nil, errorsList, isUnavailable
 		}
 	}
 
-	// Terminaron todas las tareas. Si hay un ganador rezagado, devolverlo.
-	if bestResult != nil {
-		formatType := "AAC/HLS"
-		if strings.Contains(bestResult.Quality, "LOSSLESS") || strings.Contains(bestResult.Quality, "FLAC") {
-			formatType = "FLAC"
-		}
-		log.Printf("[SHOTGUN] 🏆 CONSOLACION track %d: %s (%s/%s) desde %s en %v",
-			trackID, formatType, bestResult.ManifestType, bestResult.Quality, bestResult.Mirror.URL, bestResult.Latency)
-		return bestResult.URL, nil
-	}
-
-	if isUnavailable {
-		log.Printf("[SHOTGUN] 🚫 Track %d no disponible globalmente (Preview/Region Locked)", trackID)
-	}
-
-	return "", fmt.Errorf("escopetazo fallido, %d peticiones dieron error. Logs: %s", len(tasks), strings.Join(errorsList, " | "))
+	// Batch completado
+	return batchBest, errorsList, isUnavailable
 }
 
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
+// isBetterResult determina si un resultado de stream es mejor que otro
+// Prioridad: BTS > HLS, FLAC > AAC
+func isBetterResult(new, current *streamResult) bool {
+	if new.ManifestType == "BTS" && current.ManifestType == "HLS" {
+		return true
 	}
-	return b
+	if new.ManifestType == "HLS" && current.ManifestType == "HLS" {
+		if (new.Quality == "LOSSLESS" || new.Quality == "HI_RES_LOSSLESS") &&
+			(current.Quality == "HIGH" || current.Quality == "LOW") {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pool) GetCoverURL(coverUUID string, size int) string {
@@ -1584,6 +1627,322 @@ func parseManifestURL(trackID int, version, mimeType, manifest string) (string, 
 	}
 
 	return "", fmt.Errorf("could not extract URL from manifest (type: %s content preview: %.50s)", mimeType, content)
+}
+
+// GetPlaylist fetches playlist metadata and items from hifi-api using shotgun approach
+// Parallel requests to tier HIGH mirrors with progressive batching, first successful wins.
+// Supports pagination.
+func (p *Pool) GetPlaylist(ctx context.Context, playlistUUID string) (*TidalPlaylist, error) {
+	const maxLimit = 100 // Reduced from 500 - some proxies reject high limit values
+
+	var allTracks []TidalTrack
+	var playlistInfo TidalPlaylist
+	offset := 0
+
+	for {
+		q := url.Values{
+			"id":     {playlistUUID},
+			"limit":  {fmt.Sprintf("%d", maxLimit)},
+			"offset": {fmt.Sprintf("%d", offset)},
+		}
+
+		log.Printf("[TIDAL:PLAYLIST] Fetching playlist %s offset=%d limit=%d", playlistUUID, offset, maxLimit)
+
+		// Use shotgun approach with progressive batching (3 mirrors at a time)
+		body, err := p.shotgunRequest(ctx, "/playlist/", q, TierHigh)
+		if err != nil {
+			// Provide more context for common errors
+			errStr := err.Error()
+			if strings.Contains(errStr, "400") {
+				return nil, fmt.Errorf("playlist unavailable (may be private, deleted, or Tidal API error): %w", err)
+			}
+			if strings.Contains(errStr, "404") {
+				return nil, fmt.Errorf("playlist not found: %w", err)
+			}
+			if strings.Contains(errStr, "401") || strings.Contains(errStr, "403") {
+				return nil, fmt.Errorf("access denied - playlist may be private: %w", err)
+			}
+			return nil, fmt.Errorf("fetch playlist page at offset %d: %w", offset, err)
+		}
+
+		var resp struct {
+			Playlist TidalPlaylist `json:"playlist"`
+			Items    []struct {
+				Item TidalTrack `json:"item"`
+			} `json:"items"`
+		}
+
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("decode playlist page at offset %d: %w", offset, err)
+		}
+
+		// Save playlist info from first page
+		if offset == 0 {
+			playlistInfo = resp.Playlist
+		}
+
+		// Extract tracks from this page
+		pageTracks := make([]TidalTrack, 0, len(resp.Items))
+		for _, item := range resp.Items {
+			pageTracks = append(pageTracks, item.Item)
+		}
+
+		allTracks = append(allTracks, pageTracks...)
+
+		// If we got fewer than maxLimit tracks, we've reached the end
+		if len(pageTracks) < maxLimit {
+			break
+		}
+
+		offset += maxLimit
+	}
+
+	playlistInfo.Tracks = allTracks
+	return &playlistInfo, nil
+}
+
+// shotgunRequest fires parallel requests to multiple mirrors across all tiers with cascading fallback
+// Uses progressive batching: processes mirrors in batches of 3, moving to next batch only if current fails
+// preferredTier determines priority order: HIGH→MEDIUM→LOW, MEDIUM→HIGH→LOW, LOW→MEDIUM→HIGH
+func (p *Pool) shotgunRequest(ctx context.Context, path string, query url.Values, preferredTier LatencyTier) ([]byte, error) {
+	const batchSize = 3
+
+	// Define tier order based on preference
+	var tierOrder []LatencyTier
+	switch preferredTier {
+	case TierHigh:
+		tierOrder = []LatencyTier{TierHigh, TierMedium, TierLow}
+	case TierMedium:
+		tierOrder = []LatencyTier{TierMedium, TierHigh, TierLow}
+	case TierLow:
+		tierOrder = []LatencyTier{TierLow, TierMedium, TierHigh}
+	default:
+		tierOrder = []LatencyTier{TierHigh, TierMedium, TierLow}
+	}
+
+	var allErrors []string
+
+	// Try each tier in order until one succeeds
+	for tierIdx, tier := range tierOrder {
+		mirrors := p.getMirrorsForTier(tier)
+
+		if len(mirrors) == 0 {
+			continue
+		}
+
+		// Add small delay between tier attempts to avoid thundering herd
+		// First tier starts immediately, subsequent tiers wait briefly
+		if tierIdx > 0 {
+			select {
+			case <-time.After(100 * time.Millisecond):
+				// Brief pause between tiers
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		// Process mirrors in progressive batches of batchSize
+		// This avoids overwhelming Tidal when all proxies are active
+		for batchNum := 0; batchNum < len(mirrors); batchNum += batchSize {
+			end := batchNum + batchSize
+			if end > len(mirrors) {
+				end = len(mirrors)
+			}
+			batch := mirrors[batchNum:end]
+
+			log.Printf("[PLAYLIST:SHOTGUN] Tier %v batch %d/%d: firing %d parallel requests to %s",
+				tier, batchNum/batchSize+1, (len(mirrors)+batchSize-1)/batchSize, len(batch), path)
+
+			body, err := p.shotgunWithMirrors(ctx, path, query, batch)
+			if err == nil {
+				return body, nil
+			}
+
+			// This batch failed, add to errors and continue to next batch
+			allErrors = append(allErrors, fmt.Sprintf("tier %v batch %d: %v", tier, batchNum/batchSize+1, err))
+
+			// Small delay between batches within the same tier
+			if end < len(mirrors) {
+				select {
+				case <-time.After(50 * time.Millisecond):
+					// Brief pause between batches
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+		}
+
+		log.Printf("[PLAYLIST:SHOTGUN] Tier %v failed after all batches, trying next tier...", tier)
+	}
+
+	return nil, fmt.Errorf("all tiers failed: %s", strings.Join(allErrors, "; "))
+}
+
+// getMirrorsForTier returns healthy mirrors for a specific tier
+func (p *Pool) getMirrorsForTier(tier LatencyTier) []*Mirror {
+	var mirrors []*Mirror
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.mirrorMgr == nil {
+		return mirrors
+	}
+
+	switch tier {
+	case TierHigh:
+		highMirrors := p.mirrorMgr.GetMirrorsForCache()
+		for _, m := range highMirrors {
+			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
+				mirrors = append(mirrors, m)
+			}
+		}
+	case TierMedium:
+		medMirrors := p.mirrorMgr.GetMirrorsByTierWithFallback(TierMedium, 5)
+		for _, m := range medMirrors {
+			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
+				mirrors = append(mirrors, m)
+			}
+		}
+	case TierLow:
+		lowMirrors := p.mirrorMgr.GetMirrorsByTierWithFallback(TierLow, 5)
+		for _, m := range lowMirrors {
+			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
+				mirrors = append(mirrors, m)
+			}
+		}
+	}
+
+	return mirrors
+}
+
+// shotgunWithMirrors performs shotgun request with specific mirror list
+func (p *Pool) shotgunWithMirrors(ctx context.Context, path string, query url.Values, mirrors []*Mirror) ([]byte, error) {
+	if len(mirrors) == 0 {
+		return nil, fmt.Errorf("no mirrors available")
+	}
+
+	// Shotgun context - cancels all pending requests when first succeeds
+	shotgunCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		body []byte
+		err  error
+		m    *Mirror
+	}
+
+	results := make(chan result, len(mirrors))
+
+	// Fire all requests in parallel
+	for _, m := range mirrors {
+		go func(mirror *Mirror) {
+			body, err := p.fetchFromMirror(shotgunCtx, path, query, mirror)
+			results <- result{body: body, err: err, m: mirror}
+		}(m)
+	}
+
+	// Collect results - first successful wins
+	var errorsList []string
+	for i := 0; i < len(mirrors); i++ {
+		select {
+		case res := <-results:
+			if res.err == nil && len(res.body) > 0 {
+				cancel()
+				log.Printf("[PLAYLIST:SHOTGUN] Winner: %s", res.m.URL)
+				return res.body, nil
+			}
+			if res.err != nil {
+				errorsList = append(errorsList, fmt.Sprintf("%s: %v", res.m.URL, res.err))
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, fmt.Errorf("all %d mirrors failed: %s", len(mirrors), strings.Join(errorsList, "; "))
+}
+
+// fetchFromMirror performs a single request to a specific mirror
+func (p *Pool) fetchFromMirror(ctx context.Context, path string, query url.Values, m *Mirror) ([]byte, error) {
+	// Track active requests
+	m.activeRequests.Add(1)
+	defer m.activeRequests.Add(-1)
+
+	u := m.URL + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+
+	// Debug: log the exact URL being requested (truncate query params for privacy if needed)
+	log.Printf("[TIDAL:FETCH] %s -> URL: %s", m.URL, u)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	start := time.Now()
+	resp, err := p.client.Do(req)
+	latency := time.Since(start)
+
+	if err != nil {
+		log.Printf("[TIDAL:FETCH] %s -> Network error: %v (took %v)", m.URL, err, latency)
+		if p.mirrorMgr != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		bodyPreview := string(body)
+		if len(bodyPreview) > 200 {
+			bodyPreview = bodyPreview[:200] + "..."
+		}
+		log.Printf("[TIDAL:FETCH] %s -> HTTP %d: %s (took %v)", m.URL, resp.StatusCode, bodyPreview, latency)
+		err := fmt.Errorf("upstream returned %d: %s", resp.StatusCode, string(body))
+		if p.mirrorMgr != nil {
+			// Don't penalize 4xx errors - they're API/auth issues not mirror issues
+			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+				p.mirrorMgr.ReportResult(m, latency, err)
+			} else {
+				p.mirrorMgr.ReportResult(m, latency, nil)
+			}
+		}
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if err != nil {
+		if p.mirrorMgr != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return nil, err
+	}
+
+	// Validate JSON
+	if len(body) > 0 && body[0] == '<' {
+		htmlPreview := string(body)
+		if len(htmlPreview) > 100 {
+			htmlPreview = htmlPreview[:100] + "..."
+		}
+		err := fmt.Errorf("returned HTML instead of JSON: %s", htmlPreview)
+		if p.mirrorMgr != nil {
+			p.mirrorMgr.ReportResult(m, latency, err)
+		}
+		return nil, err
+	}
+
+	if p.mirrorMgr != nil {
+		p.mirrorMgr.ReportResult(m, latency, nil)
+	}
+
+	return body, nil
 }
 
 // ClearAll is a no-op for Pool as it has no internal caches

@@ -32,7 +32,7 @@ type JobManager struct {
 // NewJobManager creates a new import job manager
 func NewJobManager(dbc *db.DB, proxy tidalproxy.TidalProxy) *JobManager {
 	return &JobManager{
-		registry:  NewRegistry(),
+		registry:  NewRegistry(proxy),
 		semaphore: make(chan struct{}, maxConcurrentImports),
 		db:        dbc,
 		proxy:     proxy,
@@ -164,9 +164,23 @@ func (jm *JobManager) runJob(ctx context.Context, cancel context.CancelFunc, pla
 	}
 }
 
-// findTrack searches for a track in Tidal by ISRC or text
+// findTrack searches for a track in Tidal by ID, ISRC, or text
+// Priority: TidalID (direct) > ISRC > Text search
 func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) int {
-	// Try ISRC first if available
+	// Priority 1: Use TidalID directly if available (from Tidal playlist import)
+	// This avoids unnecessary search calls to the proxy
+	if track.TidalID > 0 {
+		// Verify the track exists by fetching its info
+		if _, err := jm.proxy.GetTrackInfo(ctx, track.TidalID); err == nil {
+			log.Printf("[IMPORT] Direct ID match: %d (%s - %s)", track.TidalID, track.Artist, track.Title)
+			return track.TidalID
+		}
+		// Track ID exists but fetch failed - fall through to search
+		log.Printf("[IMPORT] TidalID %d failed validation, falling back to search (%s - %s)",
+			track.TidalID, track.Artist, track.Title)
+	}
+
+	// Priority 2: Try ISRC if available
 	if track.ISRC != "" {
 		tidalTrack := jm.searchByISRC(ctx, track.ISRC)
 		if tidalTrack != nil {
@@ -174,8 +188,7 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) int {
 		}
 	}
 
-	// Fallback to text search (with album for better matching)
-	// Debug: log album info
+	// Priority 3: Fallback to text search (with album for better matching)
 	if track.Album == "" {
 		log.Printf("[IMPORT DEBUG] No album info for track: %s - %s", track.Artist, track.Title)
 	}

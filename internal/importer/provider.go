@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"sync"
+
+	"go.senan.xyz/gonic/tidalproxy"
 )
 
 // Provider defines the interface for external playlist sources
@@ -23,13 +25,15 @@ type Registry struct {
 }
 
 // NewRegistry creates a new provider registry with default providers
-func NewRegistry() *Registry {
+// If tidalProxy is provided, it will be used by the TidalProvider
+func NewRegistry(tidalProxy tidalproxy.TidalProxy) *Registry {
 	r := &Registry{
 		providers: make([]Provider, 0),
 	}
 	// Register default providers
 	r.Register(&SpotifyProvider{})
 	r.Register(&DeezerProvider{})
+	r.Register(NewTidalProvider(tidalProxy))
 	return r
 }
 

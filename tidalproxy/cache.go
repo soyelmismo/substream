@@ -1028,6 +1028,12 @@ func (c *CachedProxy) Stats() CacheStats {
 	}
 }
 
+// GetPlaylist fetches playlist metadata and tracks (no caching for playlists)
+func (c *CachedProxy) GetPlaylist(ctx context.Context, playlistUUID string) (*TidalPlaylist, error) {
+	// Playlists are dynamic, don't cache them
+	return c.TidalProxy.GetPlaylist(ctx, playlistUUID)
+}
+
 // ClearAll clears all in-memory LRU caches
 func (c *CachedProxy) ClearAll() {
 	log.Printf("[CACHE] Clearing in-memory LRU caches...")

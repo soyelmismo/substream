@@ -59,6 +59,9 @@ type TidalProxy interface {
 	// Lyrics
 	GetLyrics(ctx context.Context, trackID int) (*TidalLyrics, error)
 
+	// Playlists
+	GetPlaylist(ctx context.Context, playlistUUID string) (*TidalPlaylist, error)
+
 	// Management
 	SetInstances(urls []string)
 	GetMirrorManager() *MirrorManager

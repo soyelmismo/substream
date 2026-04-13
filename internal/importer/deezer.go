@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 )
 
@@ -46,12 +45,12 @@ func (d *DeezerProvider) getClient() *http.Client {
 
 // Deezer API response structures
 type deezerPlaylistResponse struct {
-	ID          int               `json:"id"`
-	Title       string            `json:"title"`
-	Description string            `json:"description"`
-	Picture     string            `json:"picture"`
-	PictureBig  string            `json:"picture_big"`
-	Tracks      deezerTrackList   `json:"tracks"`
+	ID          int             `json:"id"`
+	Title       string          `json:"title"`
+	Description string          `json:"description"`
+	Picture     string          `json:"picture"`
+	PictureBig  string          `json:"picture_big"`
+	Tracks      deezerTrackList `json:"tracks"`
 }
 
 type deezerTrackList struct {
@@ -59,12 +58,12 @@ type deezerTrackList struct {
 }
 
 type deezerTrack struct {
-	ID       int           `json:"id"`
-	Title    string        `json:"title"`
-	Duration int           `json:"duration"`
-	Artist   deezerArtist  `json:"artist"`
-	Album    deezerAlbum   `json:"album"`
-	ISRC     string        `json:"isrc"`
+	ID       int          `json:"id"`
+	Title    string       `json:"title"`
+	Duration int          `json:"duration"`
+	Artist   deezerArtist `json:"artist"`
+	Album    deezerAlbum  `json:"album"`
+	ISRC     string       `json:"isrc"`
 }
 
 type deezerArtist struct {
@@ -73,9 +72,9 @@ type deezerArtist struct {
 }
 
 type deezerAlbum struct {
-	ID     int    `json:"id"`
-	Title  string `json:"title"`
-	Cover  string `json:"cover"`
+	ID    int    `json:"id"`
+	Title string `json:"title"`
+	Cover string `json:"cover"`
 }
 
 // Fetch retrieves playlist data from Deezer API
@@ -89,35 +88,35 @@ func (d *DeezerProvider) Fetch(ctx context.Context, playlistURL string) (*Import
 
 	// Fetch playlist from Deezer API
 	url := fmt.Sprintf("%s/playlist/%s", deezerAPIURL, playlistID)
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	req.Header.Set("User-Agent", deezerUserAgent)
-	
+
 	resp, err := d.getClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch playlist: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("deezer API returned %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	var playlist deezerPlaylistResponse
 	if err := json.NewDecoder(resp.Body).Decode(&playlist); err != nil {
 		return nil, fmt.Errorf("decode playlist: %w", err)
 	}
-	
+
 	// Check for API error
 	if playlist.ID == 0 && playlist.Title == "" {
 		return nil, fmt.Errorf("playlist not found or private")
 	}
-	
+
 	// Convert to ImportedPlaylist
 	result := &ImportedPlaylist{
 		Title:       playlist.Title,
@@ -125,7 +124,7 @@ func (d *DeezerProvider) Fetch(ctx context.Context, playlistURL string) (*Import
 		CoverURL:    playlist.PictureBig,
 		Tracks:      make([]ImportedTrack, 0, len(playlist.Tracks.Data)),
 	}
-	
+
 	// Convert tracks
 	for _, track := range playlist.Tracks.Data {
 		importedTrack := ImportedTrack{
@@ -136,11 +135,6 @@ func (d *DeezerProvider) Fetch(ctx context.Context, playlistURL string) (*Import
 		}
 		result.Tracks = append(result.Tracks, importedTrack)
 	}
-	
-	return result, nil
-}
 
-// isDeezerURL helper for quick URL detection
-func isDeezerURL(s string) bool {
-	return strings.Contains(s, "deezer.com/playlist/")
+	return result, nil
 }

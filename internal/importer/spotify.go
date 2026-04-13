@@ -457,8 +457,3 @@ func getString(data map[string]interface{}, keys ...string) string {
 	}
 	return ""
 }
-
-func isSpotifyURL(s string) bool {
-	return strings.Contains(s, "open.spotify.com/playlist/") ||
-		strings.Contains(s, "spotify:playlist:")
-}
