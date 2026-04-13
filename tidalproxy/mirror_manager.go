@@ -3,10 +3,12 @@ package tidalproxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,34 +37,11 @@ func (s MirrorState) String() string {
 	}
 }
 
-// LatencyTier represents the latency category of a mirror
-type LatencyTier int
-
-const (
-	TierLow    LatencyTier = iota // Fastest ~33% - for streaming
-	TierMedium                    // Middle ~33% - for general/VIP use
-	TierHigh                      // Slowest ~33% - for background cache hydration
-)
-
-func (t LatencyTier) String() string {
-	switch t {
-	case TierLow:
-		return "LOW"
-	case TierMedium:
-		return "MED"
-	case TierHigh:
-		return "HIGH"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 // Mirror represents a single proxy mirror
 type Mirror struct {
 	URL            string
 	Weight         int
-	HealthEndpoint string      // e.g., "/health" or just "/" for HEAD check
-	Tier           LatencyTier // Assigned based on benchmark latency
+	HealthEndpoint string // e.g., "/health" or just "/" for HEAD check
 
 	// Runtime stats - accessed via atomic
 	state               atomic.Int32 // MirrorState
@@ -75,6 +54,94 @@ type Mirror struct {
 	lastSuccess         atomic.Int64 // unix timestamp
 	requestCount        atomic.Int64
 	lastHealthCheckFail atomic.Int64 // unix timestamp of last health check failure
+
+	// --- NUEVAS MÉTRICAS DE STREAMING ---
+	btsSuccesses atomic.Int64
+	hlsResponses atomic.Int64
+	streamFails  atomic.Int64
+}
+
+// Nuevos métodos de reporte
+func (m *Mirror) ReportBTS()        { m.btsSuccesses.Add(1) }
+func (m *Mirror) ReportHLS()        { m.hlsResponses.Add(1) }
+func (m *Mirror) ReportStreamFail() { m.streamFails.Add(1) }
+
+// GetStreamScore calcula la confiabilidad del mirror basándose en los codecs que entrega
+func (m *Mirror) GetStreamScore() float64 {
+	bts := float64(m.btsSuccesses.Load())
+	hls := float64(m.hlsResponses.Load())
+	fails := float64(m.streamFails.Load())
+	lat := float64(m.latencyEMA.Load()) / float64(time.Millisecond)
+	if lat <= 0 {
+		lat = 1
+	}
+
+	// Base inicial por latencia (100ms = 100pts, 50ms = 200pts)
+	score := 10000.0 / lat
+
+	// Sistema de Karma (Historial de comportamiento)
+	score += (bts * 50.0)    // Fuerte recompensa por dar BTS Progresivo
+	score -= (hls * 10.0)    // Ligera penalización por dar HLS
+	score -= (fails * 150.0) // CASTIGO SEVERO por quedarse colgado o fallar
+
+	return score
+}
+
+// GetAPIScore calcula la confiabilidad general para metadata
+func (m *Mirror) GetAPIScore() float64 {
+	lat := float64(m.latencyEMA.Load()) / float64(time.Millisecond)
+	if lat <= 0 {
+		lat = 1
+	}
+	// Latencia combinada con Tasa de Éxito
+	return (10000.0 / lat) * m.GetSuccessRate()
+}
+
+// GetMirrorsByPriority devuelve el pool completo ordenado inteligentemente según la tarea
+func (mm *MirrorManager) GetMirrorsByPriority(priority TaskPriority) []*Mirror {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	var pool []*Mirror
+	for _, m := range mm.mirrors {
+		if m.GetState() == StateHealthy || m.GetState() == StateProbing {
+			pool = append(pool, m)
+		}
+	}
+
+	if len(pool) == 0 {
+		return nil
+	}
+
+	switch priority {
+	case PriorityUrgent:
+		// Streaming: Los reyes del Stream Score van primero
+		sort.Slice(pool, func(i, j int) bool {
+			return pool[i].GetStreamScore() > pool[j].GetStreamScore()
+		})
+	case PriorityNormal:
+		// Metadata: Ordenar por API Score
+		sort.Slice(pool, func(i, j int) bool {
+			return pool[i].GetAPIScore() > pool[j].GetAPIScore()
+		})
+		// Soft-Knee: Si hay suficientes proxies, empujar al campeón (#0 y #1) más atrás
+		// para no saturarlo con peticiones JSON tontas.
+		if len(pool) >= 4 {
+			p0, p1 := pool[0], pool[1]
+			pool[0] = pool[2]
+			pool[1] = pool[3]
+			pool[2] = p0
+			pool[3] = p1
+		}
+	case PriorityBackground:
+		// Hidratación de fondo: Ordenar por API Score pero INVERTIR EL ARREGLO
+		// (Los más lentos/apestados pero sanos se usan primero)
+		sort.Slice(pool, func(i, j int) bool {
+			return pool[i].GetAPIScore() < pool[j].GetAPIScore() // Menor a mayor
+		})
+	}
+
+	return pool
 }
 
 // MirrorManager manages multiple proxy mirrors with health checking
@@ -220,46 +287,10 @@ func (mm *MirrorManager) BenchmarkMirrors() {
 			}
 		}
 	}
-
-	// Assign tiers based on latency percentiles
-	// Low: fastest ~33%, Medium: middle ~33%, High: slowest ~33%
-	n := len(mm.mirrors)
-	if n > 0 {
-		lowThreshold := n / 3
-		if lowThreshold < 1 {
-			lowThreshold = 1
-		}
-		highThreshold := (2 * n) / 3
-
-		for i, m := range mm.mirrors {
-			switch {
-			case i < lowThreshold:
-				m.Tier = TierLow
-			case i >= highThreshold:
-				m.Tier = TierHigh
-			default:
-				m.Tier = TierMedium
-			}
-		}
-
-		// Log tier distribution
-		lowCount, medCount, highCount := 0, 0, 0
-		for _, m := range mm.mirrors {
-			switch m.Tier {
-			case TierLow:
-				lowCount++
-			case TierMedium:
-				medCount++
-			case TierHigh:
-				highCount++
-			}
-		}
-		log.Printf("[MIRROR] Tiers assigned: LOW=%d MED=%d HIGH=%d", lowCount, medCount, highCount)
-	}
 	mm.mu.Unlock()
 
-	log.Printf("[MIRROR] Benchmark complete. Fastest: %s (%v) [Tier:%s]",
-		mm.mirrors[0].URL, time.Duration(mm.mirrors[0].latencyEMA.Load()), mm.mirrors[0].Tier)
+	log.Printf("[MIRROR] Benchmark complete. Fastest: %s (%v)",
+		mm.mirrors[0].URL, time.Duration(mm.mirrors[0].latencyEMA.Load()))
 }
 
 // UpdateMirrors updates the mirror list with new URLs (preserves stats for existing mirrors)
@@ -579,7 +610,7 @@ func (mm *MirrorManager) runHealthChecks() {
 	}
 }
 
-// checkMirror probes a single mirror
+// checkMirror probes a single mirror verifying actual JSON responses
 func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 	m.activeRequests.Add(1)
 	defer m.activeRequests.Add(-1)
@@ -594,68 +625,65 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 	ctx, cancel := context.WithTimeout(mm.ctx, mm.probeTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "HEAD", endpoint, nil)
+	// [HACKER FIX] Cambiar HEAD por GET para leer el cuerpo de la respuesta
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return
 	}
 
 	resp, err := client.Do(req)
 	latency := time.Since(start)
-	if resp != nil {
+
+	var isRealFailure bool
+	if err != nil {
+		isRealFailure = true
+	} else {
 		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+
+		// 429 = Rate limited, 5xx = Server dead
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			isRealFailure = true
+		} else if len(body) > 0 && body[0] == '<' {
+			// Falso positivo: Nos devolvió un HTML de Cloudflare/Proxy en lugar de JSON
+			isRealFailure = true
+		}
 	}
 
-	if err != nil {
-		// Failed - record health check failure time separately from request failures
+	if isRealFailure {
 		m.lastHealthCheckFail.Store(time.Now().Unix())
-		m.consecutiveSuccess.Store(0) // Reset consecutive success counter on failure
+		m.consecutiveSuccess.Store(0)
 		if m.GetState() == StateHealthy {
 			m.failCount.Add(1)
 			if int(m.failCount.Load()) >= mm.failureThreshold {
 				m.SetState(StateUnhealthy)
-				log.Printf("[MIRROR] %s health check failed, marked unhealthy", m.URL)
+				log.Printf("[MIRROR] %s deep health check failed, marked unhealthy", m.URL)
 			}
 		}
 		return
 	}
 
-	// Success - any HTTP response means the server is alive (even 4xx/5xx)
-	// Only connection errors (timeout, refused, etc) should mark as unhealthy
-	if resp.StatusCode < 100 {
-		// This shouldn't happen, but treat as failure just in case
-		m.lastHealthCheckFail.Store(time.Now().Unix())
-		m.consecutiveSuccess.Store(0)
-		return
-	}
-
-	// Health check passed - server responded with HTTP (any status is OK for health)
 	consecutive := m.consecutiveSuccess.Add(1)
 
 	if m.GetState() == StateUnhealthy {
-		// Check if cooldown passed based on last health check failure (not request failure)
 		lastHealthFail := time.Unix(m.lastHealthCheckFail.Load(), 0)
 		if time.Since(lastHealthFail) > mm.cooldownDuration {
 			m.SetState(StateProbing)
-			m.consecutiveSuccess.Store(1) // Reset to 1 (this success)
+			m.consecutiveSuccess.Store(1)
 			log.Printf("[MIRROR] %s cooldown ended, entering probing state", m.URL)
 		}
 	} else if m.GetState() == StateProbing {
-		// Require 2 consecutive successes before marking healthy (hysteresis)
 		if consecutive >= 2 {
 			m.SetState(StateHealthy)
 			m.failCount.Store(0)
-			log.Printf("[MIRROR] %s health check passed 2x, marked healthy (latency: %v)", m.URL, latency)
-		} else {
-			log.Printf("[MIRROR] %s probing success %d/2 (latency: %v)", m.URL, consecutive, latency)
+			log.Printf("[MIRROR] %s deep health check passed, marked healthy", m.URL)
 		}
 	} else {
-		// Already healthy, just cap the counter to prevent overflow
 		if consecutive > 100 {
 			m.consecutiveSuccess.Store(100)
 		}
 	}
 
-	// Update latency even on health checks
 	mm.ReportResult(m, latency, nil)
 }
 
@@ -667,89 +695,17 @@ func (mm *MirrorManager) GetStatus() string {
 	status := "Mirror Status:\n"
 	for _, m := range mm.mirrors {
 		state, latency, fails, reqs := m.GetStats()
-		status += fmt.Sprintf("  %s: %s | tier=%s | latency=%v | fails=%d | reqs=%d\n",
-			m.URL, state, m.Tier, latency, fails, reqs)
+		status += fmt.Sprintf("  %s: %s | streamScore=%.1f | apiScore=%.1f | latency=%v | fails=%d | reqs=%d\n",
+			m.URL, state, m.GetStreamScore(), m.GetAPIScore(), latency, fails, reqs)
 	}
 	return status
 }
 
-// GetMirrors returns the list of mirrors sorted by latency (fastest first)
-func (mm *MirrorManager) GetMirrors() []*Mirror {
-	return mm.GetMirrorsByTierWithFallback(TierLow, 3) // Default: Low tier with fallback to Medium
-}
-
-// GetMirrorsByTier returns mirrors from a specific tier only
-func (mm *MirrorManager) GetMirrorsByTier(tier LatencyTier) []*Mirror {
+// GetAllMirrors devuelve todos los mirrors
+func (mm *MirrorManager) GetAllMirrors() []*Mirror {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
-
-	var filtered []*Mirror
-	for _, m := range mm.mirrors {
-		if m.Tier == tier && m.GetState() == StateHealthy {
-			filtered = append(filtered, m)
-		}
-	}
-
-	// Sort by latency within tier
-	for i := 0; i < len(filtered)-1; i++ {
-		for j := i + 1; j < len(filtered); j++ {
-			if filtered[i].latencyEMA.Load() > filtered[j].latencyEMA.Load() {
-				filtered[i], filtered[j] = filtered[j], filtered[i]
-			}
-		}
-	}
-
-	return filtered
-}
-
-// GetMirrorsByTierWithFallback returns mirrors from requested tier,
-// falling back to Medium tier if not enough mirrors available
-func (mm *MirrorManager) GetMirrorsByTierWithFallback(tier LatencyTier, minCount int) []*Mirror {
-	mm.mu.RLock()
-	defer mm.mu.RUnlock()
-
-	var result []*Mirror
-
-	// First, get mirrors from requested tier
-	for _, m := range mm.mirrors {
-		if m.Tier == tier && (m.GetState() == StateHealthy || m.GetState() == StateProbing) {
-			result = append(result, m)
-		}
-	}
-
-	// If not enough, fallback to Medium tier
-	if len(result) < minCount {
-		for _, m := range mm.mirrors {
-			if m.Tier == TierMedium && (m.GetState() == StateHealthy || m.GetState() == StateProbing) {
-				// Check not already added
-				found := false
-				for _, r := range result {
-					if r.URL == m.URL {
-						found = true
-						break
-					}
-				}
-				if !found {
-					result = append(result, m)
-				}
-			}
-		}
-	}
-
-	// Sort by latency
-	for i := 0; i < len(result)-1; i++ {
-		for j := i + 1; j < len(result); j++ {
-			if result[i].latencyEMA.Load() > result[j].latencyEMA.Load() {
-				result[i], result[j] = result[j], result[i]
-			}
-		}
-	}
-
-	return result
-}
-
-// GetMirrorsForCache returns High tier mirrors (for background cache hydration)
-// Falls back to Medium if High tier has insufficient mirrors
-func (mm *MirrorManager) GetMirrorsForCache() []*Mirror {
-	return mm.GetMirrorsByTierWithFallback(TierHigh, 2)
+	mirrors := make([]*Mirror, len(mm.mirrors))
+	copy(mirrors, mm.mirrors)
+	return mirrors
 }

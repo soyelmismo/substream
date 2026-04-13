@@ -232,34 +232,25 @@ func calculateBackoff(try int, baseDelay time.Duration, errCategory ErrorCategor
 // doFetchRawWithInstance performs a GET request to a specific proxy instance (by index).
 // Used for retry logic when 404 errors are encountered.
 // Also tracks results with MirrorManager if available.
-// Respects CtxTier from context for mirror selection (LOW for streaming, MED for metadata, HIGH for cache).
+// Respects CtxPriority from context for dynamic mirror selection.
 func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query url.Values, clientIP string, instanceIdx int) ([]byte, error) {
 	p.mu.RLock()
-	// Select mirror based on tier from context
+	// Select mirror based on priority from context
 	var m *Mirror
 	var base string
 
 	if instanceIdx == 0 && p.mirrorMgr != nil {
-		// Get tier preference from context
-		tier := GetTierFromContext(ctx)
-
-		// Select mirror from appropriate tier
-		var mirrors []*Mirror
-		switch tier {
-		case TierLow:
-			mirrors = p.mirrorMgr.GetMirrorsByTierWithFallback(TierLow, 3)
-		case TierMedium:
-			mirrors = p.mirrorMgr.GetMirrorsByTierWithFallback(TierMedium, 2)
-		case TierHigh:
-			mirrors = p.mirrorMgr.GetMirrorsForCache()
-		default:
-			mirrors = p.mirrorMgr.GetMirrorsByTierWithFallback(TierLow, 3)
-		}
+		priority := GetPriorityFromContext(ctx)
+		mirrors := p.mirrorMgr.GetMirrorsByPriority(priority)
 
 		if len(mirrors) > 0 {
-			// Select from tier pool - pick least loaded from fastest mirrors
-			m = mirrors[0] // Already sorted by latency, pick first
-			for _, candidate := range mirrors[1:] {
+			m = mirrors[0]
+			// Try to find a less loaded one among the top 3
+			limit := len(mirrors)
+			if limit > 3 {
+				limit = 3
+			}
+			for _, candidate := range mirrors[1:limit] {
 				if candidate.activeRequests.Load() < m.activeRequests.Load() {
 					m = candidate
 				}
@@ -269,7 +260,7 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 			}
 		}
 
-		// Fallback to default selection if tier selection failed
+		// Fallback to default selection if priority selection failed
 		if base == "" {
 			m = p.mirrorMgr.SelectMirror()
 			if m != nil {
@@ -771,7 +762,7 @@ func (p *Pool) gatherFromMirrors(ctx context.Context, query url.Values) [][]byte
 	var mirrors []*Mirror
 	p.mu.RLock()
 	if p.mirrorMgr != nil {
-		for _, m := range p.mirrorMgr.GetMirrors() {
+		for _, m := range p.mirrorMgr.GetAllMirrors() {
 			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
 				mirrors = append(mirrors, m)
 			}
@@ -1102,6 +1093,10 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 		Quality:      task.Quality,
 	}
 
+	// [TIMEOUT ESTRICTO] ¡No esperaremos 10 segundos por un zombi! Cortamos a los 3.5s
+	reqCtx, cancel := context.WithTimeout(ctx, 3500*time.Millisecond)
+	defer cancel()
+
 	// --- RUTA V1: Exclusiva para BTS (Idéntico a Python) ---
 	if task.ManifestType == "BTS" {
 		qV1 := url.Values{
@@ -1119,7 +1114,7 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 			} `json:"data"`
 		}
 
-		err := p.doFetchRawWithMirror(ctx, "/track/", qV1, clientIP, task.Mirror, &v1Response)
+		err := p.doFetchRawWithMirror(reqCtx, "/track/", qV1, clientIP, task.Mirror, &v1Response)
 		res.Latency = time.Since(start)
 		res.Err = err
 
@@ -1182,7 +1177,7 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 		} `json:"data"`
 	}
 
-	err := p.doFetchRawWithMirror(ctx, "/trackManifests/", qV2, clientIP, task.Mirror, &v2Response)
+	err := p.doFetchRawWithMirror(reqCtx, "/trackManifests/", qV2, clientIP, task.Mirror, &v2Response)
 	res.Latency = time.Since(start)
 	res.Err = err
 
@@ -1221,11 +1216,11 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 		requestedQuality = p.quality
 	}
 
-	// Obtener mirrors sanos y en prueba
+	// Obtener TODOS los mirrors sanos sin importar el Tier
 	var mirrors []*Mirror
 	p.mu.RLock()
 	if p.mirrorMgr != nil {
-		for _, m := range p.mirrorMgr.GetMirrors() {
+		for _, m := range p.mirrorMgr.GetAllMirrors() {
 			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
 				mirrors = append(mirrors, m)
 			}
@@ -1237,12 +1232,11 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 		return "", fmt.Errorf("no healthy mirrors available")
 	}
 
-	// Ordenar mirrors por latencia (los más rápidos primero)
+	// Ordenar mirrors por STREAM SCORE (Historial de Códecs + Tiempos de Respuesta)
+	// Si un Low Tier falla, un Mid Tier con buen historial lo sobrepasará y será usado.
 	for i := 0; i < len(mirrors)-1; i++ {
 		for j := i + 1; j < len(mirrors); j++ {
-			_, latI, _, _ := mirrors[i].GetStats()
-			_, latJ, _, _ := mirrors[j].GetStats()
-			if latJ < latI {
+			if mirrors[j].GetStreamScore() > mirrors[i].GetStreamScore() {
 				mirrors[i], mirrors[j] = mirrors[j], mirrors[i]
 			}
 		}
@@ -1409,7 +1403,14 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 				p.mirrorMgr.ReportResult(res.Mirror, res.Latency, filterMirrorError(res.Err))
 			}
 
+			// Reportar métricas para el Ranking de Streaming
 			if res.Err == nil && res.URL != "" {
+				if res.ManifestType == "BTS" {
+					res.Mirror.ReportBTS()
+				} else {
+					res.Mirror.ReportHLS()
+				}
+
 				// FAST PATH: Calidad solicitada encontrada Y ES BTS (progresivo)
 				// NO aceptamos HLS en fast path porque rompe el gapless playback
 				if res.Quality == requestedQuality && res.ManifestType == "BTS" {
@@ -1435,10 +1436,17 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 			} else if res.Err != nil {
 				errorsList = append(errorsList, fmt.Sprintf("%s (%s/%s): %v",
 					res.Mirror.URL, res.ManifestType, res.Quality, res.Err))
-				if strings.Contains(strings.ToLower(res.Err.Error()), "preview") ||
-					strings.Contains(strings.ToLower(res.Err.Error()), "region") ||
-					strings.Contains(strings.ToLower(res.Err.Error()), "restricted") {
+
+				errStr := strings.ToLower(res.Err.Error())
+				if strings.Contains(errStr, "preview") ||
+					strings.Contains(errStr, "region") ||
+					strings.Contains(errStr, "restricted") {
 					isUnavailable = true
+				}
+
+				// Castigo severo a los mirrors que se quedan colgados
+				if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
+					res.Mirror.ReportStreamFail()
 				}
 			}
 
@@ -1722,7 +1730,8 @@ func (p *Pool) GetPlaylist(ctx context.Context, playlistUUID string) (*TidalPlay
 		log.Printf("[TIDAL:PLAYLIST] Fetching playlist %s offset=%d limit=%d", playlistUUID, offset, maxLimit)
 
 		// Use shotgun approach with progressive batching (3 mirrors at a time)
-		body, err := p.shotgunRequest(ctx, "/playlist/", q, TierHigh)
+		// Background priority: usa los mirrors más lentos/penalizados primero
+		body, err := p.shotgunRequest(ctx, "/playlist/", q, PriorityBackground)
 		if err != nil {
 			// Provide more context for common errors
 			errStr := err.Error()
@@ -1774,118 +1783,49 @@ func (p *Pool) GetPlaylist(ctx context.Context, playlistUUID string) (*TidalPlay
 	return &playlistInfo, nil
 }
 
-// shotgunRequest fires parallel requests to multiple mirrors across all tiers with cascading fallback
-// Uses progressive batching: processes mirrors in batches of 3, moving to next batch only if current fails
-// preferredTier determines priority order: HIGH→MEDIUM→LOW, MEDIUM→HIGH→LOW, LOW→MEDIUM→HIGH
-func (p *Pool) shotgunRequest(ctx context.Context, path string, query url.Values, preferredTier LatencyTier) ([]byte, error) {
+// shotgunRequest fires parallel requests across mirrors with progressive fallback.
+// It relies on GetMirrorsByPriority to automatically arrange the absolute best order for the task.
+func (p *Pool) shotgunRequest(ctx context.Context, path string, query url.Values, priority TaskPriority) ([]byte, error) {
 	const batchSize = 3
-
-	// Define tier order based on preference
-	var tierOrder []LatencyTier
-	switch preferredTier {
-	case TierHigh:
-		tierOrder = []LatencyTier{TierHigh, TierMedium, TierLow}
-	case TierMedium:
-		tierOrder = []LatencyTier{TierMedium, TierHigh, TierLow}
-	case TierLow:
-		tierOrder = []LatencyTier{TierLow, TierMedium, TierHigh}
-	default:
-		tierOrder = []LatencyTier{TierHigh, TierMedium, TierLow}
-	}
-
 	var allErrors []string
 
-	// Try each tier in order until one succeeds
-	for tierIdx, tier := range tierOrder {
-		mirrors := p.getMirrorsForTier(tier)
+	mirrors := p.mirrorMgr.GetMirrorsByPriority(priority)
+	if len(mirrors) == 0 {
+		return nil, fmt.Errorf("no healthy mirrors available for shotgun")
+	}
 
-		if len(mirrors) == 0 {
-			continue
+	// Process mirrors in progressive batches.
+	// Because the list is already sorted by priority (Urgent=Best, Background=Worst),
+	// we just walk down the array naturally!
+	for batchNum := 0; batchNum < len(mirrors); batchNum += batchSize {
+		end := batchNum + batchSize
+		if end > len(mirrors) {
+			end = len(mirrors)
+		}
+		batch := mirrors[batchNum:end]
+
+		log.Printf("[PLAYLIST:SHOTGUN] Priority %v batch %d/%d: firing %d parallel requests to %s",
+			priority, batchNum/batchSize+1, (len(mirrors)+batchSize-1)/batchSize, len(batch), path)
+
+		body, err := p.shotgunWithMirrors(ctx, path, query, batch)
+		if err == nil {
+			return body, nil
 		}
 
-		// Add small delay between tier attempts to avoid thundering herd
-		// First tier starts immediately, subsequent tiers wait briefly
-		if tierIdx > 0 {
+		// This batch failed, add to errors and continue to next batch
+		allErrors = append(allErrors, fmt.Sprintf("batch %d: %v", batchNum/batchSize+1, err))
+
+		if end < len(mirrors) {
 			select {
 			case <-time.After(100 * time.Millisecond):
-				// Brief pause between tiers
+				// Brief pause between batches
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
 		}
-
-		// Process mirrors in progressive batches of batchSize
-		// This avoids overwhelming Tidal when all proxies are active
-		for batchNum := 0; batchNum < len(mirrors); batchNum += batchSize {
-			end := batchNum + batchSize
-			if end > len(mirrors) {
-				end = len(mirrors)
-			}
-			batch := mirrors[batchNum:end]
-
-			log.Printf("[PLAYLIST:SHOTGUN] Tier %v batch %d/%d: firing %d parallel requests to %s",
-				tier, batchNum/batchSize+1, (len(mirrors)+batchSize-1)/batchSize, len(batch), path)
-
-			body, err := p.shotgunWithMirrors(ctx, path, query, batch)
-			if err == nil {
-				return body, nil
-			}
-
-			// This batch failed, add to errors and continue to next batch
-			allErrors = append(allErrors, fmt.Sprintf("tier %v batch %d: %v", tier, batchNum/batchSize+1, err))
-
-			// Small delay between batches within the same tier
-			if end < len(mirrors) {
-				select {
-				case <-time.After(50 * time.Millisecond):
-					// Brief pause between batches
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
-		}
-
-		log.Printf("[PLAYLIST:SHOTGUN] Tier %v failed after all batches, trying next tier...", tier)
 	}
 
-	return nil, fmt.Errorf("all tiers failed: %s", strings.Join(allErrors, "; "))
-}
-
-// getMirrorsForTier returns healthy mirrors for a specific tier
-func (p *Pool) getMirrorsForTier(tier LatencyTier) []*Mirror {
-	var mirrors []*Mirror
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if p.mirrorMgr == nil {
-		return mirrors
-	}
-
-	switch tier {
-	case TierHigh:
-		highMirrors := p.mirrorMgr.GetMirrorsForCache()
-		for _, m := range highMirrors {
-			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
-				mirrors = append(mirrors, m)
-			}
-		}
-	case TierMedium:
-		medMirrors := p.mirrorMgr.GetMirrorsByTierWithFallback(TierMedium, 5)
-		for _, m := range medMirrors {
-			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
-				mirrors = append(mirrors, m)
-			}
-		}
-	case TierLow:
-		lowMirrors := p.mirrorMgr.GetMirrorsByTierWithFallback(TierLow, 5)
-		for _, m := range lowMirrors {
-			if m.GetState() == StateHealthy || m.GetState() == StateProbing {
-				mirrors = append(mirrors, m)
-			}
-		}
-	}
-
-	return mirrors
+	return nil, fmt.Errorf("all batches failed: %s", strings.Join(allErrors, "; "))
 }
 
 // shotgunWithMirrors performs shotgun request with specific mirror list

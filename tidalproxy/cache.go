@@ -263,8 +263,8 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 		}
 	}
 
-	// 3. Fetch from API using MEDIUM tier (not critical like streaming)
-	ctx = WithTier(ctx, TierMedium)
+	// 3. Fetch from API using Normal priority (not critical like streaming)
+	ctx = WithPriority(ctx, PriorityNormal)
 	t, err := c.TidalProxy.GetTrackInfo(ctx, trackID)
 	if err == nil && t != nil {
 		c.cacheTrackJSON(t)
@@ -324,8 +324,8 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 		}
 	}
 
-	// 4. Fetch from API using MEDIUM tier
-	ctx = WithTier(ctx, TierMedium)
+	// 4. Fetch from API using Normal priority
+	ctx = WithPriority(ctx, PriorityNormal)
 	a, err := c.TidalProxy.GetAlbumInfo(ctx, albumID)
 	if err == nil && a != nil {
 		c.cacheAlbumJSON(a)
@@ -390,7 +390,7 @@ func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) ma
 		return nil
 	}
 
-	ctx = WithTier(ctx, TierMedium)
+	ctx = WithPriority(ctx, PriorityNormal)
 
 	result := make(map[int]*TidalAlbum, len(albumIDs))
 	missingIDs := make([]int, 0)
@@ -532,8 +532,8 @@ func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalAr
 		}
 	}
 
-	// 3. Fetch from API using MEDIUM tier
-	ctx = WithTier(ctx, TierMedium)
+	// 3. Fetch from API using Normal priority
+	ctx = WithPriority(ctx, PriorityNormal)
 	a, err := c.TidalProxy.GetArtistInfo(ctx, artistID)
 	if err == nil && a != nil {
 		// Serialize to JSON
@@ -564,8 +564,8 @@ func (c *CachedProxy) GetCoverUUIDForAlbum(ctx context.Context, albumID int) str
 		return cached
 	}
 
-	// Trigger album fetch to get cover (MEDIUM tier via GetAlbumInfo)
-	ctx = WithTier(ctx, TierMedium)
+	// Trigger album fetch to get cover (Normal priority via GetAlbumInfo)
+	ctx = WithPriority(ctx, PriorityNormal)
 	a, err := c.GetAlbumInfo(ctx, albumID)
 	if err == nil && a != nil {
 		return a.Cover
@@ -574,7 +574,7 @@ func (c *CachedProxy) GetCoverUUIDForAlbum(ctx context.Context, albumID int) str
 }
 
 func (c *CachedProxy) SearchAlbums(ctx context.Context, query string, limit, offset int) ([]TidalAlbum, error) {
-	ctx = WithTier(ctx, TierMedium) // Search uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Search uses Normal priority
 	albums, err := c.TidalProxy.SearchAlbums(ctx, query, limit, offset)
 	if err == nil {
 		for _, a := range albums {
@@ -585,7 +585,7 @@ func (c *CachedProxy) SearchAlbums(ctx context.Context, query string, limit, off
 }
 
 func (c *CachedProxy) SearchTracks(ctx context.Context, query string, limit, offset int) ([]TidalTrack, error) {
-	ctx = WithTier(ctx, TierMedium) // Search uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Search uses Normal priority
 	tracks, err := c.TidalProxy.SearchTracks(ctx, query, limit, offset)
 	if err == nil {
 		for _, t := range tracks {
@@ -596,12 +596,12 @@ func (c *CachedProxy) SearchTracks(ctx context.Context, query string, limit, off
 }
 
 func (c *CachedProxy) SearchArtists(ctx context.Context, query string, limit, offset int) ([]TidalArtist, error) {
-	ctx = WithTier(ctx, TierMedium) // Search uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Search uses Normal priority
 	return c.TidalProxy.SearchArtists(ctx, query, limit, offset)
 }
 
 func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTracks bool) (*TidalArtistPage, error) {
-	ctx = WithTier(ctx, TierMedium) // Artist albums uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Artist albums uses Normal priority
 	key := fmt.Sprintf("td:ar:al:%d", artistID)
 	if skipTracks {
 		key += ":skip"
@@ -675,7 +675,7 @@ func (c *CachedProxy) GetArtistAlbums(ctx context.Context, artistID int, skipTra
 }
 
 func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limit int) ([]TidalTrack, error) {
-	ctx = WithTier(ctx, TierMedium) // Top tracks uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Top tracks uses Normal priority
 	key := fmt.Sprintf("td:ar:tt:%d", artistID)
 
 	// 1. Check LRU
@@ -738,7 +738,7 @@ func (c *CachedProxy) GetArtistTopTracks(ctx context.Context, artistID int, limi
 }
 
 func (c *CachedProxy) GetSimilarArtists(ctx context.Context, artistID int) ([]TidalArtist, error) {
-	ctx = WithTier(ctx, TierMedium) // Similar artists uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Similar artists uses Normal priority
 	key := fmt.Sprintf("td:ar:sim:%d", artistID)
 
 	// 1. Check LRU
@@ -797,7 +797,7 @@ func (c *CachedProxy) GetSimilarArtists(ctx context.Context, artistID int) ([]Ti
 }
 
 func (c *CachedProxy) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack, error) {
-	ctx = WithTier(ctx, TierMedium) // Top tracks uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Top tracks uses Normal priority
 	tracks, err := c.TidalProxy.GetTopTracks(ctx, limit)
 	if err == nil {
 		for _, t := range tracks {
@@ -808,7 +808,7 @@ func (c *CachedProxy) GetTopTracks(ctx context.Context, limit int) ([]TidalTrack
 }
 
 func (c *CachedProxy) GetRecommendations(ctx context.Context, trackID int) ([]TidalTrack, error) {
-	ctx = WithTier(ctx, TierMedium) // Recommendations uses MEDIUM tier
+	ctx = WithPriority(ctx, PriorityNormal) // Recommendations uses Normal priority
 	tracks, err := c.TidalProxy.GetRecommendations(ctx, trackID)
 	if err == nil {
 		for _, t := range tracks {

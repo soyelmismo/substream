@@ -6,24 +6,31 @@ import "context"
 type CtxKey int
 
 const (
-	// CtxTier allows specifying which mirror tier to use for the request
-	// TierLow for streaming, TierMedium for metadata, TierHigh for cache
-	CtxTier CtxKey = iota
+	CtxPriority CtxKey = iota
 )
 
-// WithTier returns a context with the specified tier for mirror selection
-func WithTier(ctx context.Context, tier LatencyTier) context.Context {
-	return context.WithValue(ctx, CtxTier, tier)
+// TaskPriority defines how aggressively the mirror manager should protect top proxies
+type TaskPriority int
+
+const (
+	PriorityUrgent     TaskPriority = iota // Streaming (uses absolute best)
+	PriorityNormal                         // User-facing metadata (spares the #1 proxy)
+	PriorityBackground                     // Hydration (uses slowest healthy proxies first)
+)
+
+// WithPriority returns a context with the specified priority
+func WithPriority(ctx context.Context, p TaskPriority) context.Context {
+	return context.WithValue(ctx, CtxPriority, p)
 }
 
-// GetTierFromContext extracts the tier preference from context, defaults to TierLow
-func GetTierFromContext(ctx context.Context) LatencyTier {
-	if val := ctx.Value(CtxTier); val != nil {
-		if tier, ok := val.(LatencyTier); ok {
-			return tier
+// GetPriorityFromContext extracts the priority preference, defaults to Urgent
+func GetPriorityFromContext(ctx context.Context) TaskPriority {
+	if val := ctx.Value(CtxPriority); val != nil {
+		if p, ok := val.(TaskPriority); ok {
+			return p
 		}
 	}
-	return TierLow // Default: streaming priority
+	return PriorityUrgent
 }
 
 // TidalProxy abstracts all interaction with hifi-api instances

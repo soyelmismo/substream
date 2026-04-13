@@ -45,8 +45,8 @@ func New(proxy tidalproxy.TidalProxy) *Resolver {
 		proxy: proxy,
 		cache: cache.New[int](cache.Config{
 			Name:            "fuzzy-resolver",
-			MaxSize:         5000,               // 5k entries ~ 40MB
-			DefaultTTL:      72 * time.Hour,     // 3 days - tracks don't change often
+			MaxSize:         5000,           // 5k entries ~ 40MB
+			DefaultTTL:      72 * time.Hour, // 3 days - tracks don't change often
 			CleanupInterval: 1 * time.Hour,
 		}),
 	}
@@ -106,8 +106,8 @@ func (r *Resolver) ResolveBatch(ctx context.Context, queries []Query) map[string
 			default:
 			}
 
-			// Search Tidal - use MEDIUM tier since this is discovery, not critical streaming
-			searchCtx := tidalproxy.WithTier(ctx, tidalproxy.TierMedium)
+			// Search Tidal - use Normal priority since this is discovery, not critical streaming
+			searchCtx := tidalproxy.WithPriority(ctx, tidalproxy.PriorityNormal)
 
 			// Use artist + title for broader search, or just title if artist empty
 			searchQuery := query.Title

@@ -124,7 +124,7 @@ func (p *Provider) GetSimilarArtists(ctx context.Context, artist recommendations
 	var recs []recommendations.ArtistRecommendation
 	for _, a := range similar.Artists {
 		// Search for this artist in Tidal
-		searchCtx := tidalproxy.WithTier(ctx, tidalproxy.TierMedium)
+		searchCtx := tidalproxy.WithPriority(ctx, tidalproxy.PriorityNormal)
 		artists, err := p.proxy.SearchArtists(searchCtx, a.Name, 3, 0)
 		if err != nil || len(artists) == 0 {
 			continue

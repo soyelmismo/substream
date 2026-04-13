@@ -336,8 +336,8 @@ func (c *Controller) hydrateTrackBackground(trackID int) {
 		time.Sleep(50 * time.Millisecond) // yield
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
-		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
+		// Enviar al fondo de la piscina (protege a los proxies de streaming)
+		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
 		c.proxy.GetTrackInfo(ctx, trackID)
 	}()
 }
@@ -353,8 +353,8 @@ func (c *Controller) hydrateAlbumBackground(albumID int) {
 		time.Sleep(50 * time.Millisecond) // yield
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
-		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
+		// Enviar al fondo de la piscina (protege a los proxies de streaming)
+		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
 		log.Printf("[HYDRATE] Deep hydrating album %d...", albumID)
 		c.proxy.GetAlbumInfo(ctx, albumID) // GetAlbumInfo triggers caching of all its tracks
 	}()
@@ -373,10 +373,10 @@ func (c *Controller) hydrateArtistBackground(artistID int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
-		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
+		// Enviar al fondo de la piscina (protege a los proxies de streaming)
+		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
 
-		log.Printf("[HYDRATE] Deep hydrating artist %d... [Tier:HIGH]", artistID)
+		log.Printf("[HYDRATE] Deep hydrating artist %d... [Priority:Background]", artistID)
 
 		// 1. Get Artist Info
 		c.proxy.GetArtistInfo(ctx, artistID)
@@ -431,8 +431,8 @@ func (c *Controller) hydratePlaylistBackground(playlistID int, trackIDs []int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		// Use HIGH tier for background hydration (doesn't saturate LOW/MEDIUM)
-		ctx = tidalproxy.WithTier(ctx, tidalproxy.TierHigh)
+		// Enviar al fondo de la piscina (protege a los proxies de streaming)
+		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
 
 		log.Printf("[HYDRATE] Hydrating playlist %d with %d tracks...", playlistID, len(trackIDs))
 
