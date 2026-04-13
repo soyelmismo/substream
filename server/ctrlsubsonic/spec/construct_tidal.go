@@ -55,9 +55,12 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", coverIDValue)}
 
 	// Determine quality and suffix first
-	// [NOTE] For LOSSLESS/HI_RES_LOSSLESS, we use .m4a extension in path because
-	// we don't know if the stream will be BTS (native FLAC) or HLS (fMP4 container).
-	// The actual audio quality is lossless in both cases.
+	// [NOTE] For LOSSLESS/HI_RES_LOSSLESS, we report .m4a suffix for maximum
+	// client compatibility. The actual stream will be:
+	//   1. BTS (native FLAC) - prioritized by Shotgun for gapless playback
+	//   2. HLS unwrapped to direct fMP4 URL - extracted via manifest parsing
+	//   3. HLS stitched server-side - only if unwrap fails
+	// The audio quality is always lossless; the container format is transparent to clients.
 	suffix := "m4a"
 	bitrate := 320
 	contentType := "audio/mp4"

@@ -19,18 +19,19 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
 
-// needsForcedProxy returns true for clients that require proxy mode for proper seeking
-// Currently disabled - all clients that needed proxy are now in needsHLSStitching.
-func needsForcedProxy(_ string) bool {
-	return false
-}
-
-// needsHLSStitching returns true for clients that cannot decode HLS manifests
-// and need the server to download and stitch HLS segments into raw audio.
-// These clients (like psysonic using Symphonia) require continuous audio data.
-func needsHLSStitching(clientName string) bool {
+// doesntSupportHLS returns true for clients that cannot natively decode HLS manifests.
+// These clients require the server to stitch segments into a continuous raw audio stream.
+// The list can be pruned as developers add proper HLS support to their clients.
+func doesntSupportHLS(clientName string) bool {
 	lower := strings.ToLower(clientName)
-	return lower == "psysonic" || lower == "tempus" || lower == "symfonium"
+	switch lower {
+	case "psysonic", "tempus", "symfonium", "supersonic":
+		// These clients don't properly handle HLS manifests yet
+		// Note: supersonic CAN handle HLS but stitching provides better gapless
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.Response {
@@ -145,23 +146,42 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	c.dbc.Exec(`INSERT INTO plays (user_id, uri, provider, played_at, count) VALUES (?, ?, 'tidal', ?, 1) ON CONFLICT(user_id, uri) DO UPDATE SET count=count+1, played_at=?`,
 		user.ID, trackURI, time.Now(), time.Now())
 
-	// 2. Redirect if not proxying (force proxy for certain Android clients that can't seek with redirects)
-	// [FIX] Now allows redirects for HLS/DASH - MPV/Supersonic handles them natively
-	// [FIX] Force proxy for clients needing HLS stitching (psysonic) - they need raw audio, not manifests
+	// 2. Route based on client HLS support
 	proxyStreams := c.getCachedSetting("proxy_streams", "false")
-	needsStitch := prep.IsHLS && needsHLSStitching(prep.ClientName)
-	if proxyStreams != "true" && !needsForcedProxy(prep.ClientName) && !needsStitch {
-		urlPreview := prep.StreamURL
+	clientNeedsHelp := doesntSupportHLS(prep.ClientName)
+	streamURL := prep.StreamURL
+
+	if clientNeedsHelp && prep.IsHLS {
+		// Client can't handle HLS natively - try to unwrap to progressive URL
+		if directURL := c.unwrapTidalManifest(r.Context(), prep.StreamURL, prep.ClientIP, 0); directURL != "" {
+			log.Printf("[STREAM] Unwrapped HLS to progressive for %s track=%d", prep.ClientName, id.Value())
+			streamURL = directURL
+			prep.IsHLS = false // Now it's a direct progressive stream
+		} else {
+			// Unwrap failed - must stitch for this client
+			urlPreview := prep.StreamURL
+			if len(urlPreview) > 100 {
+				urlPreview = urlPreview[:100] + "..."
+			}
+			log.Printf("[STREAM] HLS stitch mode for %s track=%d URL=%s", prep.ClientName, id.Value(), urlPreview)
+			// Fall through to stitching logic below
+		}
+	}
+
+	// Redirect if not proxying and not stitching
+	needsStitch := clientNeedsHelp && prep.IsHLS
+	if proxyStreams != "true" && !needsStitch {
+		urlPreview := streamURL
 		if len(urlPreview) > 100 {
 			urlPreview = urlPreview[:100]
 		}
 		log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s",
 			id.Value(), prep.IsHLS, urlPreview)
-		http.Redirect(w, r, prep.StreamURL, http.StatusFound)
+		http.Redirect(w, r, streamURL, http.StatusFound)
 		return nil
 	}
 
-	// 3. Proxy stream
+	// 3. Proxy/Stitch stream
 	if !prep.IsHLS && !prep.IsDASH {
 		contentType := "audio/flac"
 		if prep.Ext == "m4a" {
@@ -175,73 +195,56 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		}
 	}
 
-	if prep.IsHLS {
-		if needsHLSStitching(prep.ClientName) {
-			// Clients like psysonic (Symphonia) cannot decode HLS manifests
-			// Download and stitch segments into raw audio stream
-			urlPreview := prep.StreamURL
-			if len(urlPreview) > 100 {
-				urlPreview = urlPreview[:100]
-			}
-			log.Printf("[STREAM] HLS stitch mode for %s track=%d URL=%s", prep.ClientName, id.Value(), urlPreview)
+	if prep.IsHLS && needsStitch {
+		// Stitching required: download and stitch HLS segments
+		urlPreview := prep.StreamURL
+		if len(urlPreview) > 100 {
+			urlPreview = urlPreview[:100]
+		}
+		log.Printf("[STREAM] Starting HLS stitch for %s track=%d", prep.ClientName, id.Value())
 
-			// --- RANGE CALCULATION LOGIC ---
-			rangeHdr := r.Header.Get("Range")
-			offsetSeconds := 0.0
-			startByte := int64(0)
-			var totalBytes int64 = 0
+		// --- RANGE CALCULATION LOGIC ---
+		rangeHdr := r.Header.Get("Range")
+		offsetSeconds := 0.0
+		startByte := int64(0)
+		var totalBytes int64 = 0
 
-			bytesPerSec := int64(125000)
-			if prep.Quality == "HIGH" || prep.Quality == "LOW" || prep.Ext == "m4a" {
-				bytesPerSec = 40000
-			} else if prep.Quality == "HI_RES_LOSSLESS" {
-				bytesPerSec = 175000
-			}
+		bytesPerSec := int64(125000)
+		if prep.Quality == "HIGH" || prep.Quality == "LOW" || prep.Ext == "m4a" {
+			bytesPerSec = 40000
+		} else if prep.Quality == "HI_RES_LOSSLESS" {
+			bytesPerSec = 175000
+		}
 
-			if prep.Track != nil && prep.Track.Duration > 0 {
-				totalBytes = int64(prep.Track.Duration) * bytesPerSec
-			}
+		if prep.Track != nil && prep.Track.Duration > 0 {
+			totalBytes = int64(prep.Track.Duration) * bytesPerSec
+		}
 
-			timeOffsetParam := p.GetOrFloat("timeOffset", 0.0)
-			if timeOffsetParam > 0 {
-				offsetSeconds = timeOffsetParam
-			} else if rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") && totalBytes > 0 {
-				parts := strings.Split(strings.TrimPrefix(rangeHdr, "bytes="), "-")
-				if len(parts) > 0 && parts[0] != "" {
-					if parsedByte, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
-						startByte = parsedByte
-						offsetSeconds = float64(startByte) / float64(bytesPerSec)
-						if offsetSeconds > float64(prep.Track.Duration) {
-							offsetSeconds = float64(prep.Track.Duration) - 1
-						}
-						if offsetSeconds < 0 {
-							offsetSeconds = 0
-						}
+		timeOffsetParam := p.GetOrFloat("timeOffset", 0.0)
+		if timeOffsetParam > 0 {
+			offsetSeconds = timeOffsetParam
+		} else if rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") && totalBytes > 0 {
+			parts := strings.Split(strings.TrimPrefix(rangeHdr, "bytes="), "-")
+			if len(parts) > 0 && parts[0] != "" {
+				if parsedByte, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+					startByte = parsedByte
+					offsetSeconds = float64(startByte) / float64(bytesPerSec)
+					if offsetSeconds > float64(prep.Track.Duration) {
+						offsetSeconds = float64(prep.Track.Duration) - 1
+					}
+					if offsetSeconds < 0 {
+						offsetSeconds = 0
 					}
 				}
 			}
+		}
 
-			err = c.downloadAndStitchHLS(streamCtx, prep.StreamURL, w, prep.ClientIP, prep.Track, offsetSeconds, startByte, totalBytes)
-			if err != nil {
-				streamErr = err
-				log.Printf("[STREAM] ERROR: HLS stitch failed for track %d: %v", id.Value(), err)
-			} else {
-				log.Printf("[STREAM] HLS stitch succeeded for track %d", id.Value())
-			}
+		err = c.downloadAndStitchHLS(streamCtx, prep.StreamURL, w, prep.ClientIP, prep.Track, offsetSeconds, startByte, totalBytes)
+		if err != nil {
+			streamErr = err
+			log.Printf("[STREAM] ERROR: HLS stitch failed for track %d: %v", id.Value(), err)
 		} else {
-			// [NEW] Serve HLS manifest directly to MPV - it handles HLS natively
-			urlPreview := prep.StreamURL
-			if len(urlPreview) > 100 {
-				urlPreview = urlPreview[:100]
-			}
-			log.Printf("[STREAM] DEBUG: proxying HLS manifest for track %d URL=%s", id.Value(), urlPreview)
-			err = c.proxyHLSManifest(streamCtx, prep.StreamURL, w, prep.ClientIP)
-			if err != nil {
-				streamErr = err
-				log.Printf("[STREAM] ERROR: HLS proxy failed for track %d: %v", id.Value(), err)
-			} else {
-				log.Printf("[STREAM] DEBUG: HLS proxy succeeded for track %d", id.Value())
-			}
+			log.Printf("[STREAM] HLS stitch succeeded for track %d", id.Value())
 		}
 	} else if prep.IsDASH {
 		// [NEW] Serve DASH manifest directly

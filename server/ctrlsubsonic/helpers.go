@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -456,4 +458,139 @@ func (c *Controller) hydratePlaylistBackground(playlistID int, trackIDs []int) {
 
 		log.Printf("[HYDRATE] Completed playlist %d hydration (%d/%d tracks cached)", playlistID, hydrated, len(trackIDs))
 	}()
+}
+
+// unwrapTidalManifest recursively extracts the underlying progressive media URL from HLS/DASH manifests.
+// By doing this, we bypass the need to serve M3U8 files to the client or do server-side stitching,
+// achieving zero-bandwidth gapless playback directly from Tidal's CDN.
+func (c *Controller) unwrapTidalManifest(ctx context.Context, manifestURL string, clientIP string, depth int) string {
+	// Prevent infinite recursion in malicious or broken manifests
+	if depth > 3 {
+		log.Printf("[UNWRAP] Max recursion depth reached for %s", manifestURL)
+		return ""
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", manifestURL, nil)
+	if err != nil {
+		return ""
+	}
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+		req.Header.Set("X-Real-IP", clientIP)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := c.streamClient.Do(req)
+	if err != nil {
+		log.Printf("[UNWRAP] Network error fetching manifest depth %d: %v", depth, err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[UNWRAP] HTTP %d fetching manifest depth %d", resp.StatusCode, depth)
+		return ""
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	content := string(bodyBytes)
+
+	// Robust URL resolution using net/url (handles absolute, relative, and root paths natively)
+	baseURL, err := url.Parse(manifestURL)
+	if err != nil {
+		return ""
+	}
+	resolveURL := func(ref string) string {
+		if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+			return ref
+		}
+		refURL, err := url.Parse(ref)
+		if err != nil {
+			return ref
+		}
+		return baseURL.ResolveReference(refURL).String()
+	}
+
+	// 1. DASH Bypass
+	if strings.Contains(manifestURL, ".mpd") || strings.Contains(manifestURL, "MPEG_DASH") || strings.Contains(content, "<MPD") {
+		if start := strings.Index(content, "<BaseURL>"); start != -1 {
+			start += 9
+			if end := strings.Index(content[start:], "</BaseURL>"); end != -1 {
+				uri := content[start : start+end]
+				uri = strings.ReplaceAll(uri, "&amp;", "&")
+				resolved := resolveURL(uri)
+				log.Printf("[UNWRAP] Extracted DASH BaseURL: %s", resolved)
+				return resolved
+			}
+		}
+		return ""
+	}
+
+	// 2. HLS Bypass
+	lines := strings.Split(content, "\n")
+	isMaster := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "#EXT-X-STREAM-INF") {
+			isMaster = true
+			break
+		}
+	}
+
+	// If Master Playlist, extract the variant and recursively unwrap it
+	if isMaster {
+		for i, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "#EXT-X-STREAM-INF") {
+				// The next non-empty, non-comment line is our variant URI
+				for j := i + 1; j < len(lines); j++ {
+					variantLine := strings.TrimSpace(lines[j])
+					if variantLine != "" && !strings.HasPrefix(variantLine, "#") {
+						resolved := resolveURL(variantLine)
+						log.Printf("[UNWRAP] Recursing into HLS variant: %s", resolved)
+						return c.unwrapTidalManifest(ctx, resolved, clientIP, depth+1)
+					}
+				}
+			}
+		}
+		return ""
+	}
+
+	// If Media Playlist, ensure it's a single-file byterange manifest.
+	// If it doesn't have BYTERANGE, it means it's a true multi-segment HLS.
+	// We CANNOT unwrap true multi-segment files, so we abort and return empty.
+	if !strings.Contains(content, "BYTERANGE") {
+		log.Printf("[UNWRAP] HLS is multi-segment (no BYTERANGE). Aborting unwrap.")
+		return ""
+	}
+
+	// Extract MAP URI (Contains the fMP4 Headers + Audio Data)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#EXT-X-MAP:URI=") {
+			// Extract exactly what's inside the quotes: #EXT-X-MAP:URI="url"
+			parts := strings.SplitN(strings.TrimPrefix(line, "#EXT-X-MAP:URI="), ",", 2)
+			uri := strings.Trim(parts[0], "\"")
+			resolved := resolveURL(uri)
+			log.Printf("[UNWRAP] Extracted HLS MAP URI: %s", resolved)
+			return resolved
+		}
+	}
+
+	// Fallback: If no MAP exists but BYTERANGE is present, return the first segment URI.
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			resolved := resolveURL(line)
+			log.Printf("[UNWRAP] Extracted HLS first segment URI: %s", resolved)
+			return resolved
+		}
+	}
+
+	return ""
 }

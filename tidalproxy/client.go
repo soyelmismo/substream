@@ -1201,21 +1201,21 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 
 	switch requestedQuality {
 	case "HI_RES_LOSSLESS":
-		// [CRITICAL] For HI_RES_LOSSLESS, prioritize BTS for native FLAC.
+		// For HI_RES_LOSSLESS, prioritize BTS for native FLAC.
 		// Fallback to HLS if BTS fails (same quality, fMP4 container).
-		combos = append(combos, combo{"BTS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES", "MQA"}})
+		combos = append(combos, combo{"BTS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES"}})
 		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
-		combos = append(combos, combo{"HLS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES", "MQA"}})
+		combos = append(combos, combo{"HLS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES"}})
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
-		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
-		combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
+		//combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
+		//combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
 	case "LOSSLESS":
-		// [CRITICAL] For LOSSLESS, prioritize BTS for native FLAC.
+		// For LOSSLESS, prioritize BTS for native FLAC.
 		// Fallback to HLS if BTS fails (same quality, fMP4 container).
 		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
-		combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
-		combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
+		//combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
+		//combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
 	default:
 		combos = append(combos, combo{"BTS", requestedQuality, []string{"AACLC", "HEAACV1"}})
 		combos = append(combos, combo{"HLS", requestedQuality, []string{"AACLC", "HEAACV1"}})
@@ -1353,8 +1353,9 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 			}
 
 			if res.Err == nil && res.URL != "" {
-				// FAST PATH: Calidad solicitada encontrada
-				if res.Quality == requestedQuality {
+				// FAST PATH: Calidad solicitada encontrada Y ES BTS (progresivo)
+				// NO aceptamos HLS en fast path porque rompe el gapless playback
+				if res.Quality == requestedQuality && res.ManifestType == "BTS" {
 					formatType := "AAC"
 					if strings.Contains(res.Quality, "LOSSLESS") || strings.Contains(res.Quality, "FLAC") {
 						formatType = "FLAC"
@@ -1365,17 +1366,13 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 					return &res, errorsList, isUnavailable, true
 				}
 
-				// BONUS: FLAC encontrado cuando se pidió AAC
-				if (res.Quality == "LOSSLESS" || res.Quality == "HI_RES_LOSSLESS") && requestedQuality == "HIGH" {
-					log.Printf("[SHOTGUN] 🎯 BONUS UPGRADE track %d: FLAC encontrado (pidió AAC), desde %s en %v",
-						trackID, res.Mirror.URL, res.Latency)
-					cancel()
-					return &res, errorsList, isUnavailable, true
-				}
-
-				// Guardar mejor resultado del batch
+				// Si no es la calidad exacta o es HLS, guardamos como backup
+				// El isBetterResult se encarga de priorizar BTS > HLS y mejor calidad
 				if batchBest == nil || isBetterResult(&res, batchBest) {
 					batchBest = &res
+					if graceTimer != nil {
+						graceTimer.Stop()
+					}
 					graceTimer = time.NewTimer(gracePeriod)
 				}
 			} else if res.Err != nil {
@@ -1409,12 +1406,23 @@ func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int
 // isBetterResult determina si un resultado de stream es mejor que otro
 // Prioridad: BTS > HLS, FLAC > AAC
 func isBetterResult(new, current *streamResult) bool {
+	// 1. Siempre preferir BTS (Progresivo) sobre HLS (mejor para gapless)
 	if new.ManifestType == "BTS" && current.ManifestType == "HLS" {
 		return true
 	}
-	if new.ManifestType == "HLS" && current.ManifestType == "HLS" {
-		if (new.Quality == "LOSSLESS" || new.Quality == "HI_RES_LOSSLESS") &&
-			(current.Quality == "HIGH" || current.Quality == "LOW") {
+
+	// 2. Si ambos son del mismo tipo de manifiesto, preferir mejor calidad
+	if new.ManifestType == current.ManifestType {
+		// HI_RES > LOSSLESS > HIGH > LOW
+		qualityOrder := map[string]int{
+			"HI_RES_LOSSLESS": 4,
+			"LOSSLESS":        3,
+			"HIGH":            2,
+			"LOW":             1,
+		}
+		newOrder := qualityOrder[new.Quality]
+		currentOrder := qualityOrder[current.Quality]
+		if newOrder > currentOrder {
 			return true
 		}
 	}
