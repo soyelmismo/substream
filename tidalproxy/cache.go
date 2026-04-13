@@ -177,6 +177,50 @@ func (c *CachedProxy) cacheTrackJSON(t *TidalTrack) {
 	}
 }
 
+// backfillTrackYear fills in Album.ReleaseDate from album cache if track lacks it
+// Checks both LRU and SQLite persistent cache
+func (c *CachedProxy) backfillTrackYear(t *TidalTrack) {
+	if t.Album.ReleaseDate != "" || t.Album.ID == 0 {
+		return // Already has year or no album ID
+	}
+	albumKey := fmt.Sprintf("td:al:%d", t.Album.ID)
+
+	// 1. Try LRU cache first (fast)
+	if cached := c.albums.Get(albumKey); cached != nil {
+		var album TidalAlbum
+		if err := json.Unmarshal(cached, &album); err == nil && album.ReleaseDate != "" {
+			t.Album.ReleaseDate = album.ReleaseDate
+			return
+		}
+	}
+
+	// 2. Fallback to SQLite persistent cache
+	if c.db != nil {
+		if cached := c.db.GetCachedMetadata(albumKey); cached != nil {
+			var album TidalAlbum
+			if err := json.Unmarshal(cached, &album); err == nil && album.ReleaseDate != "" {
+				t.Album.ReleaseDate = album.ReleaseDate
+				// Warm the LRU cache for next time
+				c.albums.Set(albumKey, cached, 0)
+				return
+			}
+		}
+	}
+}
+
+// backfillAlbumTracks propagates album ReleaseDate to all tracks in the album
+// Used when reading cached albums that may have tracks without year
+func (c *CachedProxy) backfillAlbumTracks(a *TidalAlbum) {
+	if a.ReleaseDate == "" || len(a.Items) == 0 {
+		return
+	}
+	for i := range a.Items {
+		if a.Items[i].Album.ReleaseDate == "" {
+			a.Items[i].Album.ReleaseDate = a.ReleaseDate
+		}
+	}
+}
+
 // cacheAlbumJSON adds an album to both LRU and persistent write-back buffer
 func (c *CachedProxy) cacheAlbumJSON(a *TidalAlbum) {
 	if a == nil || a.ID == 0 {
@@ -184,14 +228,18 @@ func (c *CachedProxy) cacheAlbumJSON(a *TidalAlbum) {
 	}
 
 	albumRef := TidalAlbumRef{
-		ID:    a.ID,
-		Title: a.Title,
-		Cover: a.Cover,
+		ID:          a.ID,
+		Title:       a.Title,
+		Cover:       a.Cover,
+		ReleaseDate: a.ReleaseDate, // [YEAR] Propagate album year to tracks
 	}
 
 	for i := range a.Items {
 		if a.Items[i].Album.ID == 0 {
 			a.Items[i].Album = albumRef
+		} else if a.Items[i].Album.ReleaseDate == "" {
+			// Track has album ref but no year - fill it in
+			a.Items[i].Album.ReleaseDate = a.ReleaseDate
 		}
 		if len(a.Items[i].Artists) == 0 && len(a.Artists) > 0 {
 			a.Items[i].Artists = a.Artists
@@ -220,15 +268,29 @@ func (c *CachedProxy) cacheAlbumJSON(a *TidalAlbum) {
 func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrack, error) {
 	key := fmt.Sprintf("td:tr:%d", trackID)
 
-	// 1. Check in-memory LRU cache
+	// 1. Check in-memory LRU cache first
 	if cached := c.tracks.Get(key); cached != nil {
+		c.pendingMu.Lock()
+		if pending := c.pending[key]; pending != nil {
+			// Pending has newer data, use it and update LRU
+			c.pendingMu.Unlock()
+			c.tracks.Set(key, pending, 0)
+			var t TidalTrack
+			if err := json.Unmarshal(pending, &t); err == nil {
+				c.backfillTrackYear(&t) // [YEAR] Backfill from album cache
+				return &t, nil
+			}
+		} else {
+			c.pendingMu.Unlock()
+		}
 		var t TidalTrack
 		if err := json.Unmarshal(cached, &t); err == nil {
+			c.backfillTrackYear(&t) // [YEAR] Backfill from album cache
 			return &t, nil
 		} else {
-			// Data exists but is corrupt/invalid
+			// Data in pending buffer is corrupt (shouldn't happen)
 			c.tracks.MarkCorrupt()
-			log.Printf("[CACHE ANOMALY] corrupt track data for key=%s: %v", key, err)
+			log.Printf("[CACHE ANOMALY] corrupt track in pending buffer key=%s: %v", key, err)
 		}
 	}
 
@@ -253,6 +315,7 @@ func (c *CachedProxy) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrac
 		if cached := c.db.GetCachedMetadata(key); cached != nil {
 			var t TidalTrack
 			if err := json.Unmarshal(cached, &t); err == nil {
+				c.backfillTrackYear(&t)      // [YEAR] Backfill from album cache
 				c.tracks.Set(key, cached, 0) // Warm LRU cache
 				return &t, nil
 			} else {
@@ -293,6 +356,7 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 			c.albums.MarkCorrupt()
 			log.Printf("[CACHE ANOMALY] corrupt album data in LRU key=%s", key)
 		} else if a != nil {
+			c.backfillAlbumTracks(a) // [YEAR] Fix tracks that lack year
 			return a, nil
 		}
 	}
@@ -305,6 +369,7 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 			c.albums.MarkCorrupt()
 			log.Printf("[CACHE ANOMALY] corrupt album in pending buffer key=%s", key)
 		} else if a != nil {
+			c.backfillAlbumTracks(a) // [YEAR] Fix tracks that lack year
 			return a, nil
 		}
 	} else {
@@ -318,6 +383,7 @@ func (c *CachedProxy) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbu
 				c.albums.MarkCorrupt()
 				log.Printf("[CACHE ANOMALY] corrupt album in SQLite key=%s", key)
 			} else if a != nil {
+				c.backfillAlbumTracks(a)     // [YEAR] Fix tracks that lack year
 				c.albums.Set(key, cached, 0) // Warm LRU cache
 				return a, nil
 			}
@@ -402,6 +468,7 @@ func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) ma
 			var a TidalAlbum
 			if err := json.Unmarshal(cached, &a); err == nil {
 				if len(a.Items) > 0 || a.NumberOfTracks == 0 {
+					c.backfillAlbumTracks(&a) // [YEAR] Fix tracks that lack year
 					result[id] = &a
 					continue
 				}
@@ -436,6 +503,7 @@ func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) ma
 						var id int
 						fmt.Sscanf(key, "td:al:%d", &id)
 						if id > 0 {
+							c.backfillAlbumTracks(&a) // [YEAR] Fix tracks that lack year
 							result[id] = &a
 							c.albums.Set(key, data, 0) // Warm LRU
 							foundIDs[id] = struct{}{}
