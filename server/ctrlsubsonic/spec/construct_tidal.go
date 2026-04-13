@@ -2,6 +2,7 @@ package spec
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -9,6 +10,31 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 	"go.senan.xyz/gonic/tidalproxy"
 )
+
+// nonAsciiUnsafe matches any character that is NOT a safe filename char.
+// Allows: Unicode letters (incluye tildes, ñ, ü, etc.), numbers, space, period, hyphen, underscore
+var nonAsciiUnsafe = regexp.MustCompile(`[^\p{L}\p{N} ._-]+`)
+
+// sanitizeFilename sanitizes a string for safe use in filenames.
+// Removes all non-ASCII and unsafe filesystem characters.
+func sanitizeFilename(s string) string {
+	// First replace common unsafe chars with hyphen
+	replacer := strings.NewReplacer(
+		"/", "-",
+		"\\", "-",
+		":", "-",
+		"*", "",
+		"?", "",
+		"\"", "'",
+		"<", "",
+		">", "",
+		"|", "-",
+	)
+	s = replacer.Replace(s)
+	// Then remove all non-ASCII/unsafe unicode characters
+	s = nonAsciiUnsafe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
 
 // NewTrackFromTidal converts a Tidal track to Subsonic TrackChild
 func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
@@ -20,13 +46,28 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 	trackID := &specid.ID{URI: fmt.Sprintf("td:tr:%d", t.ID)}
 	albumID := &specid.ID{URI: fmt.Sprintf("td:al:%d", t.Album.ID)}
 	artistID := &specid.ID{URI: fmt.Sprintf("td:ar:%d", t.Artist.ID)}
-	
+
 	// Use track ID as fallback for cover if album ID is invalid
 	coverIDValue := t.Album.ID
 	if coverIDValue == 0 {
 		coverIDValue = t.ID
 	}
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", coverIDValue)}
+
+	// Determine quality and suffix first
+	suffix := "flac"
+	bitrate := 1411
+	contentType := "audio/flac"
+	if t.AudioQuality == "HIGH" || t.AudioQuality == "LOW" {
+		bitrate = 320
+		contentType = "audio/mp4"
+		suffix = "m4a"
+	}
+
+	// Build user-friendly path: audio/artista/NN. artista - titulo.formato
+	safeArtist := sanitizeFilename(artistName)
+	safeTitle := sanitizeFilename(t.Title)
+	path := fmt.Sprintf("audio/%s/%02d. %s - %s.%s", safeArtist, t.TrackNumber, safeArtist, safeTitle, suffix)
 
 	tc := &TrackChild{
 		ID:          trackID,
@@ -40,22 +81,14 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 		TrackNumber: t.TrackNumber,
 		DiscNumber:  t.VolumeNumber,
 		Duration:    t.Duration,
-		Bitrate:     1411,
-		ContentType: "audio/flac",
-		Suffix:      "flac",
+		Bitrate:     bitrate,
+		ContentType: contentType,
+		Suffix:      suffix,
 		Size:        t.Duration * 176400, // approximate FLAC size
 		IsDir:       false,
 		Type:        "music",
-		Path:        fmt.Sprintf("tidal/%d/%d.flac", t.Album.ID, t.ID),
+		Path:        path,
 		Year:        parseYear(t.Album.ReleaseDate),
-	}
-
-	// Adjust for standard high quality if we can detect it (TODO)
-	// For now default to FLAC 1411 as we prefer LOSSLESS
-	if t.AudioQuality == "HIGH" || t.AudioQuality == "LOW" {
-		tc.Bitrate = 320
-		tc.ContentType = "audio/mp4"
-		tc.Suffix = "m4a"
 	}
 
 	// multi-artist

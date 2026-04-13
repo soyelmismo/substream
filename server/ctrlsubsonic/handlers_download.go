@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,6 +16,10 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
+
+// nonAsciiUnsafe matches any character that is NOT a safe filename char.
+// Allows: Unicode letters (incluye tildes, ñ, ü, etc.), numbers, space, period, hyphen, underscore
+var nonAsciiUnsafe = regexp.MustCompile(`[^\p{L}\p{N} ._-]+`)
 
 // ServeDownload handles download requests for albums/playlists as ZIP files
 // OpenSubsonic extension: https://opensubsonic.netlify.app/docs/endpoints/download/
@@ -102,21 +107,22 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 			continue
 		}
 
-		// Determine extension based on quality setting, not stream URL
-		// Tidal returns manifests that don't reflect the actual codec in URL
+		// Determine extension based on stream type and quality
+		// HLS streams use fMP4 container even for LOSSLESS, so always .m4a for HLS
+		isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
 		ext := "m4a" // Default AAC/MP4
-		switch tidalQuality {
-		case "LOSSLESS", "HI_RES_LOSSLESS":
-			ext = "flac"
-		case "LOW", "HIGH":
-			ext = "m4a"
-		default:
-			// Fallback to URL detection for unknown qualities
-			if strings.Contains(streamURL, ".flac") {
+		if !isHLS {
+			// For non-HLS (BTS/progressive), FLAC is actually FLAC
+			switch tidalQuality {
+			case "LOSSLESS", "HI_RES_LOSSLESS":
 				ext = "flac"
-			} else if strings.Contains(streamURL, ".mp3") {
-				ext = "mp3"
 			}
+		}
+		// Fallback to URL detection
+		if strings.Contains(streamURL, ".flac") {
+			ext = "flac"
+		} else if strings.Contains(streamURL, ".mp3") {
+			ext = "mp3"
 		}
 
 		trackFile := fmt.Sprintf("%02d - %s.%s", track.TrackNumber, track.Title, ext)
@@ -225,13 +231,25 @@ func (c *Controller) downloadAndAddToZip(ctx context.Context, streamURL string, 
 	return err
 }
 
+// sanitizeFilename sanitizes a string for safe use in filenames.
+// Removes unsafe filesystem characters but keeps Unicode letters (tildes, ñ, ü, etc.)
 func sanitizeFilename(name string) string {
-	// Replace characters that are invalid in filenames
-	invalid := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
-	for _, char := range invalid {
-		name = strings.ReplaceAll(name, char, "_")
-	}
-	return name
+	// First replace common unsafe chars with hyphen
+	replacer := strings.NewReplacer(
+		"/", "-",
+		"\\", "-",
+		":", "-",
+		"*", "",
+		"?", "",
+		"\"", "'",
+		"<", "",
+		">", "",
+		"|", "-",
+	)
+	name = replacer.Replace(name)
+	// Then remove symbols and non-ASCII unicode (but keep letters with tildes)
+	name = nonAsciiUnsafe.ReplaceAllString(name, "")
+	return strings.TrimSpace(name)
 }
 
 func getClientIP(r *http.Request) string {

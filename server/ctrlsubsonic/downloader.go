@@ -32,11 +32,14 @@ type segmentInfo struct {
 // panic via an arithmetic sign error in Psysonic's seek-end adjustment.
 //
 // Box layouts (version 0):
-//   [size:4][name:4][ver:1][flags:3][ctime:4][mtime:4][timescale:4][duration:4]
-//   offsets from box start: timescale=20, duration=24
+//
+//	[size:4][name:4][ver:1][flags:3][ctime:4][mtime:4][timescale:4][duration:4]
+//	offsets from box start: timescale=20, duration=24
+//
 // Box layouts (version 1):
-//   [size:4][name:4][ver:1][flags:3][ctime:8][mtime:8][timescale:4][duration:8]
-//   offsets from box start: timescale=28, duration=32
+//
+//	[size:4][name:4][ver:1][flags:3][ctime:8][mtime:8][timescale:4][duration:8]
+//	offsets from box start: timescale=28, duration=32
 func fixMp4Durations(data []byte, totalDurationSecs float64) {
 	i := 0
 	for i+8 <= len(data) {
@@ -89,11 +92,11 @@ func createFakeSidx(segments []segmentInfo, bytesPerSec int64, firstOffset uint3
 	buf := make([]byte, boxSize)
 	binary.BigEndian.PutUint32(buf[0:4], uint32(boxSize))
 	copy(buf[4:8], []byte("sidx"))
-	buf[8] = 0 // version 0
-	buf[9], buf[10], buf[11] = 0, 0, 0 // flags
+	buf[8] = 0                                // version 0
+	buf[9], buf[10], buf[11] = 0, 0, 0        // flags
 	binary.BigEndian.PutUint32(buf[12:16], 1) // reference_ID
 	binary.BigEndian.PutUint32(buf[16:20], timescale)
-	binary.BigEndian.PutUint32(buf[20:24], 0) // earliest_presentation_time
+	binary.BigEndian.PutUint32(buf[20:24], 0)           // earliest_presentation_time
 	binary.BigEndian.PutUint32(buf[24:28], firstOffset) // first_offset (relative to anchor)
 
 	// reserved = 0, reference_count
@@ -287,7 +290,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			if len(initData) >= 8 && string(initData[4:8]) == "ftyp" {
 				rw.Header().Set("Content-Type", "audio/mp4")
 				// Remove any incorrect Content-Disposition from ServeStream
-				if rw.Header().Get("Content-Disposition") != "" {
+				if rw.Header().Get("Content-Disposition") != "" && track != nil {
 					cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s", track.Artist.Name, track.Title), "/", "_")
 					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
 				}
@@ -300,17 +303,17 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 					if totalBytes > 0 {
 						bps = totalBytes / int64(track.Duration)
 					}
-					
+
 					fixMp4Durations(initData, float64(track.Duration))
-					
+
 					firstOffset := uint32(len(initData)) - ftypLen
 					fakeSidx := createFakeSidx(segments, bps, firstOffset)
-					
+
 					newInitData := make([]byte, 0, len(initData)+len(fakeSidx))
 					newInitData = append(newInitData, initData[:ftypLen]...)
 					newInitData = append(newInitData, fakeSidx...)
 					newInitData = append(newInitData, initData[ftypLen:]...)
-					
+
 					initData = newInitData
 					if totalBytes > 0 {
 						totalBytes += int64(len(fakeSidx))
@@ -318,7 +321,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 					log.Printf("[DOWNLOAD] Injected simulated sidx index box (%d bytes) to support seeking", len(fakeSidx))
 				}
 			}
-			
+
 			if totalBytes > 0 {
 				rw.Header().Set("Accept-Ranges", "bytes")
 			}
@@ -706,7 +709,7 @@ func (t *flacTagger) process(r io.Reader, c *Controller) error {
 			rw.Header().Set("Content-Type", "audio/mp4")
 			rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
 		}
-		
+
 		if t.totalBytes > 0 {
 			rw.Header().Set("Accept-Ranges", "bytes")
 		} else {
