@@ -1096,7 +1096,72 @@ func filterMirrorError(err error) error {
 
 func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID int, clientIP string) streamResult {
 	start := time.Now()
+	res := streamResult{
+		Mirror:       task.Mirror,
+		ManifestType: task.ManifestType,
+		Quality:      task.Quality,
+	}
 
+	// --- RUTA V1: Exclusiva para BTS (Idéntico a Python) ---
+	if task.ManifestType == "BTS" {
+		qV1 := url.Values{
+			"id":      {fmt.Sprint(trackID)},
+			"quality": {task.Quality},
+		}
+
+		var v1Response struct {
+			Data struct {
+				TrackID           int    `json:"trackId"`
+				AudioQuality      string `json:"audioQuality"`
+				ManifestMimeType  string `json:"manifestMimeType"`
+				Manifest          string `json:"manifest"`
+				AssetPresentation string `json:"assetPresentation"`
+			} `json:"data"`
+		}
+
+		err := p.doFetchRawWithMirror(ctx, "/track/", qV1, clientIP, task.Mirror, &v1Response)
+		res.Latency = time.Since(start)
+		res.Err = err
+
+		if err != nil {
+			log.Printf("[BTS:DEBUG] Mirror %s error for track %d: %v", task.Mirror.URL, trackID, err)
+			return res
+		}
+
+		if v1Response.Data.AssetPresentation == "PREVIEW" {
+			log.Printf("[BTS:DEBUG] Mirror %s returned PREVIEW for track %d", task.Mirror.URL, trackID)
+			res.Err = fmt.Errorf("preview track")
+			return res
+		}
+
+		if v1Response.Data.Manifest == "" {
+			log.Printf("[BTS:DEBUG] Mirror %s empty manifest for track %d (quality: %s)", task.Mirror.URL, trackID, task.Quality)
+			res.Err = fmt.Errorf("empty manifest")
+			return res
+		}
+
+		audioURL, parseErr := parseManifestURL(trackID, "V1-BTS", v1Response.Data.ManifestMimeType, v1Response.Data.Manifest)
+		if parseErr != nil {
+			log.Printf("[BTS:DEBUG] Mirror %s parse error for track %d: %v", task.Mirror.URL, trackID, parseErr)
+			res.Err = fmt.Errorf("parse error: %w", parseErr)
+			return res
+		}
+		if audioURL == "" {
+			log.Printf("[BTS:DEBUG] Mirror %s empty URL after parse for track %d", task.Mirror.URL, trackID)
+			res.Err = fmt.Errorf("empty url after parse")
+			return res
+		}
+
+		urlPreview := audioURL
+		if len(urlPreview) > 80 {
+			urlPreview = urlPreview[:80]
+		}
+		log.Printf("[BTS:DEBUG] Mirror %s SUCCESS for track %d: %s...", task.Mirror.URL, trackID, urlPreview)
+		res.URL = audioURL
+		return res
+	}
+
+	// --- RUTA V2: Exclusiva para HLS ---
 	qV2 := url.Values{
 		"id":           {fmt.Sprint(trackID)},
 		"manifestType": {task.ManifestType},
@@ -1118,15 +1183,8 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 	}
 
 	err := p.doFetchRawWithMirror(ctx, "/trackManifests/", qV2, clientIP, task.Mirror, &v2Response)
-	latency := time.Since(start)
-
-	res := streamResult{
-		Mirror:       task.Mirror,
-		ManifestType: task.ManifestType,
-		Quality:      task.Quality,
-		Latency:      latency,
-		Err:          err,
-	}
+	res.Latency = time.Since(start)
+	res.Err = err
 
 	if err != nil {
 		return res
@@ -1137,7 +1195,7 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 		return res
 	}
 
-	// 1. Extraer URL de un JSON Base64 (Típico de BTS)
+	// Extraer URL de un JSON Base64 (A veces V2 lo envía)
 	manifestB64 := v2Response.Data.Attributes.Manifest
 	if manifestB64 != "" {
 		audioURL, parseErr := parseManifestURL(trackID, "V2-"+task.ManifestType, v2Response.Data.Attributes.ManifestMimeType, manifestB64)
@@ -1147,15 +1205,14 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 		}
 	}
 
-	// 2. Extraer de URI directa (Devuelto por HLS)
-	// Como ahora MPV procesa HLS crudo, simplemente devolvemos esta URL
+	// Extraer de URI directa (Típico de HLS en V2)
 	uri := v2Response.Data.Attributes.URI
 	if uri != "" {
 		res.URL = uri
 		return res
 	}
 
-	res.Err = fmt.Errorf("no valid stream url found in response")
+	res.Err = fmt.Errorf("no valid hls stream url found in v2 response")
 	return res
 }
 
