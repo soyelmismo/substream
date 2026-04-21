@@ -240,6 +240,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobble
 	// Streaming
 	c.Handle("/stream", chainRaw(respRaw(c.ServeStream)))
 	c.Handle("/download", chainRaw(respRaw(c.ServeDownload)))
+	c.Handle("/hls.m3u8", chainRaw(respRaw(c.ServeHLS))) // OpenSubsonic HLS endpoint
 	c.Handle("/getCoverArt", chainRaw(respRaw(c.ServeGetCoverArt)))
 
 	// Stars & Ratings

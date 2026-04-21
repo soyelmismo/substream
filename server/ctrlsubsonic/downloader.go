@@ -126,7 +126,8 @@ func createFakeSidx(segments []segmentInfo, bytesPerSec int64, firstOffset uint3
 
 // downloadAndStitchHLS fetches an M3U8 manifest and streams all its segments to w
 // offsetSeconds allows time-based seeking (skip segments until offset)
-func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64, startByte int64, totalBytes int64) error {
+// clientName is used to determine if Content-Type fix is needed for clients like supersonic
+func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64, startByte int64, totalBytes int64, clientName string) error {
 	// 1. Fetch the manifest
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
 	if err != nil {
@@ -212,7 +213,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 
 	if isMaster && variantURL != "" {
 		log.Printf("[DOWNLOAD] HLS Master detected, following variant: %s", variantURL)
-		return c.downloadAndStitchHLS(ctx, variantURL, w, clientIP, track, offsetSeconds, startByte, totalBytes)
+		return c.downloadAndStitchHLS(ctx, variantURL, w, clientIP, track, offsetSeconds, startByte, totalBytes, clientName)
 	}
 
 	// Calculate which segment to start from based on time offset
@@ -286,13 +287,14 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		if rw, ok := w.(http.ResponseWriter); ok {
 			// Check for MP4 signature ("ftyp" at offset 4)
 			if len(initData) >= 8 && string(initData[4:8]) == "ftyp" {
-				rw.Header().Set("Content-Type", "audio/mp4")
+				// [MPV FIX] Use audio/x-m4a which MPV/ffmpeg handles better for seeking
+				rw.Header().Set("Content-Type", "audio/x-m4a")
+				log.Printf("[DOWNLOAD] fMP4 container detected, using Content-Type audio/x-m4a for MPV compatibility")
 				// Remove any incorrect Content-Disposition from ServeStream
 				if rw.Header().Get("Content-Disposition") != "" && track != nil {
 					cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s", track.Artist.Name, track.Title), "/", "_")
 					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
 				}
-				log.Printf("[DOWNLOAD] fMP4 container detected, corrected Content-Type to audio/mp4")
 
 				// Inject fake sidx to force ExoPlayer to show seek bar
 				ftypLen := binary.BigEndian.Uint32(initData[0:4])
@@ -368,6 +370,26 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			}
 			log.Printf("[DOWNLOAD] First segment (partial) sent to client in %v", time.Since(downloadStart))
 		} else {
+			// [FIX] Set Content-Type before writing any data (only for clients that need help)
+			if rw, ok := w.(http.ResponseWriter); ok && doesntSupportHLS(clientName) {
+				// Detect format from data signature
+				contentType := "audio/flac" // default
+				if len(firstData) >= 8 {
+					// Check for MP4/fMP4 signature ("ftyp" at offset 4)
+					if string(firstData[4:8]) == "ftyp" {
+						// [MPV FIX] Use audio/x-m4a for better MPV/ffmpeg compatibility
+						contentType = "audio/x-m4a"
+						log.Printf("[DOWNLOAD] fMP4 container detected in first segment, using Content-Type audio/x-m4a for %s", clientName)
+					} else if string(firstData[0:4]) == "fLaC" {
+						contentType = "audio/flac"
+						log.Printf("[DOWNLOAD] Native FLAC detected in first segment, using Content-Type audio/flac for %s", clientName)
+					}
+				}
+				rw.Header().Set("Content-Type", contentType)
+				if totalBytes > 0 {
+					rw.Header().Set("Accept-Ranges", "bytes")
+				}
+			}
 			// Try tagging if FLAC, then write
 			if err := tagger.process(bytes.NewReader(firstData), c); err != nil {
 				log.Printf("[DOWNLOAD] tagging failed, writing raw: %v", err)

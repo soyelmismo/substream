@@ -16,10 +16,15 @@ import (
 	"time"
 )
 
-// highKarmaThreshold es el StreamScore mínimo para considerar un mirror de "alta confianza".
-// Cuando el mejor mirror supera este umbral, usamos solo 1 concurrente en lugar del shotgun de 3.
-// Esto reduce la carga en mirrors confiables mientras mantenemos el shotgun para mirrors nuevos o inestables.
-const highKarmaThreshold = 0.0
+// streamCacheTTL es el tiempo de vida para el micro-caché de URLs de stream
+const streamCacheTTL = 10 * time.Second
+
+// streamCacheEntry almacena una URL con su timestamp
+type streamCacheEntry struct {
+	URL       string
+	Timestamp time.Time
+	Quality   string
+}
 
 // PoolConfig holds configuration for the proxy pool
 type PoolConfig struct {
@@ -42,6 +47,10 @@ type Pool struct {
 
 	// New mirror manager for intelligent selection
 	mirrorMgr *MirrorManager
+
+	// Micro-cache for stream URLs (10s TTL) to reduce redundant requests
+	streamCache   map[int]streamCacheEntry
+	streamCacheMu sync.RWMutex
 }
 
 // NewPool creates a proxy pool from a list of hifi-api base URLs
@@ -60,7 +69,8 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 		client: &http.Client{
 			Timeout: cfg.Timeout,
 		},
-		quality: cfg.Quality,
+		quality:     cfg.Quality,
+		streamCache: make(map[int]streamCacheEntry),
 	}
 
 	// Initialize mirror manager for intelligent routing
@@ -1090,6 +1100,69 @@ func filterMirrorError(err error) error {
 	return nil
 }
 
+// tryProxyURL attempts a HEAD request to validate the proxied URL
+// Returns the working URL (proxied or direct) and true if successful
+// Replicates verification headers to match the original request
+func tryProxyURL(proxiedURL string, client *http.Client, clientIP string) (string, bool) {
+	// Quick HEAD check to proxy-audio (500ms timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "HEAD", proxiedURL, nil)
+	if err != nil {
+		return proxiedURL, true // Can't even create request, just return and let it fail later
+	}
+
+	// Replicate verification headers (matching what Tidal/monochrome expect)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "identity") // HEAD requests typically don't need compression
+	req.Header.Set("Referer", "https://monochrome.tf/")
+
+	// Pass client IP for geo-locking validation (if proxy checks this)
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+		req.Header.Set("X-Real-IP", clientIP)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[PROXY:FALLBACK] Proxy HEAD failed (%v), will try direct Tidal URL", err)
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	// If proxy returns 2xx, it's working
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return proxiedURL, true
+	}
+
+	// Proxy error (4xx/5xx), try to extract direct URL
+	log.Printf("[PROXY:FALLBACK] Proxy returned %d, will try direct Tidal URL", resp.StatusCode)
+	return "", false
+}
+
+// extractDirectURL extracts the original Tidal URL from a proxied URL
+// Format: https://monochrome.tf/proxy-audio?url=<encoded_url>
+func extractDirectURL(proxiedURL string) string {
+	if !strings.Contains(proxiedURL, "proxy-audio") {
+		return proxiedURL // Not a proxied URL
+	}
+
+	u, err := url.Parse(proxiedURL)
+	if err != nil {
+		return proxiedURL
+	}
+
+	directURL := u.Query().Get("url")
+	if directURL == "" {
+		return proxiedURL
+	}
+
+	return directURL
+}
+
 func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID int, clientIP string) streamResult {
 	start := time.Now()
 	res := streamResult{
@@ -1102,64 +1175,79 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 	reqCtx, cancel := context.WithTimeout(ctx, 3500*time.Millisecond)
 	defer cancel()
 
-	// --- RUTA V1: Exclusiva para BTS (Idéntico a Python) ---
-	if task.ManifestType == "BTS" {
-		qV1 := url.Values{
-			"id":      {fmt.Sprint(trackID)},
-			"quality": {task.Quality},
-		}
+	/*
+		// [TEMP DISABLED] --- RUTA V1: Exclusiva para BTS (Idéntico a Python) ---
+		// Desactivado temporalmente para priorizar HLS y evitar dar de baja mirrors HLS-only
+		if task.ManifestType == "BTS" {
+			qV1 := url.Values{
+				"id":      {fmt.Sprint(trackID)},
+				"quality": {task.Quality},
+			}
 
-		var v1Response struct {
-			Data struct {
-				TrackID           int    `json:"trackId"`
-				AudioQuality      string `json:"audioQuality"`
-				ManifestMimeType  string `json:"manifestMimeType"`
-				Manifest          string `json:"manifest"`
-				AssetPresentation string `json:"assetPresentation"`
-			} `json:"data"`
-		}
+			var v1Response struct {
+				Data struct {
+					TrackID           int    `json:"trackId"`
+					AudioQuality      string `json:"audioQuality"`
+					ManifestMimeType  string `json:"manifestMimeType"`
+					Manifest          string `json:"manifest"`
+					AssetPresentation string `json:"assetPresentation"`
+				} `json:"data"`
+			}
 
-		err := p.doFetchRawWithMirror(reqCtx, "/track/", qV1, clientIP, task.Mirror, &v1Response)
-		res.Latency = time.Since(start)
-		res.Err = err
+			err := p.doFetchRawWithMirror(reqCtx, "/track/", qV1, clientIP, task.Mirror, &v1Response)
+			res.Latency = time.Since(start)
+			res.Err = err
 
-		if err != nil {
-			log.Printf("[BTS:DEBUG] Mirror %s error for track %d: %v", task.Mirror.URL, trackID, err)
+			if err != nil {
+				log.Printf("[BTS:DEBUG] Mirror %s error for track %d: %v", task.Mirror.URL, trackID, err)
+				return res
+			}
+
+			if v1Response.Data.AssetPresentation == "PREVIEW" {
+				log.Printf("[BTS:DEBUG] Mirror %s returned PREVIEW for track %d", task.Mirror.URL, trackID)
+				res.Err = fmt.Errorf("preview track")
+				return res
+			}
+
+			if v1Response.Data.Manifest == "" {
+				log.Printf("[BTS:DEBUG] Mirror %s empty manifest for track %d (quality: %s)", task.Mirror.URL, trackID, task.Quality)
+				res.Err = fmt.Errorf("empty manifest")
+				return res
+			}
+
+			audioURL, parseErr := parseManifestURL(trackID, "V1-BTS", v1Response.Data.ManifestMimeType, v1Response.Data.Manifest)
+			if parseErr != nil {
+				log.Printf("[BTS:DEBUG] Mirror %s parse error for track %d: %v", task.Mirror.URL, trackID, parseErr)
+				res.Err = fmt.Errorf("parse error: %w", parseErr)
+				return res
+			}
+			if audioURL == "" {
+				log.Printf("[BTS:DEBUG] Mirror %s empty URL after parse for track %d", task.Mirror.URL, trackID)
+				res.Err = fmt.Errorf("empty url after parse")
+				return res
+			}
+
+			// [PROXY VALIDATION] Check if proxied URL works, fallback to direct if not
+			finalURL, ok := tryProxyURL(audioURL, p.client, clientIP)
+			if !ok {
+				// Fallback to direct Tidal URL
+				directURL := extractDirectURL(audioURL)
+				log.Printf("[BTS:FALLBACK] Using direct Tidal URL for track %d: %s...", trackID, directURL[:min(50, len(directURL))])
+				finalURL = directURL
+			} else if finalURL != audioURL {
+				// Proxy worked but returned different URL (shouldn't happen with our logic)
+				log.Printf("[BTS:PROXY] Proxy validated for track %d", trackID)
+			}
+
+			urlPreview := finalURL
+			if len(urlPreview) > 80 {
+				urlPreview = urlPreview[:80]
+			}
+			log.Printf("[BTS:DEBUG] Mirror %s SUCCESS for track %d: %s...", task.Mirror.URL, trackID, urlPreview)
+			res.URL = finalURL
 			return res
 		}
-
-		if v1Response.Data.AssetPresentation == "PREVIEW" {
-			log.Printf("[BTS:DEBUG] Mirror %s returned PREVIEW for track %d", task.Mirror.URL, trackID)
-			res.Err = fmt.Errorf("preview track")
-			return res
-		}
-
-		if v1Response.Data.Manifest == "" {
-			log.Printf("[BTS:DEBUG] Mirror %s empty manifest for track %d (quality: %s)", task.Mirror.URL, trackID, task.Quality)
-			res.Err = fmt.Errorf("empty manifest")
-			return res
-		}
-
-		audioURL, parseErr := parseManifestURL(trackID, "V1-BTS", v1Response.Data.ManifestMimeType, v1Response.Data.Manifest)
-		if parseErr != nil {
-			log.Printf("[BTS:DEBUG] Mirror %s parse error for track %d: %v", task.Mirror.URL, trackID, parseErr)
-			res.Err = fmt.Errorf("parse error: %w", parseErr)
-			return res
-		}
-		if audioURL == "" {
-			log.Printf("[BTS:DEBUG] Mirror %s empty URL after parse for track %d", task.Mirror.URL, trackID)
-			res.Err = fmt.Errorf("empty url after parse")
-			return res
-		}
-
-		urlPreview := audioURL
-		if len(urlPreview) > 80 {
-			urlPreview = urlPreview[:80]
-		}
-		log.Printf("[BTS:DEBUG] Mirror %s SUCCESS for track %d: %s...", task.Mirror.URL, trackID, urlPreview)
-		res.URL = audioURL
-		return res
-	}
+	*/
 
 	// --- RUTA V2: Exclusiva para HLS ---
 	qV2 := url.Values{
@@ -1200,7 +1288,16 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 	if manifestB64 != "" {
 		audioURL, parseErr := parseManifestURL(trackID, "V2-"+task.ManifestType, v2Response.Data.Attributes.ManifestMimeType, manifestB64)
 		if parseErr == nil && audioURL != "" {
-			res.URL = audioURL
+			// [PROXY VALIDATION] Check if proxied URL works, fallback to direct if not
+			finalURL, ok := tryProxyURL(audioURL, p.client, clientIP)
+			if !ok {
+				// Fallback to direct Tidal URL
+				directURL := extractDirectURL(audioURL)
+				log.Printf("[HLS:FALLBACK] Using direct Tidal URL for track %d", trackID)
+				res.URL = directURL
+			} else {
+				res.URL = finalURL
+			}
 			return res
 		}
 	}
@@ -1220,6 +1317,24 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 	if requestedQuality == "" {
 		requestedQuality = p.quality
 	}
+
+	// [MICRO-CACHE] Verificar si tenemos una URL reciente para este track
+	p.streamCacheMu.RLock()
+	if entry, ok := p.streamCache[trackID]; ok {
+		if time.Since(entry.Timestamp) < streamCacheTTL {
+			// Calidad compatible? Si el cache es igual o mejor calidad, lo usamos
+			qualityOrder := map[string]int{"HI_RES_LOSSLESS": 4, "LOSSLESS": 3, "HIGH": 2, "LOW": 1}
+			requestedOrder := qualityOrder[requestedQuality]
+			cachedOrder := qualityOrder[entry.Quality]
+			if cachedOrder >= requestedOrder {
+				p.streamCacheMu.RUnlock()
+				log.Printf("[CACHE-HIT] Track %d: usando URL cacheada (calidad=%s, age=%v)",
+					trackID, entry.Quality, time.Since(entry.Timestamp))
+				return entry.URL, nil
+			}
+		}
+	}
+	p.streamCacheMu.RUnlock()
 
 	// Obtener TODOS los mirrors sanos sin importar el Tier
 	var mirrors []*Mirror
@@ -1247,6 +1362,18 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 		}
 	}
 
+	// [ROUND-ROBIN] Rotar el orden de mirrors basado en trackID para distribuir
+	// peticiones concurrentes (gapless playback) entre diferentes mirrors.
+	// Esto evita sobrecargar el mismo mirror con múltiples peticiones simultáneas.
+	if len(mirrors) > 1 {
+		offset := trackID % len(mirrors)
+		if offset > 0 {
+			// Rotar: [offset:] + [:offset]
+			mirrors = append(mirrors[offset:], mirrors[:offset]...)
+			log.Printf("[SHOTGUN] 🔄 Round-robin: track %d usando offset %d para distribuir carga", trackID, offset)
+		}
+	}
+
 	// Generar el arsenal de combinaciones (Calidad + Formato)
 	type combo struct {
 		mType   string
@@ -1257,24 +1384,19 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 
 	switch requestedQuality {
 	case "HI_RES_LOSSLESS":
-		// For HI_RES_LOSSLESS, prioritize BTS for native FLAC.
-		// Fallback to HLS if BTS fails (same quality, fMP4 container).
-		combos = append(combos, combo{"BTS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES"}})
-		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
+		// HLS first (primary), BTS as fallback
 		combos = append(combos, combo{"HLS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES"}})
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
-		//combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
-		//combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
-	case "LOSSLESS":
-		// For LOSSLESS, prioritize BTS for native FLAC.
-		// Fallback to HLS if BTS fails (same quality, fMP4 container).
+		combos = append(combos, combo{"BTS", "HI_RES_LOSSLESS", []string{"FLAC_HIRES"}})
 		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
+	case "LOSSLESS":
+		// HLS first (primary), BTS as fallback
 		combos = append(combos, combo{"HLS", "LOSSLESS", []string{"FLAC"}})
-		//combos = append(combos, combo{"BTS", "HIGH", []string{"AACLC"}})
-		//combos = append(combos, combo{"HLS", "HIGH", []string{"AACLC"}})
+		combos = append(combos, combo{"BTS", "LOSSLESS", []string{"FLAC"}})
 	default:
-		combos = append(combos, combo{"BTS", requestedQuality, []string{"AACLC", "HEAACV1"}})
+		// HLS first (primary), BTS as fallback
 		combos = append(combos, combo{"HLS", requestedQuality, []string{"AACLC", "HEAACV1"}})
+		combos = append(combos, combo{"BTS", requestedQuality, []string{"AACLC", "HEAACV1"}})
 	}
 
 	// Asignar combinaciones a los proxies disponibles
@@ -1306,86 +1428,192 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 
 	// ¡DISPARAR EL ESCOPETAZO CON BATCHING PROGRESIVO!
 	// Procesar en batches de 3 para no saturar Tidal (mismo patrón que playlists)
-	// [OPTIMIZACIÓN KARMA] Si el mejor mirror tiene alto karma, usamos solo 1 concurrente
-	// ya que tenemos suficiente evidencia histórica de que es confiable.
+	// [OPTIMIZACIÓN KARMA] Si el mejor mirror tiene alto karma, usamos 2 concurrentes
+	// para balance entre confiabilidad y velocidad de fallback (nunca 1, eso es lento).
 	defaultBatchSize := 3
 	batchSize := defaultBatchSize
 
-	// Verificar si el primer mirror tiene alto karma (alto StreamScore) y es BTS
-	if len(tasks) > 0 && len(mirrors) > 0 {
-		bestMirror := mirrors[0]
-		bestScore := bestMirror.GetStreamScore()
-		if bestScore >= highKarmaThreshold && tasks[0].ManifestType == "BTS" {
-			// El mejor mirror tiene alto karma y la primera tarea es BTS (progresivo)
-			// Reducimos a 1 concurrente para no saturar mirrors confiables
-			batchSize = 1
-			log.Printf("[SHOTGUN] 🎖️ ALTO KARMA detectado: %s (score=%.1f >= %.1f). Usando 1 concurrente en lugar de 3",
-				bestMirror.URL, bestScore, highKarmaThreshold)
-		}
-	}
+	// [OPTIMIZACIÓN] Track de mirrors fallados para no reintentarlos en fallback
+	failedMirrorURLs := make(map[string]bool)
+
+	// [NOTA] Los mirrors ya están ordenados por StreamScore (alto karma primero)
+	// El hedging a 150ms automáticamente favorece a los rápidos sin bloqueos previos
+	// No se necesita lógica especial - la licuadora procesa a todos por igual
 
 	var errorsList []string
 	var isUnavailable bool
 	var bestResult *streamResult
-	highKarmaFailed := false
 
-	// Usar índice manual para permitir cambio dinámico de batchSize
+	// [HEDGING] Canal global de resultados - todos los batches compiten aquí
+	type batchOutcome struct {
+		result  *streamResult
+		errors  []string
+		unavail bool
+		found   bool
+		failed  []string
+	}
+	resultsChan := make(chan batchOutcome, len(tasks))
+
+	// Contexto para cancelar todas las goroutines cuando encontremos resultado
+	hedgeCtx, hedgeCancel := context.WithCancel(ctx)
+	defer hedgeCancel()
+
+	// [HEDGING] Lanzar batches solapados: cada 150ms lanzamos siguiente si no hay ganador
+	// Un espejo sano responde en <100ms. Si pasan 150ms sin respuesta, están colgados.
+	hedgeDelay := 150 * time.Millisecond
 	batchNum := 0
 	batchCount := 0
-	for batchNum < len(tasks) {
-		batchCount++
+	allFailedMirrors := make(map[string]bool)
+
+	// Función para lanzar un batch sin bloquear
+	launchBatch := func(batch []streamTask, batchIdx int) {
+		actualBatchSize := len(batch)
+		log.Printf("[SHOTGUN-HEDGE] Batch %d: Lanzando %d peticiones para track %d",
+			batchIdx, actualBatchSize, trackID)
+
+		// Lanzar cada task del batch en su propia goroutine
+		for _, t := range batch {
+			go func(task streamTask) {
+				res := p.executeStreamTask(hedgeCtx, task, trackID, clientIP)
+
+				// Reportar a MirrorManager
+				if p.mirrorMgr != nil {
+					p.mirrorMgr.ReportResult(res.Mirror, res.Latency, filterMirrorError(res.Err))
+				}
+
+				// Reportar métricas de streaming
+				if res.Err == nil && res.URL != "" {
+					if res.ManifestType == "BTS" {
+						res.Mirror.ReportBTS()
+					} else {
+						res.Mirror.ReportHLS()
+					}
+				} else if res.Err != nil {
+					// Castigo a mirrors que se quedan colgados
+					errStr := strings.ToLower(res.Err.Error())
+					if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
+						res.Mirror.ReportStreamFail()
+					}
+				}
+
+				// Enviar resultado al canal global
+				outcome := batchOutcome{
+					result: &res,
+				}
+
+				if res.Err != nil {
+					outcome.errors = []string{fmt.Sprintf("%s (%s/%s): %v",
+						res.Mirror.URL, res.ManifestType, res.Quality, res.Err)}
+					outcome.failed = []string{res.Mirror.URL}
+
+					errStr := strings.ToLower(res.Err.Error())
+					if strings.Contains(errStr, "preview") ||
+						strings.Contains(errStr, "region") ||
+						strings.Contains(errStr, "restricted") {
+						outcome.unavail = true
+					}
+				} else if res.URL != "" && res.Quality == requestedQuality && res.ManifestType == "HLS" {
+					// FAST PATH: Calidad exacta en HLS
+					outcome.found = true
+				}
+
+				select {
+				case resultsChan <- outcome:
+				case <-hedgeCtx.Done():
+					// Contexto cancelado, no enviar
+				}
+			}(t)
+		}
+	}
+
+	// Lanzar primer batch inmediatamente
+	if batchNum < len(tasks) {
 		end := batchNum + batchSize
 		if end > len(tasks) {
 			end = len(tasks)
 		}
-		batch := tasks[batchNum:end]
+		launchBatch(tasks[batchNum:end], batchCount+1)
+		batchCount++
+		batchNum = end
+	}
 
-		actualBatchSize := len(batch)
-		log.Printf("[SHOTGUN] Batch %d/%d: Disparando %d peticiones para track %d",
-			batchCount, (len(tasks)+defaultBatchSize-1)/defaultBatchSize, actualBatchSize, trackID)
+	// Loop de hedging: recolectar resultados y lanzar más batches si es necesario
+	hedgeTimer := time.NewTimer(hedgeDelay)
+	defer hedgeTimer.Stop()
 
-		// Procesar este batch
-		batchResult, batchErrors, batchUnavailable, foundExact := p.executeBatch(ctx, batch, trackID, clientIP, requestedQuality, bestResult)
-
-		// Acumular errores
-		errorsList = append(errorsList, batchErrors...)
-		if batchUnavailable {
-			isUnavailable = true
-		}
-
-		// FAST PATH: Si encontramos calidad exacta, retornar inmediatamente sin más batches
-		if foundExact && batchResult != nil && batchResult.URL != "" {
-			return batchResult.URL, nil
-		}
-
-		// Actualizar bestResult si este batch tiene algo mejor (para fallback si no hay exact match)
-		if batchResult != nil && batchResult.URL != "" {
-			if bestResult == nil || isBetterResult(batchResult, bestResult) {
-				bestResult = batchResult
+	for {
+		select {
+		case outcome := <-resultsChan:
+			// Acumular errores y mirrors fallados
+			errorsList = append(errorsList, outcome.errors...)
+			if outcome.unavail {
+				isUnavailable = true
 			}
-		}
-
-		// [FALLBACK KARMA] Si estábamos en modo alto karma (batchSize=1) y falló,
-		// expandir a shotgun completo con los mirrors restantes
-		if batchSize == 1 && batchResult == nil && !highKarmaFailed {
-			log.Printf("[SHOTGUN] 🔄 Fallback: Mirror de alto karma falló, expandiendo a shotgun de %d", defaultBatchSize)
-			batchSize = defaultBatchSize
-			highKarmaFailed = true
-			// No incrementar batchNum - reintentar desde el inicio con shotgun completo
-			continue
-		}
-
-		// Avanzar al siguiente batch
-		batchNum += batchSize
-
-		// Breve pausa entre batches para no saturar (excepto si es el último)
-		if batchNum < len(tasks) && !(highKarmaFailed && batchSize == defaultBatchSize && batchNum == defaultBatchSize) {
-			select {
-			case <-time.After(50 * time.Millisecond):
-				// Pausa entre batches
-			case <-ctx.Done():
-				return "", ctx.Err()
+			for _, m := range outcome.failed {
+				allFailedMirrors[m] = true
+				failedMirrorURLs[m] = true
 			}
+
+			// FAST PATH: Calidad exacta encontrada
+			if outcome.found && outcome.result != nil {
+				hedgeCancel() // Cancelar todas las peticiones pendientes
+
+				formatType := "AAC"
+				if strings.Contains(outcome.result.Quality, "LOSSLESS") || strings.Contains(outcome.result.Quality, "FLAC") {
+					formatType = "FLAC"
+				}
+				log.Printf("[SHOTGUN] 🎯 FAST PATH track %d: %s (%s/%s) desde %s en %v",
+					trackID, formatType, outcome.result.ManifestType, outcome.result.Quality,
+					outcome.result.Mirror.URL, outcome.result.Latency)
+
+				// [MICRO-CACHE] Guardar resultado exitoso
+				p.streamCacheMu.Lock()
+				p.streamCache[trackID] = streamCacheEntry{
+					URL:       outcome.result.URL,
+					Timestamp: time.Now(),
+					Quality:   outcome.result.Quality,
+				}
+				p.streamCacheMu.Unlock()
+
+				return outcome.result.URL, nil
+			}
+
+			// Actualizar bestResult para fallback
+			if outcome.result != nil && outcome.result.URL != "" {
+				if bestResult == nil || isBetterResult(outcome.result, bestResult) {
+					bestResult = outcome.result
+				}
+			}
+
+		case <-hedgeTimer.C:
+			// [HEDGING] Pasaron 150ms sin ganador. ¿Hay más batches por lanzar?
+			if batchNum < len(tasks) {
+				// Lanzar siguiente batch inmediatamente (sin lógica de fallback compleja)
+				end := batchNum + batchSize
+				if end > len(tasks) {
+					end = len(tasks)
+				}
+				launchBatch(tasks[batchNum:end], batchCount+1)
+				batchCount++
+				batchNum = end
+
+				// Reiniciar timer para siguiente hedging (si quedan más batches)
+				if batchNum < len(tasks) {
+					hedgeTimer.Reset(hedgeDelay)
+				}
+			} else {
+				// No hay más batches por lanzar, seguir esperando resultados
+				hedgeTimer.Reset(50 * time.Millisecond) // Polling ultra-rápido al final
+			}
+
+		case <-ctx.Done():
+			hedgeCancel()
+			return "", ctx.Err()
+		}
+
+		// Condición de salida: todos los batches lanzados y tenemos resultado
+		if batchNum >= len(tasks) && bestResult != nil {
+			break
 		}
 	}
 
@@ -1397,6 +1625,16 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 		}
 		log.Printf("[SHOTGUN] 🏆 track %d: %s (%s/%s) desde %s en %v",
 			trackID, formatType, bestResult.ManifestType, bestResult.Quality, bestResult.Mirror.URL, bestResult.Latency)
+
+		// [MICRO-CACHE] Guardar resultado exitoso para requests futuros
+		p.streamCacheMu.Lock()
+		p.streamCache[trackID] = streamCacheEntry{
+			URL:       bestResult.URL,
+			Timestamp: time.Now(),
+			Quality:   bestResult.Quality,
+		}
+		p.streamCacheMu.Unlock()
+
 		return bestResult.URL, nil
 	}
 
@@ -1414,99 +1652,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// executeBatch processes a batch of stream tasks with grace period logic
-// Returns immediately (fast path) if the requested quality is found
-// Returns (result, errors, isUnavailable, foundExact) where foundExact indicates if the exact requested quality was matched
-func (p *Pool) executeBatch(ctx context.Context, tasks []streamTask, trackID int, clientIP string, requestedQuality string, currentBest *streamResult) (*streamResult, []string, bool, bool) {
-	shotgunCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	results := make(chan streamResult, len(tasks))
-	for _, t := range tasks {
-		go func(task streamTask) {
-			results <- p.executeStreamTask(shotgunCtx, task, trackID, clientIP)
-		}(t)
-	}
-
-	var errorsList []string
-	var isUnavailable bool
-	var batchBest *streamResult
-	gracePeriod := 300 * time.Millisecond
-	var graceTimer *time.Timer
-
-	for i := 0; i < len(tasks); i++ {
-		select {
-		case res := <-results:
-			// Reportar estado al manager
-			if p.mirrorMgr != nil {
-				p.mirrorMgr.ReportResult(res.Mirror, res.Latency, filterMirrorError(res.Err))
-			}
-
-			// Reportar métricas para el Ranking de Streaming
-			if res.Err == nil && res.URL != "" {
-				if res.ManifestType == "BTS" {
-					res.Mirror.ReportBTS()
-				} else {
-					res.Mirror.ReportHLS()
-				}
-
-				// FAST PATH: Calidad solicitada encontrada Y ES BTS (progresivo)
-				// NO aceptamos HLS en fast path porque rompe el gapless playback
-				if res.Quality == requestedQuality && res.ManifestType == "BTS" {
-					formatType := "AAC"
-					if strings.Contains(res.Quality, "LOSSLESS") || strings.Contains(res.Quality, "FLAC") {
-						formatType = "FLAC"
-					}
-					log.Printf("[SHOTGUN] 🎯 FAST PATH track %d: %s (%s/%s) desde %s en %v",
-						trackID, formatType, res.ManifestType, res.Quality, res.Mirror.URL, res.Latency)
-					cancel() // Cancelar otras peticiones del batch
-					return &res, errorsList, isUnavailable, true
-				}
-
-				// Si no es la calidad exacta o es HLS, guardamos como backup
-				// El isBetterResult se encarga de priorizar BTS > HLS y mejor calidad
-				if batchBest == nil || isBetterResult(&res, batchBest) {
-					batchBest = &res
-					if graceTimer != nil {
-						graceTimer.Stop()
-					}
-					graceTimer = time.NewTimer(gracePeriod)
-				}
-			} else if res.Err != nil {
-				errorsList = append(errorsList, fmt.Sprintf("%s (%s/%s): %v",
-					res.Mirror.URL, res.ManifestType, res.Quality, res.Err))
-
-				errStr := strings.ToLower(res.Err.Error())
-				if strings.Contains(errStr, "preview") ||
-					strings.Contains(errStr, "region") ||
-					strings.Contains(errStr, "restricted") {
-					isUnavailable = true
-				}
-
-				// Castigo severo a los mirrors que se quedan colgados
-				if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
-					res.Mirror.ReportStreamFail()
-				}
-			}
-
-		case <-func() <-chan time.Time {
-			if graceTimer != nil {
-				return graceTimer.C
-			}
-			return nil
-		}():
-			// Grace period expirado, devolver lo mejor del batch
-			return batchBest, errorsList, isUnavailable, false
-
-		case <-ctx.Done():
-			return nil, errorsList, isUnavailable, false
-		}
-	}
-
-	// Batch completado
-	return batchBest, errorsList, isUnavailable, false
 }
 
 // isBetterResult determina si un resultado de stream es mejor que otro
@@ -1674,6 +1819,22 @@ func (p *Pool) GetLyrics(ctx context.Context, trackID int) (*TidalLyrics, error)
 }
 
 // Manifest Parsing
+const monochromeAudioProxy = "https://monochrome.tf/proxy-audio"
+
+// rewriteAudioURL rewrites Tidal audio URLs to use monochrome proxy-audio
+func rewriteAudioURL(originalURL string) string {
+	// Only rewrite URLs from Tidal's audio CDN
+	if !strings.Contains(originalURL, "tidal.com") && !strings.Contains(originalURL, "tidalhifi.com") {
+		return originalURL
+	}
+	// Skip HLS manifests (.m3u8) - those are handled differently
+	if strings.Contains(originalURL, ".m3u8") || strings.Contains(originalURL, "manifest") {
+		return originalURL
+	}
+	// Rewrite through proxy-audio
+	return fmt.Sprintf("%s?url=%s", monochromeAudioProxy, url.QueryEscape(originalURL))
+}
+
 func parseManifestURL(trackID int, version, mimeType, manifest string) (string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(manifest)
 	if err != nil {
@@ -1696,7 +1857,8 @@ func parseManifestURL(trackID int, version, mimeType, manifest string) (string, 
 		if end > 0 {
 			u := content[start : start+end]
 			url := strings.ReplaceAll(u, "&amp;", "&")
-			log.Printf("[TIDAL] parseManifestURL track=%d %s: DASH BaseURL found: %s...", trackID, version, url[:min(50, len(url))])
+			url = rewriteAudioURL(url)
+			log.Printf("[TIDAL] parseManifestURL track=%d %s: DASH BaseURL found (proxied): %s...", trackID, version, url[:min(50, len(url))])
 			return url, nil
 		}
 	}
@@ -1711,11 +1873,13 @@ func parseManifestURL(trackID int, version, mimeType, manifest string) (string, 
 				if end > 0 {
 					u := line[start : start+end]
 					url := strings.ReplaceAll(u, "&amp;", "&")
-					log.Printf("[TIDAL] parseManifestURL track=%d %s: XML fallback found: %s...", trackID, version, url[:min(50, len(url))])
+					url = rewriteAudioURL(url)
+					log.Printf("[TIDAL] parseManifestURL track=%d %s: XML fallback found (proxied): %s...", trackID, version, url[:min(50, len(url))])
 					return url, nil
 				}
 				url := strings.ReplaceAll(line[start:], "&amp;", "&")
-				log.Printf("[TIDAL] parseManifestURL track=%d %s: XML fallback (no end): %s...", trackID, version, url[:min(50, len(url))])
+				url = rewriteAudioURL(url)
+				log.Printf("[TIDAL] parseManifestURL track=%d %s: XML fallback (no end, proxied): %s...", trackID, version, url[:min(50, len(url))])
 				return url, nil
 			}
 		}
@@ -1729,21 +1893,23 @@ func parseManifestURL(trackID int, version, mimeType, manifest string) (string, 
 		}
 		if err := json.Unmarshal(decoded, &manifestData); err == nil {
 			if manifestData.URL != "" {
-				log.Printf("[TIDAL] parseManifestURL track=%d %s: JSON url found: %s...", trackID, version, manifestData.URL[:min(50, len(manifestData.URL))])
-				return manifestData.URL, nil
+				proxiedURL := rewriteAudioURL(manifestData.URL)
+				log.Printf("[TIDAL] parseManifestURL track=%d %s: JSON url found (proxied): %s...", trackID, version, proxiedURL[:min(50, len(proxiedURL))])
+				return proxiedURL, nil
 			}
 			if len(manifestData.URLs) > 0 {
-				log.Printf("[TIDAL] parseManifestURL track=%d %s: JSON urls[0] found: %s...", trackID, version, manifestData.URLs[0][:min(50, len(manifestData.URLs[0]))])
-				return manifestData.URLs[0], nil
+				proxiedURL := rewriteAudioURL(manifestData.URLs[0])
+				log.Printf("[TIDAL] parseManifestURL track=%d %s: JSON urls[0] found (proxied): %s...", trackID, version, proxiedURL[:min(50, len(proxiedURL))])
+				return proxiedURL, nil
 			}
 		}
 	}
 
-	// M3U8: first line that starts with http
+	// M3U8: first line that starts with http (skip proxying for HLS manifests)
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "http") {
-			log.Printf("[TIDAL] parseManifestURL track=%d %s: M3U8 found: %s...", trackID, version, line[:min(50, len(line))])
+			log.Printf("[TIDAL] parseManifestURL track=%d %s: M3U8 found (not proxied): %s...", trackID, version, line[:min(50, len(line))])
 			return line, nil
 		}
 	}

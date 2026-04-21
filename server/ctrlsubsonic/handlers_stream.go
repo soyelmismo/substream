@@ -27,8 +27,9 @@ func doesntSupportHLS(clientName string) bool {
 	switch lower {
 	case "psysonic", "tempus", "symfonium":
 		// These clients don't properly handle HLS manifests yet
-		// Note: supersonic CAN handle HLS but stitching provides better gapless
+		// Forcing HLS stitching provides continuous audio stream with proper gapless support
 		return true
+	// [NOTE] supersonic removed - it handles HLS natively via MPV
 	default:
 		return false
 	}
@@ -292,7 +293,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			}
 		}
 
-		err = c.downloadAndStitchHLS(streamCtx, prep.StreamURL, w, prep.ClientIP, prep.Track, offsetSeconds, startByte, totalBytes)
+		err = c.downloadAndStitchHLS(streamCtx, prep.StreamURL, w, prep.ClientIP, prep.Track, offsetSeconds, startByte, totalBytes, prep.ClientName)
 		if err != nil {
 			streamErr = err
 			log.Printf("[STREAM] ERROR: HLS stitch failed for track %d: %v", id.Value(), err)
@@ -313,6 +314,46 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			streamErr = err
 			log.Printf("[STREAM] ERROR: direct proxy failed for track %d: %v", id.Value(), err)
 		}
+	}
+	return nil
+}
+
+// ServeHLS handles the /hls.m3u8 endpoint according to OpenSubsonic spec
+// Returns an HLS playlist (M3U8) that clients can use for HLS streaming
+// The client is responsible for downloading and playing the segments
+func (c *Controller) ServeHLS(w http.ResponseWriter, r *http.Request) *spec.Response {
+	p := r.Context().Value(CtxParams).(params.Params)
+	id, err := p.GetID("id")
+	if err != nil || id.Type() != specid.Track {
+		return spec.NewError(10, "provide a track `id` parameter")
+	}
+
+	// Get stream info using existing prepareStream logic
+	ctx := r.Context()
+	prep, err := c.prepareStream(ctx, r, id.Value())
+	if err != nil {
+		log.Printf("[HLS] Failed to prepare stream for track %d: %v", id.Value(), err)
+		return spec.NewError(0, "failed to get stream: %v", err)
+	}
+
+	// Verify we got an HLS stream
+	if !prep.IsHLS {
+		log.Printf("[HLS] Track %d is not available as HLS (URL: %s)", id.Value(), prep.StreamURL)
+		return spec.NewError(0, "track not available as HLS stream")
+	}
+
+	// Proxy the HLS manifest - this rewrites relative URLs to absolute
+	// and ensures the client gets a valid M3U8 that works from their IP
+	urlPreview := prep.StreamURL
+	if len(urlPreview) > 100 {
+		urlPreview = urlPreview[:100]
+	}
+	log.Printf("[HLS] Proxying M3U8 manifest for track=%d URL=%s client=%s",
+		id.Value(), urlPreview, prep.ClientName)
+
+	if err := c.proxyHLSManifest(ctx, prep.StreamURL, w, prep.ClientIP); err != nil {
+		log.Printf("[HLS] Failed to proxy manifest for track %d: %v", id.Value(), err)
+		return spec.NewError(0, "failed to proxy HLS manifest: %v", err)
 	}
 	return nil
 }
