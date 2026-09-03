@@ -725,6 +725,7 @@ func (db *DB) Migrate() error {
 		&Setting{},
 		&Bookmark{},
 		&ProxyInstance{},
+		&TidalAccount{},
 		&TrackMetadata{},
 		&MetadataCache{},
 	).Error

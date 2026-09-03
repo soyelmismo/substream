@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"image"
@@ -16,11 +17,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/sessions"
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/listenbrainz"
+	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
@@ -1333,4 +1336,221 @@ func (c *Controller) ServeUpdateLastFMAPIKeyDo(r *http.Request) *Response {
 		redirect: "/admin/home",
 		flashN:   []string{fmt.Sprintf("Last.fm API keys %s successfully", status)},
 	}
+}
+
+// Tidal OAuth Account Handlers
+
+func (c *Controller) ServeTidalAccounts(r *http.Request) *Response {
+	accounts, err := c.dbc.GetTidalAccounts()
+	if err != nil {
+		return &Response{code: 500, err: fmt.Sprintf("get tidal accounts: %v", err)}
+	}
+
+	data := &templateData{}
+	data.TidalAccounts = accounts
+
+	c.pendingOAuthMu.Lock()
+	data.PendingOAuth = c.pendingOAuth
+	c.pendingOAuthMu.Unlock()
+
+	return &Response{
+		template: "tidal_accounts.tmpl",
+		data:     data,
+	}
+}
+
+func (c *Controller) ServeTidalStartOAuthDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	dcr, err := tidal.RequestDeviceAuthorization(r.Context())
+	if err != nil {
+		log.Printf("[TIDAL] Failed to start OAuth device auth: %v", err)
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("failed to request Tidal login link: %v", err)}}
+	}
+
+	c.pendingOAuthMu.Lock()
+	c.pendingOAuth = dcr
+	c.pendingOAuthMu.Unlock()
+
+	log.Printf("[TIDAL] Generated device authorization link: %s (code: %s)", dcr.VerificationURIComplete, dcr.UserCode)
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{"authorization link created! Open link.tidal.com to approve."}}
+}
+
+func (c *Controller) ServeTidalCancelOAuthDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	c.pendingOAuthMu.Lock()
+	c.pendingOAuth = nil
+	c.pendingOAuthMu.Unlock()
+
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{"OAuth login cancelled."}}
+}
+
+func (c *Controller) ServeTidalPollOAuthJSON(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	c.pendingOAuthMu.Lock()
+	pending := c.pendingOAuth
+	c.pendingOAuthMu.Unlock()
+
+	if pending == nil {
+		json.NewEncoder(w).Encode(map[string]any{"status": "no_pending"})
+		return
+	}
+
+	tok, err := tidal.PollForDeviceTokens(r.Context(), pending.DeviceCode)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": err.Error()})
+		return
+	}
+
+	if tok == nil {
+		json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		return
+	}
+
+	// Approved!
+	userID := tok.GetUserIDStr()
+	username := strings.TrimSpace(r.URL.Query().Get("username"))
+	if username == "" {
+		username = "Tidal (" + userID + ")"
+	}
+	expiresAt := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+
+	_, err = c.dbc.AddTidalAccount(userID, username, tok.RefreshToken, tok.AccessToken, expiresAt)
+	if err != nil {
+		log.Printf("[TIDAL] Error saving linked account to DB: %v", err)
+		json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": "error saving account to database"})
+		return
+	}
+
+	c.pendingOAuthMu.Lock()
+	c.pendingOAuth = nil
+	c.pendingOAuthMu.Unlock()
+
+	log.Printf("[AUDIT] Tidal OAuth account linked successfully: %s (User ID: %s)", username, userID)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":   "success",
+		"user_id":  userID,
+		"username": username,
+	})
+}
+
+func (c *Controller) ServeTidalAddManualDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	refreshToken := strings.TrimSpace(r.FormValue("refresh_token"))
+	username := strings.TrimSpace(r.FormValue("username"))
+
+	if refreshToken == "" {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"refresh token is required"}}
+	}
+
+	// Verify token immediately against Tidal
+	tok, err := tidal.RefreshAccessToken(r.Context(), refreshToken)
+	if err != nil {
+		log.Printf("[TIDAL] Manual refresh token verification failed: %v", err)
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("token verification failed: %v", err)}}
+	}
+
+	userID := tok.GetUserIDStr()
+	if username == "" {
+		username = "Tidal (" + userID + ")"
+	}
+	expiresAt := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+
+	if _, err := c.dbc.AddTidalAccount(userID, username, refreshToken, tok.AccessToken, expiresAt); err != nil {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("could not save account: %v", err)}}
+	}
+
+	log.Printf("[AUDIT] Manual Tidal account added: %s (User ID: %s)", username, userID)
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{fmt.Sprintf("Tidal account %s verified and added successfully!", username)}}
+}
+
+func (c *Controller) ServeTidalDeleteAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	if err := c.dbc.DeleteTidalAccount(idInt); err != nil {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("delete account: %v", err)}}
+	}
+
+	log.Printf("[AUDIT] Tidal account deleted (ID: %d)", idInt)
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{"Tidal account removed"}}
+}
+
+func (c *Controller) ServeTidalToggleAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	active := r.FormValue("active") == "true"
+	if err := c.dbc.ToggleTidalAccount(idInt, active); err != nil {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("update account: %v", err)}}
+	}
+
+	log.Printf("[AUDIT] Tidal account (ID: %d) set active=%v", idInt, active)
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{"account status updated"}}
+}
+
+func (c *Controller) ServeTidalRefreshAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	accounts, err := c.dbc.GetTidalAccounts()
+	if err != nil {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"failed to read accounts"}}
+	}
+
+	var target *db.TidalAccount
+	for _, a := range accounts {
+		if a.ID == idInt {
+			target = a
+			break
+		}
+	}
+
+	if target == nil {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{"account not found"}}
+	}
+
+	tok, err := tidal.RefreshAccessToken(r.Context(), target.RefreshToken)
+	if err != nil {
+		log.Printf("[TIDAL] Failed to refresh token for account %d (%s): %v", target.ID, target.Username, err)
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("refresh failed: %v", err)}}
+	}
+
+	expiresAt := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	if err := c.dbc.UpdateTidalAccountTokens(target.ID, tok.AccessToken, expiresAt); err != nil {
+		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("database update failed: %v", err)}}
+	}
+
+	log.Printf("[AUDIT] Tidal account %d (%s) refreshed. Valid until: %s", target.ID, target.Username, expiresAt.Format(time.RFC3339))
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{fmt.Sprintf("token refreshed successfully! (valid for %d hours)", tok.ExpiresIn/3600)}}
 }

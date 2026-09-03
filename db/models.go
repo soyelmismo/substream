@@ -126,6 +126,18 @@ type ProxyInstance struct {
 	CreatedAt time.Time `sql:"DEFAULT:current_timestamp"`
 }
 
+type TidalAccount struct {
+	ID           int       `gorm:"primary_key"`
+	UserID       string    `gorm:"index"`
+	Username     string    `sql:"default: ''"`
+	RefreshToken string    `gorm:"not null"`
+	AccessToken  string    `sql:"default: ''"`
+	ExpiresAt    time.Time `sql:"DEFAULT:current_timestamp"`
+	IsActive     bool      `sql:"DEFAULT: true"`
+	CreatedAt    time.Time `sql:"DEFAULT:current_timestamp"`
+	UpdatedAt    time.Time `sql:"DEFAULT:current_timestamp"`
+}
+
 // TrackMetadata stores the mapping between tracks and their album/artist.
 // This is essential for the virtual library feature - it allows us to infer
 // which artists and albums a user has interacted with based on track plays/stars.

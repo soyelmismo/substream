@@ -1,0 +1,164 @@
+{{ template "head" . }}
+{{ template "nav" . }}
+
+<div class="flex flex-col gap-8">
+    <div class="flex flex-col gap-4 text-right">
+        <h1 class="text-3xl font-bold text-gray-900">tidal accounts</h1>
+        <p class="text-gray-500">manage official tidal oauth subscriber accounts for direct lossless playback</p>
+    </div>
+
+    <!-- Active Accounts Block -->
+    <div class="border-b-2 border-r-2 border-gray-300/80 bg-gray-50 p-4">
+        <div class="inline-flex items-center gap-x-3">
+            <span class="text-gray-500/80 w-4">
+                <svg class="fill-current aspect-square" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+            </span>
+            <span class="text-gray-900 font-bold">configured accounts</span>
+        </div>
+        <hr class="bg-gray-900/30 my-1" />
+        <div class="font-medium text-gray-500 max-w-[700px]">active tidal accounts automatically rotated for stream resolution</div>
+        <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
+            <div class="flex flex-col divide-y divide-gray-200">
+                {{ range .TidalAccounts }}
+                <div class="flex items-center justify-between py-3">
+                    <div class="flex items-center gap-2">
+                        <form action="{{ path "/admin/tidal_delete_account_do" }}" method="POST" onsubmit="return confirm('remove this account?')">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="id" value="{{ .ID }}">
+                            <input type="submit" value="delete" class="text-rose-600 hover:text-rose-700 cursor-pointer text-xs font-bold px-1.5 py-1">
+                        </form>
+                        <form action="{{ path "/admin/tidal_refresh_account_do" }}" method="POST">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="id" value="{{ .ID }}">
+                            <input type="submit" value="refresh token" class="text-blue-600 hover:text-blue-700 cursor-pointer text-xs font-bold px-1.5 py-1 bg-blue-50 hover:bg-blue-100 rounded">
+                        </form>
+                        <form action="{{ path "/admin/tidal_toggle_account_do" }}" method="POST">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="id" value="{{ .ID }}">
+                            <input type="hidden" name="active" value="{{ if .IsActive }}false{{ else }}true{{ end }}">
+                            <input type="submit" value="{{ if .IsActive }}disable{{ else }}enable{{ end }}" class="text-gray-600 hover:text-gray-800 cursor-pointer text-xs font-bold px-1.5 py-1 bg-gray-100 hover:bg-gray-200 rounded">
+                        </form>
+                    </div>
+                    <div class="flex items-center gap-4">
+                        {{ if .IsActive }}
+                            <span class="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded">active</span>
+                        {{ else }}
+                            <span class="text-xs font-bold text-gray-500 bg-gray-100 px-2 py-0.5 rounded">inactive</span>
+                        {{ end }}
+                        <div class="flex flex-col items-end">
+                            <span class="font-bold text-gray-900">{{ .Username }}</span>
+                            <span class="text-[11px] text-gray-500">User ID: {{ .UserID }} • {{ tokenExpiresHuman .ExpiresAt }}</span>
+                            <span class="text-[10px] text-gray-400">added {{ dateHuman .CreatedAt }}</span>
+                        </div>
+                    </div>
+                </div>
+                {{ else }}
+                <div class="py-10 text-center text-gray-400 font-medium italic">
+                    no tidal accounts configured yet. link an account below or add a refresh token manually.
+                </div>
+                {{ end }}
+            </div>
+        </div>
+    </div>
+
+    <!-- 1-Click OAuth Linking Block -->
+    <div class="border-b-2 border-r-2 border-gray-300/80 bg-gray-50 p-4">
+        <div class="inline-flex items-center gap-x-3">
+            <span class="text-gray-500/80 w-4">
+                <svg class="fill-current aspect-square" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            </span>
+            <span class="text-gray-900 font-bold">link new account (oauth device flow)</span>
+        </div>
+        <hr class="bg-gray-900/30 my-1" />
+        <div class="font-medium text-gray-500 max-w-[700px]">link your tidal subscriber account in 1 click using the official authorization standard</div>
+        <div class="mt-4 max-w-[700px] ml-auto text-right">
+            {{ if .PendingOAuth }}
+            <div class="bg-blue-50 border border-blue-200 rounded p-4 text-center space-y-3" id="oauth-pending-box">
+                <p class="text-sm text-blue-900 font-medium">Click the link below to authorize with your Tidal account:</p>
+                <div class="my-2">
+                    <a href="https://link.tidal.com/{{ .PendingOAuth.UserCode }}" target="_blank" rel="noopener noreferrer"
+                       class="inline-block bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-3 rounded text-lg transition-colors shadow">
+                        👉 Open https://link.tidal.com/{{ .PendingOAuth.UserCode }}
+                    </a>
+                </div>
+                <p class="text-xs text-blue-700">Code: <span class="font-mono font-bold text-sm bg-white px-2 py-0.5 rounded border border-blue-300">{{ .PendingOAuth.UserCode }}</span></p>
+                <div class="flex items-center justify-center gap-2 text-xs text-blue-600 mt-2">
+                    <svg class="animate-spin h-4 w-4 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span id="oauth-status-text">waiting for authorization in Tidal...</span>
+                </div>
+                <div class="pt-2">
+                    <form action="{{ path "/admin/tidal_cancel_oauth_do" }}" method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                        <input type="submit" value="cancel" class="text-gray-500 hover:text-gray-700 cursor-pointer text-xs underline">
+                    </form>
+                </div>
+            </div>
+
+            <script>
+            (function() {
+                const pollUrl = '{{ path "/admin/tidal_poll_oauth_json" }}';
+                const statusText = document.getElementById('oauth-status-text');
+                
+                const interval = setInterval(async () => {
+                    try {
+                        const res = await fetch(pollUrl);
+                        if (!res.ok) return;
+                        const data = await res.json();
+                        if (data.status === 'success') {
+                            clearInterval(interval);
+                            if (statusText) statusText.innerText = 'Approved! Reloading...';
+                            window.location.reload();
+                        } else if (data.status === 'error') {
+                            clearInterval(interval);
+                            if (statusText) statusText.innerText = 'Error: ' + data.message;
+                        }
+                    } catch (e) {
+                        // ignore network error
+                    }
+                }, 2500);
+            })();
+            </script>
+            {{ else }}
+            <form action="{{ path "/admin/tidal_start_oauth_do" }}" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                <input type="submit" value="generate tidal authorization link" 
+                       class="bg-blue-600 hover:bg-blue-700 text-white font-bold px-5 py-2.5 rounded cursor-pointer transition-colors shadow">
+            </form>
+            {{ end }}
+        </div>
+    </div>
+
+    <!-- Manual Add Block -->
+    <div class="border-b-2 border-r-2 border-gray-300/80 bg-gray-50 p-4">
+        <div class="inline-flex items-center gap-x-3">
+            <span class="text-gray-500/80 w-4">
+                <svg class="fill-current aspect-square" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            </span>
+            <span class="text-gray-900 font-bold">add account manually</span>
+        </div>
+        <hr class="bg-gray-900/30 my-1" />
+        <div class="font-medium text-gray-500 max-w-[700px]">add an existing permanent refresh token manually</div>
+        <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
+            <form action="{{ path "/admin/tidal_add_manual_do" }}" method="POST" class="grid grid-cols-[1fr_auto] gap-2 items-center justify-items-end">
+                <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+                
+                <input type="text" name="refresh_token" placeholder="permanent refresh token (from Tidal OAuth)" required
+                    class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors font-mono text-xs">
+                <label class="text-[10px] uppercase font-bold text-gray-400">refresh token</label>
+                
+                <input type="text" name="username" placeholder="e.g. My HiFi Account"
+                    class="w-full text-right bg-white border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:border-blue-500 transition-colors">
+                <label class="text-[10px] uppercase font-bold text-gray-400">friendly name (optional)</label>
+
+                <div class="col-span-full mt-2">
+                    <input type="submit" value="verify & save account" class="bg-gray-800 hover:bg-gray-900 text-white font-bold px-4 py-2 rounded cursor-pointer transition-colors">
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+{{ template "foot" . }}

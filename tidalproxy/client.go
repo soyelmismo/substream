@@ -43,13 +43,14 @@ type instance struct {
 
 // Pool implements TidalProxy with multi-instance failover and multi-account token rotation
 type Pool struct {
-	instances []*instance
-	client    *http.Client
-	quality   string
-	userTokens []string
-	tokenIdx   uint64
-	tokenMu    sync.RWMutex
-	mu         sync.RWMutex
+	instances   []*instance
+	client      *http.Client
+	quality     string
+	userTokens  []string
+	tokenGetter func() string
+	tokenIdx    uint64
+	tokenMu     sync.RWMutex
+	mu          sync.RWMutex
 
 	// New mirror manager for intelligent selection
 	mirrorMgr *MirrorManager
@@ -59,7 +60,23 @@ type Pool struct {
 	streamCacheMu sync.RWMutex
 }
 
+func (p *Pool) SetTokenGetter(fn func() string) {
+	p.tokenMu.Lock()
+	defer p.tokenMu.Unlock()
+	p.tokenGetter = fn
+}
+
 func (p *Pool) getUserToken() string {
+	p.tokenMu.RLock()
+	getter := p.tokenGetter
+	p.tokenMu.RUnlock()
+
+	if getter != nil {
+		if tok := getter(); tok != "" {
+			return tok
+		}
+	}
+
 	p.tokenMu.RLock()
 	defer p.tokenMu.RUnlock()
 	if len(p.userTokens) == 0 {
@@ -373,10 +390,6 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		req.Header.Set("X-Forwarded-For", clientIP)
 		req.Header.Set("X-Real-IP", clientIP)
 	}
-	usedToken := p.getUserToken()
-	if usedToken != "" {
-		req.Header.Set("Authorization", "Bearer "+usedToken)
-	}
 
 	start := time.Now()
 	resp, err := p.client.Do(req)
@@ -387,10 +400,6 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 			p.mirrorMgr.ReportResult(m, latency, err)
 		}
 		return nil, fmt.Errorf("request %s: %w", path, err)
-	}
-
-	if resp.StatusCode == http.StatusUnauthorized && usedToken != "" {
-		p.reportTokenAuthFailure(usedToken)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -464,10 +473,6 @@ func (p *Pool) doFetchRawWithMirror(ctx context.Context, path string, query url.
 		req.Header.Set("X-Forwarded-For", clientIP)
 		req.Header.Set("X-Real-IP", clientIP)
 	}
-	rawUsedToken := p.getUserToken()
-	if rawUsedToken != "" {
-		req.Header.Set("Authorization", "Bearer "+rawUsedToken)
-	}
 
 	start := time.Now()
 	resp, err := p.client.Do(req)
@@ -478,10 +483,6 @@ func (p *Pool) doFetchRawWithMirror(ctx context.Context, path string, query url.
 			p.mirrorMgr.ReportResult(m, latency, err)
 		}
 		return fmt.Errorf("request %s: %w", path, err)
-	}
-
-	if resp.StatusCode == http.StatusUnauthorized && rawUsedToken != "" {
-		p.reportTokenAuthFailure(rawUsedToken)
 	}
 
 	if resp.StatusCode != http.StatusOK {

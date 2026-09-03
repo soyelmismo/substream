@@ -28,6 +28,7 @@ import (
 	"go.senan.xyz/gonic"
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
+	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/server/ctrladmin/adminui"
 	"go.senan.xyz/gonic/tidalproxy"
 )
@@ -47,6 +48,9 @@ type Controller struct {
 	proxy            tidalproxy.TidalProxy
 	resolveProxyPath ProxyPathResolver
 	rateLimiter      *RateLimiter
+
+	pendingOAuthMu   sync.Mutex
+	pendingOAuth     *tidal.DeviceCodeResponse
 }
 
 // RateLimiter provides simple IP-based rate limiting for login attempts
@@ -229,6 +233,16 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resol
 	c.Handle("/proxies", adminChain(resp(c.ServeProxies)))
 	c.Handle("/add_proxy_do", adminChain(resp(c.ServeAddProxyDo)))
 	c.Handle("/delete_proxy_do", adminChain(resp(c.ServeDeleteProxyDo)))
+
+	// admin tidal accounts
+	c.Handle("/tidal_accounts", adminChain(resp(c.ServeTidalAccounts)))
+	c.Handle("/tidal_start_oauth_do", adminChain(resp(c.ServeTidalStartOAuthDo)))
+	c.Handle("/tidal_poll_oauth_json", adminChain(http.HandlerFunc(c.ServeTidalPollOAuthJSON)))
+	c.Handle("/tidal_cancel_oauth_do", adminChain(resp(c.ServeTidalCancelOAuthDo)))
+	c.Handle("/tidal_add_manual_do", adminChain(resp(c.ServeTidalAddManualDo)))
+	c.Handle("/tidal_delete_account_do", adminChain(resp(c.ServeTidalDeleteAccountDo)))
+	c.Handle("/tidal_toggle_account_do", adminChain(resp(c.ServeTidalToggleAccountDo)))
+	c.Handle("/tidal_refresh_account_do", adminChain(resp(c.ServeTidalRefreshAccountDo)))
 
 	// admin cache
 	c.Handle("/clear_cache_do", adminChain(resp(c.ServeClearCacheDo)))
@@ -560,6 +574,10 @@ type templateData struct {
 	Proxies     []*db.ProxyInstance
 	MirrorStats string
 
+	// tidal accounts
+	TidalAccounts []*db.TidalAccount
+	PendingOAuth  *tidal.DeviceCodeResponse
+
 	// settings
 	AutoRegister bool
 	ProxyStreams bool
@@ -570,6 +588,15 @@ type templateData struct {
 
 func funcMap() template.FuncMap {
 	return template.FuncMap{
+		"tokenExpiresHuman": func(t time.Time) string {
+			if t.IsZero() {
+				return "unknown"
+			}
+			if time.Now().After(t) {
+				return "expired (" + humanize.Time(t) + ")"
+			}
+			return "expires in " + time.Until(t).Round(time.Minute).String()
+		},
 		"str": func(in any) string {
 			v, _ := json.Marshal(in)
 			return string(v)

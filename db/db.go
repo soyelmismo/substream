@@ -81,6 +81,47 @@ func (db *DB) UpdateProxyHealth(id int, healthy bool) error {
 	return db.Model(&ProxyInstance{}).Where("id=?", id).Update("is_healthy", healthy).Error
 }
 
+func (db *DB) GetTidalAccounts() ([]*TidalAccount, error) {
+	var accounts []*TidalAccount
+	err := db.Order("created_at DESC").Find(&accounts).Error
+	return accounts, err
+}
+
+func (db *DB) GetActiveTidalAccounts() ([]*TidalAccount, error) {
+	var accounts []*TidalAccount
+	err := db.Where("is_active = ?", true).Order("created_at ASC").Find(&accounts).Error
+	return accounts, err
+}
+
+func (db *DB) AddTidalAccount(userID, username, refreshToken, accessToken string, expiresAt time.Time) (*TidalAccount, error) {
+	acc := &TidalAccount{
+		UserID:       userID,
+		Username:     username,
+		RefreshToken: refreshToken,
+		AccessToken:  accessToken,
+		ExpiresAt:    expiresAt,
+		IsActive:     true,
+	}
+	err := db.Create(acc).Error
+	return acc, err
+}
+
+func (db *DB) UpdateTidalAccountTokens(id int, accessToken string, expiresAt time.Time) error {
+	return db.Model(&TidalAccount{}).Where("id=?", id).Updates(map[string]interface{}{
+		"access_token": accessToken,
+		"expires_at":   expiresAt,
+		"updated_at":   time.Now(),
+	}).Error
+}
+
+func (db *DB) DeleteTidalAccount(id int) error {
+	return db.Where("id=?", id).Delete(&TidalAccount{}).Error
+}
+
+func (db *DB) ToggleTidalAccount(id int, active bool) error {
+	return db.Model(&TidalAccount{}).Where("id=?", id).Update("is_active", active).Error
+}
+
 func (db *DB) GetSetting(key string, defaultValue string) string {
 	var setting Setting
 	err := db.Where("key=?", key).First(&setting).Error

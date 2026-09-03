@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.senan.xyz/gonic/db"
@@ -81,6 +82,7 @@ func Bootstrap(dbc *db.DB, cliURLs []string, userToken string) *Provider {
 		Timeout:        10 * time.Second,
 		UserToken:      userToken,
 	})
+	setupTokenManager(dbc, pool)
 	cachedProxy := tidalproxy.NewCachedProxy(pool, dbc, 30*24*time.Hour)
 
 	// Seed mirrors if SQLite table is empty
@@ -548,4 +550,55 @@ func (p *Provider) artistToSpec(a *tidalproxy.TidalArtist) *spec.Artist {
 		Name:    a.Name,
 		CoverID: coverID,
 	}
+}
+
+// setupTokenManager dynamically provides and auto-refreshes active Tidal OAuth accounts from SQLite
+func setupTokenManager(dbc *db.DB, pool *tidalproxy.Pool) {
+	var tokenIdx uint64
+	var refreshMu sync.Mutex
+
+	pool.SetTokenGetter(func() string {
+		accounts, err := dbc.GetActiveTidalAccounts()
+		if err != nil || len(accounts) == 0 {
+			return "" // Fall back to static CLI / .env tokens
+		}
+
+		// Select account round-robin
+		idx := atomic.AddUint64(&tokenIdx, 1) - 1
+		acc := accounts[idx%uint64(len(accounts))]
+
+		// Auto-refresh if token expires in less than 5 minutes or is empty
+		if acc.AccessToken == "" || time.Now().After(acc.ExpiresAt.Add(-5*time.Minute)) {
+			refreshMu.Lock()
+			// Double-check after acquiring lock
+			freshAccs, _ := dbc.GetActiveTidalAccounts()
+			for _, fa := range freshAccs {
+				if fa.ID == acc.ID {
+					acc = fa
+					break
+				}
+			}
+			if acc.AccessToken == "" || time.Now().After(acc.ExpiresAt.Add(-5*time.Minute)) {
+				log.Printf("[TIDAL-OAUTH] 🔄 Auto-refreshing access token for account %s (User ID: %s)...", acc.Username, acc.UserID)
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				tokResp, err := RefreshAccessToken(ctx, acc.RefreshToken)
+				cancel()
+				if err != nil {
+					log.Printf("[TIDAL-OAUTH] ❌ Refresh failed for account %s: %v", acc.Username, err)
+					refreshMu.Unlock()
+					return acc.AccessToken // Return current token as fallback
+				}
+				expiresAt := time.Now().Add(time.Duration(tokResp.ExpiresIn) * time.Second)
+				if err := dbc.UpdateTidalAccountTokens(acc.ID, tokResp.AccessToken, expiresAt); err != nil {
+					log.Printf("[TIDAL-OAUTH] ⚠️ Failed to persist refreshed token to DB: %v", err)
+				} else {
+					log.Printf("[TIDAL-OAUTH] ✅ Token refreshed successfully for %s! Valid until %s", acc.Username, expiresAt.Format("15:04:05 MST"))
+				}
+				acc.AccessToken = tokResp.AccessToken
+			}
+			refreshMu.Unlock()
+		}
+
+		return acc.AccessToken
+	})
 }
