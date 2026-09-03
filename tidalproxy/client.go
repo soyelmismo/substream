@@ -1264,7 +1264,8 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 	}
 
 	var v2Response struct {
-		Data struct {
+		Version string `json:"version"`
+		Data    struct {
 			Attributes struct {
 				Manifest          string   `json:"manifest"`
 				ManifestMimeType  string   `json:"manifestMimeType"`
@@ -1272,6 +1273,17 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 				Formats           []string `json:"formats"`
 				TrackPresentation string   `json:"trackPresentation"`
 			} `json:"attributes"`
+			Data struct {
+				ID         string `json:"id"`
+				Type       string `json:"type"`
+				Attributes struct {
+					Manifest          string   `json:"manifest"`
+					ManifestMimeType  string   `json:"manifestMimeType"`
+					URI               string   `json:"uri"`
+					Formats           []string `json:"formats"`
+					TrackPresentation string   `json:"trackPresentation"`
+				} `json:"attributes"`
+			} `json:"data"`
 		} `json:"data"`
 	}
 
@@ -1283,15 +1295,31 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 		return res
 	}
 
-	if v2Response.Data.Attributes.TrackPresentation == "PREVIEW" {
-		res.Err = fmt.Errorf("preview track")
-		return res
+	// Extraer atributos soportando formato plano y formato JSON:API anidado (monochrome 2.10)
+	manifestB64 := v2Response.Data.Data.Attributes.Manifest
+	if manifestB64 == "" {
+		manifestB64 = v2Response.Data.Attributes.Manifest
+	}
+	manifestMime := v2Response.Data.Data.Attributes.ManifestMimeType
+	if manifestMime == "" {
+		manifestMime = v2Response.Data.Attributes.ManifestMimeType
+	}
+	uri := v2Response.Data.Data.Attributes.URI
+	if uri == "" {
+		uri = v2Response.Data.Attributes.URI
+	}
+	trackPres := v2Response.Data.Data.Attributes.TrackPresentation
+	if trackPres == "" {
+		trackPres = v2Response.Data.Attributes.TrackPresentation
+	}
+
+	if trackPres == "PREVIEW" {
+		log.Printf("[HLS] Track %d is marked as PREVIEW by Tidal, streaming available manifest", trackID)
 	}
 
 	// Extraer URL de un JSON Base64 (A veces V2 lo envía)
-	manifestB64 := v2Response.Data.Attributes.Manifest
 	if manifestB64 != "" {
-		audioURL, parseErr := parseManifestURL(trackID, "V2-"+task.ManifestType, v2Response.Data.Attributes.ManifestMimeType, manifestB64)
+		audioURL, parseErr := parseManifestURL(trackID, "V2-"+task.ManifestType, manifestMime, manifestB64)
 		if parseErr == nil && audioURL != "" {
 			// [PROXY VALIDATION] Check if proxied URL works, fallback to direct if not
 			finalURL, ok := tryProxyURL(audioURL, p.client, clientIP)
@@ -1308,7 +1336,6 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 	}
 
 	// Extraer de URI directa (Típico de HLS en V2)
-	uri := v2Response.Data.Attributes.URI
 	if uri != "" {
 		res.URL = uri
 		return res
@@ -1436,7 +1463,7 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 	// Si el mejor mirror responde rápido, evitamos el overhead del shotgun hedge completo.
 	if len(tasks) > 0 {
 		bestTask := tasks[0]
-		fastCtx, fastCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		fastCtx, fastCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 		defer fastCancel()
 
 		start := time.Now()
@@ -1586,9 +1613,11 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 	hedgeTimer := time.NewTimer(hedgeDelay)
 	defer hedgeTimer.Stop()
 
+	receivedResults := 0
 	for {
 		select {
 		case outcome := <-resultsChan:
+			receivedResults++
 			// Acumular errores y mirrors fallados
 			errorsList = append(errorsList, outcome.errors...)
 			if outcome.unavail {
@@ -1656,8 +1685,8 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 			return "", ctx.Err()
 		}
 
-		// Condición de salida: todos los batches lanzados y tenemos resultado
-		if batchNum >= len(tasks) && bestResult != nil {
+		// Condición de salida: todos los batches lanzados y tenemos resultado, o todos los tasks terminaron
+		if (batchNum >= len(tasks) && bestResult != nil) || receivedResults >= len(tasks) {
 			break
 		}
 	}
