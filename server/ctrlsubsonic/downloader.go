@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -278,6 +279,24 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	hasInitSegment := len(segments) > 0 && segments[0].duration == 0
 	nextToWrite := startIdx
 
+	var targetWriter io.Writer = w
+	var remuxCmd *exec.Cmd
+	var remuxPipe *io.PipeWriter
+	var remuxErrBuf bytes.Buffer
+	var taggerDone chan struct{}
+
+	defer func() {
+		if remuxPipe != nil {
+			remuxPipe.Close()
+		}
+		if remuxCmd != nil && remuxCmd.Process != nil {
+			_ = remuxCmd.Wait()
+		}
+		if taggerDone != nil {
+			<-taggerDone
+		}
+	}()
+
 	if hasInitSegment {
 		// fMP4: need init segment first, then start from media segment 1 or startIdx
 		firstMediaIdx := 1
@@ -305,29 +324,36 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			return fmt.Errorf("first media segment %d failed: %w", firstMediaIdx, err)
 		}
 
-		// [CRITICAL FIX] Correct Content-Type for fMP4 streams
-		// Tidal FLAC streams are now in fMP4 containers, not raw FLAC
-		// Without this fix, client receives audio/flac header but fMP4 data and fails
+		// Detect container and codec
+		isFMP4 := len(initData) >= 8 && string(initData[4:8]) == "ftyp"
+		isFLACInFMP4 := isFMP4 && bytes.Contains(initData, []byte("fLaC"))
+
 		if rw, ok := w.(http.ResponseWriter); ok {
-			// Check for MP4 signature ("ftyp" at offset 4)
-			if len(initData) >= 8 && string(initData[4:8]) == "ftyp" {
-				// Standard MIME type for MP4 container audio
+			cleanName := ""
+			if track != nil {
+				cleanName = strings.ReplaceAll(fmt.Sprintf("%s - %s", track.Artist.Name, track.Title), "/", "_")
+			}
+			if isFLACInFMP4 {
+				rw.Header().Set("Content-Type", "audio/flac")
+				log.Printf("[DOWNLOAD] Genuine FLAC stream detected in fMP4, serving audio/flac for %s", clientName)
+				if rw.Header().Get("Content-Disposition") != "" && cleanName != "" {
+					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".flac"))
+				}
+				rw.Header().Set("Accept-Ranges", "none")
+			} else if isFMP4 {
+				// Standard MIME type for MP4 container audio (AAC)
 				rw.Header().Set("Content-Type", "audio/mp4")
-				log.Printf("[DOWNLOAD] fMP4 container detected, using Content-Type audio/mp4 for %s", clientName)
-				// Remove any incorrect Content-Disposition from ServeStream
-				if rw.Header().Get("Content-Disposition") != "" && track != nil {
-					cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s", track.Artist.Name, track.Title), "/", "_")
+				log.Printf("[DOWNLOAD] AAC in fMP4 container detected, using Content-Type audio/mp4 for %s", clientName)
+				if rw.Header().Get("Content-Disposition") != "" && cleanName != "" {
 					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
 				}
 
 				// Inject fake sidx ONLY for Android ExoPlayer/Tempus/Symfonium to force seek bar.
-				// NEVER inject for MPV / Supersonic / FFmpeg as it corrupts the MP4 box structure
-				// and causes "could not find corresponding track id 1" decode failure.
 				isExoPlayer := isExoPlayerClient(clientName)
 				if isExoPlayer {
 					ftypLen := binary.BigEndian.Uint32(initData[0:4])
 					if ftypLen > 0 && ftypLen < uint32(len(initData)) && track != nil && track.Duration > 0 && startByte == 0 {
-						bps := int64(125000)
+						bps := int64(40000)
 						if totalBytes > 0 {
 							bps = totalBytes / int64(track.Duration)
 						}
@@ -362,15 +388,57 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			}
 		}
 
-		// Write init segment first (required for fMP4 decoding)
-		if _, err := w.Write(initData); err != nil {
+		if isFLACInFMP4 {
+			if _, lookErr := exec.LookPath("ffmpeg"); lookErr == nil {
+				pr, pw := io.Pipe()
+				cmd := exec.CommandContext(ctx, "ffmpeg",
+					"-loglevel", "error",
+					"-f", "mp4",
+					"-i", "pipe:0",
+					"-c:a", "copy",
+					"-f", "flac",
+					"pipe:1",
+				)
+				cmd.Stdin = pr
+				cmd.Stderr = &remuxErrBuf
+
+				ffmpegOut, pipeErr := cmd.StdoutPipe()
+				if pipeErr == nil && cmd.Start() == nil {
+					targetWriter = pw
+					remuxCmd = cmd
+					remuxPipe = pw
+					taggerDone = make(chan struct{})
+					log.Printf("[DOWNLOAD] 🚀 Remuxing fMP4 FLAC to native lossless .flac with metadata/cover for %s", clientName)
+
+					go func() {
+						defer close(taggerDone)
+						if track != nil {
+							t := &flacTagger{w: w, track: track, startByte: startByte, totalBytes: totalBytes}
+							if tagErr := t.process(ffmpegOut, c); tagErr != nil && ctx.Err() == nil {
+								log.Printf("[DOWNLOAD] FLAC tagging error: %v, writing remaining raw", tagErr)
+								_, _ = io.Copy(w, ffmpegOut)
+							}
+						} else {
+							_, _ = io.Copy(w, ffmpegOut)
+						}
+					}()
+				} else {
+					log.Printf("[DOWNLOAD] Failed to start ffmpeg remuxer, falling back to raw stream")
+					pr.Close()
+					pw.Close()
+				}
+			}
+		}
+
+		// Write init segment first (required for fMP4 decoding/demuxing)
+		if _, err := targetWriter.Write(initData); err != nil {
 			return err
 		}
 		// Then write first media segment
-		if _, err := w.Write(firstData); err != nil {
+		if _, err := targetWriter.Write(firstData); err != nil {
 			return err
 		}
-		if canFlush {
+		if canFlush && remuxCmd == nil {
 			flusher.Flush()
 		}
 		log.Printf("[DOWNLOAD] First segment sent to client in %v total (%.2f KB)", time.Since(downloadStart), float64(len(firstData))/1024)
@@ -482,11 +550,11 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		key := segmentCacheKey(segments[idx].url)
 		if cached := c.segmentCache.Get(key); cached != nil {
 			log.Printf("[DOWNLOAD] Segment %d from cache (%.2f KB)", idx, float64(len(cached))/1024)
-			if _, err := w.Write(cached); err != nil {
+			if _, err := targetWriter.Write(cached); err != nil {
 				prefetchCancel() // Stop prefetching on client disconnect
 				return err
 			}
-			if canFlush {
+			if canFlush && remuxCmd == nil {
 				flusher.Flush()
 			}
 			continue
@@ -508,17 +576,32 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 
 		// Write to client
 		log.Printf("[DOWNLOAD] Segment %d streaming (%.2f KB)", idx, float64(len(data))/1024)
-		if _, err := w.Write(data); err != nil {
+		if _, err := targetWriter.Write(data); err != nil {
 			prefetchCancel()
 			return err
 		}
-		if canFlush {
+		if canFlush && remuxCmd == nil {
 			flusher.Flush()
 		}
 	}
 
 	prefetchCancel()
 	wg.Wait()
+
+	if remuxPipe != nil {
+		remuxPipe.Close()
+		remuxPipe = nil
+		if remuxCmd != nil {
+			if waitErr := remuxCmd.Wait(); waitErr != nil && ctx.Err() == nil {
+				log.Printf("[STREAM] ffmpeg remux exit error: %v (stderr: %s)", waitErr, remuxErrBuf.String())
+			}
+			remuxCmd = nil
+		}
+	}
+	if taggerDone != nil {
+		<-taggerDone
+		taggerDone = nil
+	}
 	return nil
 }
 
@@ -924,6 +1007,9 @@ func (t *flacTagger) makeVorbisComment() []byte {
 	}
 	if t.track.Album.ReleaseDate != "" {
 		tags["DATE"] = t.track.Album.ReleaseDate
+		if len(t.track.Album.ReleaseDate) >= 4 {
+			tags["YEAR"] = t.track.Album.ReleaseDate[:4]
+		}
 	}
 	if t.track.ISRC != "" {
 		tags["ISRC"] = t.track.ISRC
@@ -958,12 +1044,24 @@ func (t *flacTagger) makeVorbisComment() []byte {
 }
 
 func (t *flacTagger) makePictureBlock(c *Controller) []byte {
+	if t.track == nil {
+		return nil
+	}
 	coverUUID := t.track.Album.Cover
+	if coverUUID == "" && t.track.Album.ID > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		coverUUID = c.proxy.GetCoverUUIDForAlbum(ctx, t.track.Album.ID)
+		cancel()
+	}
 	if coverUUID == "" {
 		return nil
 	}
 
-	coverURL := c.proxy.GetCoverURL(coverUUID, 640)
+	// Prefer 1280x1280 high resolution album cover art, fallback to 640
+	coverURL := c.proxy.GetCoverURL(coverUUID, 1280)
+	if coverURL == "" {
+		coverURL = c.proxy.GetCoverURL(coverUUID, 640)
+	}
 
 	// Use controller's HTTP client with proper timeout instead of default http.Get
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -984,6 +1082,9 @@ func (t *flacTagger) makePictureBlock(c *Controller) []byte {
 	}
 	defer resp.Body.Close()
 	imgData, _ := io.ReadAll(resp.Body)
+	if len(imgData) == 0 {
+		return nil
+	}
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(3)) // type: front cover
@@ -996,9 +1097,9 @@ func (t *flacTagger) makePictureBlock(c *Controller) []byte {
 	binary.Write(buf, binary.BigEndian, uint32(len(desc)))
 	buf.WriteString(desc)
 
-	// width, height, depth, colors (dummy values for now)
-	binary.Write(buf, binary.BigEndian, uint32(640))
-	binary.Write(buf, binary.BigEndian, uint32(640))
+	// width, height, depth, colors
+	binary.Write(buf, binary.BigEndian, uint32(1280))
+	binary.Write(buf, binary.BigEndian, uint32(1280))
 	binary.Write(buf, binary.BigEndian, uint32(24))
 	binary.Write(buf, binary.BigEndian, uint32(0))
 

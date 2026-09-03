@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -107,17 +108,11 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 			continue
 		}
 
-		// Determine extension based on quality and stream type
-		// HLS LOSSLESS uses fMP4 container, BTS LOSSLESS uses native FLAC
-		isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
+		// Determine extension based on quality
 		ext := "m4a" // Default AAC/MP4
 		switch tidalQuality {
 		case "LOSSLESS", "HI_RES_LOSSLESS":
-			if isHLS {
-				ext = "m4a" // fMP4 container for HLS
-			} else {
-				ext = "flac" // Native FLAC for BTS
-			}
+			ext = "flac"
 		case "LOW", "HIGH":
 			ext = "m4a"
 		default:
@@ -140,7 +135,7 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 		}
 
 		// Download and add track content
-		if err := c.downloadAndAddToZip(ctx, streamURL, entry, getClientIP(r)); err != nil {
+		if err := c.downloadAndAddToZip(ctx, streamURL, entry, getClientIP(r), &track); err != nil {
 			log.Printf("[DOWNLOAD] Error downloading track %d: %v", track.ID, err)
 			continue
 		}
@@ -176,7 +171,7 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 	log.Printf("[DOWNLOAD] Starting single track download: track=%d artist=%q title=%q quality=%s", trackID, prep.Track.Artist.Name, prep.Track.Title, prep.Quality)
 
 	// Download and stream the track
-	if err := c.downloadAndAddToZip(r.Context(), prep.StreamURL, w, prep.ClientIP); err != nil {
+	if err := c.downloadAndAddToZip(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track); err != nil {
 		log.Printf("[DOWNLOAD] Error downloading track %d: %v", trackID, err)
 		return spec.NewError(0, "download failed: %v", err)
 	}
@@ -185,18 +180,18 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 	return nil
 }
 
-func (c *Controller) downloadAndAddToZip(ctx context.Context, streamURL string, w io.Writer, clientIP string) error {
+func (c *Controller) downloadAndAddToZip(ctx context.Context, streamURL string, w io.Writer, clientIP string, track *tidal.TidalTrack) error {
 	// Check if this is a manifest that needs proxy/stitching
 	isHLS := strings.Contains(streamURL, ".m3u8") || strings.Contains(streamURL, "manifestType=HLS")
 	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
 
 	if isHLS {
 		// Use HLS stitcher - download and concatenate all segments (no seeking for downloads)
-		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, nil, 0, 0, 0, "download")
+		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, track, 0, 0, 0, "download")
 	}
 	if isDASH {
 		// Use DASH stitcher (no seeking for downloads, offset=0)
-		return c.downloadAndStitchDASH(ctx, streamURL, w, clientIP, nil, 0)
+		return c.downloadAndStitchDASH(ctx, streamURL, w, clientIP, track, 0)
 	}
 
 	// Direct download for non-manifest URLs

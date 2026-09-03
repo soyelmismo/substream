@@ -119,6 +119,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// [LATENCY PRIORITY] For clients that need HLS stitching (supersonic, symfonium, etc.)
 	// we skip deduplication entirely. Each client gets their own stitched stream immediately
 	// rather than waiting for another request to complete. This prioritizes latency over bandwidth.
+	proxyStreams := c.getCachedSetting("proxy_streams", "false")
 	clientNeedsHelp := doesntSupportHLS(p.GetOr("c", ""))
 
 	streamKey := fmt.Sprintf("stream:%s:%d:dedup", id.String(), p.GetOrInt("maxBitRate", 0))
@@ -149,8 +150,8 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		if lock.err != nil {
 			log.Printf("[STREAM] Previous request had error (%v), starting fresh for track=%d", lock.err, id.Value())
 			c.streamLocks.Delete(streamKey)
-		} else if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute && !strings.HasPrefix(lock.prep.StreamURL, "data:") {
-			// Safe to redirect to cached URL (client supports HLS natively)
+		} else if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute && !strings.HasPrefix(lock.prep.StreamURL, "data:") && !lock.prep.IsHLS && proxyStreams != "true" {
+			// Safe to redirect to cached progressive URL (non-HLS)
 			log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
 			urlPreview := lock.prep.StreamURL
 			if len(urlPreview) > 100 {
@@ -161,7 +162,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			http.Redirect(w, r, lock.prep.StreamURL, http.StatusFound)
 			return nil
 		}
-		// Cache expired, clean up and proceed with new request
+		// Cache expired or was HLS manifest that needs stitching, clean up and proceed
 		c.streamLocks.Delete(streamKey)
 	}
 	// Cleanup lock when done - capture err in named return to propagate to waiters
@@ -191,11 +192,20 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		}
 	}()
 
-	prep, err := c.prepareStream(r.Context(), r, &id)
-	if err != nil {
-		streamErr = err
-		log.Printf("[STREAM] ERROR: prepare failed: %v", err)
-		return spec.NewError(0, "error preparing stream: %v", err)
+	var prep *streamRequest
+	if lockVal != nil {
+		if lock, ok := lockVal.(*streamLock); ok && lock.prep != nil && time.Since(lock.cached) < 10*time.Minute {
+			prep = lock.prep
+			log.Printf("[STREAM] GAPLESS reusing prepared stream metadata for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
+		}
+	}
+	if prep == nil {
+		prep, err = c.prepareStream(r.Context(), r, &id)
+		if err != nil {
+			streamErr = err
+			log.Printf("[STREAM] ERROR: prepare failed: %v", err)
+			return spec.NewError(0, "error preparing stream: %v", err)
+		}
 	}
 	// [GAPLESS] Capture successful prep for deduplication cache
 	streamPrep = prep
@@ -212,7 +222,6 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		user.ID, trackURI, time.Now(), time.Now())
 
 	// 2. Route based on client HLS support
-	proxyStreams := c.getCachedSetting("proxy_streams", "false")
 	clientNeedsHelp = doesntSupportHLS(prep.ClientName) // Already declared earlier
 	streamURL := prep.StreamURL
 
@@ -233,9 +242,10 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		}
 	}
 
-	// Redirect if not proxying and not stitching
+	// Subsonic /rest/stream clients expect a continuous audio stream (e.g. audio/flac).
+	// HLS manifests must always be stitched so standard Subsonic clients get native audio.
 	isDataURL := strings.HasPrefix(streamURL, "data:")
-	needsStitch := (clientNeedsHelp && prep.IsHLS) || isDataURL
+	needsStitch := prep.IsHLS || isDataURL
 	if proxyStreams != "true" && !needsStitch {
 		urlPreview := streamURL
 		if len(urlPreview) > 100 {
@@ -249,7 +259,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 	if r.Method == http.MethodHead {
 		contentType := "audio/mp4"
-		if prep.Ext == "flac" && !prep.IsHLS {
+		if prep.Ext == "flac" {
 			contentType = "audio/flac"
 		}
 		w.Header().Set("Content-Type", contentType)
