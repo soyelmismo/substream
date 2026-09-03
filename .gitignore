@@ -21,3 +21,6 @@ substream
 *.pem
 substream_linux
 *.key
+.env
+config
+genre-tree

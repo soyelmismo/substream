@@ -8,14 +8,18 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/andybalholm/cascadia"
+	"github.com/microcosm-cc/bluemonday"
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/scrobble"
 	"golang.org/x/net/html"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -26,16 +30,23 @@ var (
 type KeySecretFunc func() (apiKey, secret string, err error)
 
 type Client struct {
+	userAgent  string
 	httpClient *http.Client
 	keySecret  KeySecretFunc
+	Limiter    *rate.Limiter
 }
 
-func NewClient(keySecret KeySecretFunc) *Client {
-	return NewClientCustom(http.DefaultClient, keySecret)
+func NewClient(userAgent string, keySecret KeySecretFunc) *Client {
+	return NewClientCustom(userAgent, http.DefaultClient, keySecret)
 }
 
-func NewClientCustom(httpClient *http.Client, keySecret KeySecretFunc) *Client {
-	return &Client{httpClient: httpClient, keySecret: keySecret}
+func NewClientCustom(userAgent string, httpClient *http.Client, keySecret KeySecretFunc) *Client {
+	return &Client{
+		userAgent:  userAgent,
+		httpClient: httpClient,
+		keySecret:  keySecret,
+		Limiter:    rate.NewLimiter(rate.Every(time.Second/5), 1),
+	}
 }
 
 const (
@@ -197,12 +208,18 @@ func (c *Client) GetSession(token string) (string, error) {
 //nolint:gochecknoglobals
 var artistOpenGraphQuery = cascadia.MustCompile(`html > head > meta[property="og:image"]`)
 
+// the placeholder star image, served from a few different hosts
+const lastfmPlaceholderImage = "2a96cbd8b46e442fc41c2b86b821562f"
+
 func (c *Client) StealArtistImage(artistURL string) (string, error) {
-	resp, err := c.httpClient.Get(artistURL) //nolint:gosec
+	resp, err := httpGetRetry(c.httpClient, artistURL, 3) //nolint:gosec
 	if err != nil {
 		return "", fmt.Errorf("get artist url: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("get artist url: %s", resp.Status)
+	}
 
 	node, err := html.Parse(resp.Body)
 	if err != nil {
@@ -221,8 +238,29 @@ func (c *Client) StealArtistImage(artistURL string) (string, error) {
 			break
 		}
 	}
+	if strings.Contains(imageURL, lastfmPlaceholderImage) {
+		return "", nil
+	}
 
 	return imageURL, nil
+}
+
+func httpGetRetry(client *http.Client, url string, attempts int) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+	for i := range attempts {
+		if i > 0 {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			time.Sleep(time.Duration(i) * 2 * time.Second)
+		}
+		resp, err = client.Get(url) //nolint:gosec
+		if err == nil && resp.StatusCode/100 != 5 {
+			return resp, nil
+		}
+	}
+	return resp, err
 }
 
 func (c *Client) IsUserAuthenticated(user db.User) bool {
@@ -315,6 +353,11 @@ func (c *Client) makeRequest(method string, params url.Values) (LastFM, error) {
 	}
 
 	req.URL.RawQuery = params.Encode()
+	req.Header.Set("User-Agent", c.userAgent)
+
+	if err := c.Limiter.Wait(req.Context()); err != nil {
+		return LastFM{}, fmt.Errorf("rate limit: %w", err)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -340,12 +383,30 @@ func GetParamSignature(params url.Values, secret string) string {
 		paramKeys = append(paramKeys, k)
 	}
 	sort.Strings(paramKeys)
-	toHash := ""
+	var toHash strings.Builder
 	for _, k := range paramKeys {
-		toHash += k
-		toHash += params[k][0]
+		toHash.WriteString(k)
+		toHash.WriteString(params[k][0])
 	}
-	toHash += secret
-	hash := md5.Sum([]byte(toHash))
+	toHash.WriteString(secret)
+	hash := md5.Sum([]byte(toHash.String()))
 	return hex.EncodeToString(hash[:])
+}
+
+var doublePuncExpr = regexp.MustCompile(`\.\s+\.\s+`)
+var licenceExpr = regexp.MustCompile(`(?i)\buser-contributed text.*`)
+var readMoreExpr = regexp.MustCompile(`(?i)\bread more on.*`)
+
+var bluemondayPolicy = bluemonday.StrictPolicy() //nolint:gochecknoglobals
+
+func CleanText(text string) string {
+	text = bluemondayPolicy.Sanitize(text)
+	text = html.UnescapeString(text)
+	text = licenceExpr.ReplaceAllString(text, "")
+	text = readMoreExpr.ReplaceAllString(text, "")
+	text = doublePuncExpr.ReplaceAllString(text, ". ")
+	text = strings.ReplaceAll(text, " .", ".")
+	text = strings.Join(strings.Fields(text), " ")
+	text = strings.TrimSpace(text)
+	return text
 }
