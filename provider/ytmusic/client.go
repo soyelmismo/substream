@@ -1,6 +1,7 @@
 package ytmusic
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -20,6 +21,28 @@ const (
 	innertubePlayerURL = "https://music.youtube.com/youtubei/v1/player?alt=json"
 	songsFilterParam   = "Eg-KAQwIABAAGAAgACgB" // Strict Songs filter in YouTube Music
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+	pythonWorkerScript = `
+import sys, yt_dlp
+
+ydl = yt_dlp.YoutubeDL({
+    'quiet': True,
+    'no_warnings': True,
+    'format': 'ba/b',
+    'extractor_args': {'youtube': {'player_client': ['android_music']}}
+})
+print('READY', flush=True)
+
+for line in sys.stdin:
+    vid = line.strip()
+    if not vid: continue
+    try:
+        info = ydl.extract_info(f'https://www.youtube.com/watch?v={vid}', download=False)
+        url = info.get('url') or ''
+        print(f'OK {url}', flush=True)
+    except Exception as e:
+        print(f'ERR {e}', flush=True)
+`
 )
 
 type cachedStream struct {
@@ -33,14 +56,28 @@ type Client struct {
 
 	streamCache   map[string]cachedStream
 	streamCacheMu sync.RWMutex
+
+	// In-flight request de-duplication
+	inFlightMu sync.Mutex
+	inFlight   map[string]chan struct{}
+
+	// Persistent in-memory Python worker for ~1.8s stream resolution
+	workerMu     sync.Mutex
+	workerCmd    *exec.Cmd
+	workerStdin  io.WriteCloser
+	workerReader *bufio.Reader
 }
 
 // NewClient creates a new YouTube Music API client
 func NewClient() *Client {
-	return &Client{
+	c := &Client{
 		httpClient:  &http.Client{Timeout: 10 * time.Second},
 		streamCache: make(map[string]cachedStream),
+		inFlight:    make(map[string]chan struct{}),
 	}
+	// Warm up the resident python worker in background
+	go c.warmupWorker()
+	return c
 }
 
 func (c *Client) buildContextPayload() map[string]interface{} {
@@ -370,8 +407,153 @@ func (c *Client) GetTrack(ctx context.Context, videoID string) (*YTTrack, error)
 	}, nil
 }
 
-// GetStreamURL resolves the direct audio stream URL using yt-dlp on the host
+func (c *Client) warmupWorker() {
+	c.workerMu.Lock()
+	defer c.workerMu.Unlock()
+	if err := c.ensureWorkerLocked(); err != nil {
+		log.Printf("[YTMUSIC] Note: Worker warmup failed (%v), will retry on demand", err)
+	}
+}
+
+func (c *Client) ensureWorkerLocked() error {
+	if c.workerCmd != nil && c.workerCmd.Process != nil && c.workerStdin != nil {
+		return nil
+	}
+
+	cmd := exec.Command("python3", "-u", "-c", pythonWorkerScript)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("worker stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("worker stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start worker process: %w", err)
+	}
+
+	reader := bufio.NewReader(stdout)
+	readyChan := make(chan string, 1)
+	errChan := make(chan error, 1)
+
+	go func() {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			errChan <- err
+			return
+		}
+		readyChan <- line
+	}()
+
+	select {
+	case line := <-readyChan:
+		if !strings.Contains(line, "READY") {
+			_ = cmd.Process.Kill()
+			return fmt.Errorf("unexpected worker greeting: %s", line)
+		}
+	case err := <-errChan:
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("worker init read error: %w", err)
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("worker startup timed out")
+	}
+
+	c.workerCmd = cmd
+	c.workerStdin = stdin
+	c.workerReader = reader
+	log.Printf("[YTMUSIC] 🚀 Persistent Python extraction worker initialized (resident in RAM)")
+	return nil
+}
+
+func (c *Client) resolveViaWorker(videoID string) (string, error) {
+	c.workerMu.Lock()
+	defer c.workerMu.Unlock()
+
+	if err := c.ensureWorkerLocked(); err != nil {
+		return "", err
+	}
+
+	if _, err := io.WriteString(c.workerStdin, videoID+"\n"); err != nil {
+		if c.workerCmd != nil && c.workerCmd.Process != nil {
+			_ = c.workerCmd.Process.Kill()
+		}
+		c.workerCmd = nil
+		c.workerStdin = nil
+		c.workerReader = nil
+		return "", fmt.Errorf("worker stdin write: %w", err)
+	}
+
+	lineChan := make(chan string, 1)
+	errChan := make(chan error, 1)
+
+	go func() {
+		line, err := c.workerReader.ReadString('\n')
+		if err != nil {
+			errChan <- err
+			return
+		}
+		lineChan <- line
+	}()
+
+	select {
+	case line := <-lineChan:
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "OK ") {
+			url := strings.TrimSpace(strings.TrimPrefix(line, "OK "))
+			if url != "" {
+				return url, nil
+			}
+			return "", fmt.Errorf("worker returned empty URL")
+		}
+		return "", fmt.Errorf("worker extraction error: %s", line)
+	case err := <-errChan:
+		if c.workerCmd != nil && c.workerCmd.Process != nil {
+			_ = c.workerCmd.Process.Kill()
+		}
+		c.workerCmd = nil
+		c.workerStdin = nil
+		c.workerReader = nil
+		return "", fmt.Errorf("worker stdout read: %w", err)
+	case <-time.After(8 * time.Second):
+		if c.workerCmd != nil && c.workerCmd.Process != nil {
+			_ = c.workerCmd.Process.Kill()
+		}
+		c.workerCmd = nil
+		c.workerStdin = nil
+		c.workerReader = nil
+		return "", fmt.Errorf("worker extraction timed out for %s", videoID)
+	}
+}
+
+func (c *Client) resolveViaCLI(ctx context.Context, videoID string) (string, error) {
+	targetURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID)
+	cmd := exec.CommandContext(ctx, "yt-dlp",
+		"--no-warnings",
+		"--no-playlist",
+		"--extractor-args", "youtube:player_client=android_music",
+		"-f", "ba/b",
+		"-g", targetURL,
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("yt-dlp cli failed: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	streamURL := strings.TrimSpace(lines[0])
+	if streamURL == "" {
+		return "", fmt.Errorf("empty stream url returned by yt-dlp")
+	}
+	return streamURL, nil
+}
+
+// GetStreamURL resolves the direct audio stream URL using persistent worker or CLI fallback
 func (c *Client) GetStreamURL(ctx context.Context, videoID string) (string, error) {
+	// 1. Fast path: check in-memory cache
 	c.streamCacheMu.RLock()
 	if entry, ok := c.streamCache[videoID]; ok && time.Now().Before(entry.expiresAt) {
 		c.streamCacheMu.RUnlock()
@@ -379,33 +561,51 @@ func (c *Client) GetStreamURL(ctx context.Context, videoID string) (string, erro
 	}
 	c.streamCacheMu.RUnlock()
 
-	targetURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID)
-	cmd := exec.CommandContext(ctx, "yt-dlp",
-		"--no-warnings",
-		"--js-runtimes", "node",
-		"-f", "ba/b",
-		"-g", targetURL,
-	)
+	// 2. Singleflight: de-duplicate simultaneous requests for the same videoID
+	c.inFlightMu.Lock()
+	if ch, running := c.inFlight[videoID]; running {
+		c.inFlightMu.Unlock()
+		select {
+		case <-ch:
+			c.streamCacheMu.RLock()
+			entry, ok := c.streamCache[videoID]
+			c.streamCacheMu.RUnlock()
+			if ok && time.Now().Before(entry.expiresAt) {
+				return entry.url, nil
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	doneCh := make(chan struct{})
+	c.inFlight[videoID] = doneCh
+	c.inFlightMu.Unlock()
 
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("yt-dlp stream resolution failed for %s: %w", videoID, err)
+	defer func() {
+		c.inFlightMu.Lock()
+		delete(c.inFlight, videoID)
+		close(doneCh)
+		c.inFlightMu.Unlock()
+	}()
+
+	// 3. Try fast persistent resident worker (~1.8s)
+	t0 := time.Now()
+	streamURL, err := c.resolveViaWorker(videoID)
+	if err != nil || streamURL == "" {
+		log.Printf("[YTMUSIC] ⚠️ Worker failed (%v), falling back to optimized CLI...", err)
+		streamURL, err = c.resolveViaCLI(ctx, videoID)
+		if err != nil {
+			return "", fmt.Errorf("stream resolution failed for %s: %w", videoID, err)
+		}
 	}
 
-	rawURL := strings.TrimSpace(string(out))
-	lines := strings.Split(rawURL, "\n")
-	streamURL := strings.TrimSpace(lines[0])
-
-	if streamURL == "" {
-		return "", fmt.Errorf("empty stream url returned by yt-dlp for %s", videoID)
-	}
-
-	log.Printf("[YTMUSIC] ✅ Resolved direct stream URL for track %s via yt-dlp", videoID)
+	dur := time.Since(t0)
+	log.Printf("[YTMUSIC] ✅ Resolved direct stream for track %s in %v", videoID, dur)
 
 	c.streamCacheMu.Lock()
 	c.streamCache[videoID] = cachedStream{
 		url:       streamURL,
-		expiresAt: time.Now().Add(1 * time.Hour), // Google video links typically expire in 6 hours
+		expiresAt: time.Now().Add(1 * time.Hour),
 	}
 	c.streamCacheMu.Unlock()
 
