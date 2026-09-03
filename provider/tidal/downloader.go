@@ -83,6 +83,23 @@ func (p *Provider) DownloadTrack(ctx context.Context, req provider.DownloadReque
 			return session.Stdin(), nil
 		}
 
+		// Fallback for AAC in fMP4: losslessly remux to standard ADTS AAC stream
+		if isFMP4 {
+			session, err := remux.StartLosslessCopy(ctx, "mp4", "adts")
+			if err != nil {
+				return w, nil
+			}
+			remuxSession = session
+			taggerDone = make(chan struct{})
+
+			go func() {
+				defer close(taggerDone)
+				_, _ = io.Copy(w, session.Stdout())
+			}()
+
+			return session.Stdin(), nil
+		}
+
 		return w, nil
 	})
 

@@ -112,16 +112,13 @@ func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, 
 		}
 
 		// Determine extension based on quality
-		ext := "m4a" // Default AAC/MP4
+		ext := "flac" // Default lossless FLAC
 		switch tidalQuality {
-		case "LOSSLESS", "HI_RES_LOSSLESS":
-			ext = "flac"
-		case "LOW", "HIGH":
+		case "LOW":
 			ext = "m4a"
 		default:
-			// Fallback to URL detection for unknown qualities
-			if strings.Contains(streamURL, ".flac") {
-				ext = "flac"
+			if strings.Contains(streamURL, ".m4a") {
+				ext = "m4a"
 			} else if strings.Contains(streamURL, ".mp3") {
 				ext = "mp3"
 			}
@@ -195,9 +192,11 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 
 	cleanArtist := "Unknown Artist"
 	cleanTitle := "Unknown Title"
-	ext := prep.Ext
-	if ext == "" {
-		ext = "flac"
+	ext := "flac"
+	if prep.Quality == "LOW" || prep.Quality == "HIGH" || (prep.Track != nil && !prep.Track.IsLossless()) {
+		ext = "m4a"
+	} else if prep.Ext != "" {
+		ext = prep.Ext
 	}
 	if prep.Track != nil {
 		if prep.Track.Artist.Name != "" {
@@ -208,10 +207,15 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
+	contentType := "audio/" + ext
+	if ext == "m4a" {
+		contentType = "audio/mp4"
+	}
+
 	filename := fmt.Sprintf("%s - %s.%s", cleanArtist, cleanTitle, ext)
 	filename = sanitizeFilename(filename)
 
-	w.Header().Set("Content-Type", "audio/"+ext)
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	w.Header().Set("Cache-Control", "no-cache")
 

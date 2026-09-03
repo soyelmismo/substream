@@ -29,14 +29,19 @@ func NewTrackFromTidal(t *tidal.TidalTrack) *spec.TrackChild {
 	}
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", coverIDValue)}
 
-	// Determine quality and suffix first
-	suffix := "m4a"
-	bitrate := 320
-	contentType := "audio/mp4"
-	if t.AudioQuality == "LOSSLESS" || t.AudioQuality == "HI_RES_LOSSLESS" {
-		suffix = "flac"
-		contentType = "audio/flac"
-		bitrate = 1411
+	// Determine quality and suffix - check if track supports lossless or is strictly lossy AAC
+	suffix := "flac"
+	bitrate := 1411
+	contentType := "audio/flac"
+	if !t.IsLossless() {
+		suffix = "m4a"
+		bitrate = 320
+		if t.AudioQuality == "LOW" {
+			bitrate = 96
+		}
+		contentType = "audio/mp4"
+	} else if t.AudioQuality == "HI_RES_LOSSLESS" {
+		bitrate = 2822
 	}
 
 	safeArtist := sanitizeFilename(artistName)

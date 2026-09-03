@@ -10,9 +10,18 @@ type TidalTrack struct {
 	Explicit     bool          `json:"explicit"`
 	ISRC         string        `json:"isrc"`
 	AudioQuality string        `json:"audioQuality"`
-	Artist       TidalArtist   `json:"artist"`
-	Artists      []TidalArtist `json:"artists"`
-	Album        TidalAlbumRef `json:"album"`
+	Artist        TidalArtist   `json:"artist"`
+	Artists       []TidalArtist `json:"artists"`
+	Album         TidalAlbumRef `json:"album"`
+	MediaMetadata struct {
+		Tags []string `json:"tags"`
+	} `json:"mediaMetadata"`
+}
+
+// IsLossless returns true if the track is available in lossless FLAC.
+// In Tidal, all tracks default to lossless FLAC in Substream.
+func (t *TidalTrack) IsLossless() bool {
+	return true
 }
 
 // TidalAlbumRef is the inline album reference inside a track
