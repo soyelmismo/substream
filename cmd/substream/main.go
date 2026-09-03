@@ -14,6 +14,8 @@ import (
 
 	"github.com/sentriz/gormstore"
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/provider"
+	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrladmin"
 	"go.senan.xyz/gonic/server/ctrlsubsonic"
@@ -166,8 +168,11 @@ func main() {
 	sessDB := gormstore.New(dbc.DB, []byte("substream-secret-change-me"))
 	go sessDB.PeriodicCleanup(1*time.Hour, make(chan struct{}))
 
-	// Controllers
-	ctrlSubsonic := ctrlsubsonic.New(dbc, proxy, scrobblers, *confCachePath)
+	// Multi-Provider Registry
+	providers := provider.NewRegistry()
+	providers.Register(tidal.New(proxy))
+
+	ctrlSubsonic := ctrlsubsonic.New(dbc, proxy, providers, scrobblers, *confCachePath)
 	resolveProxyPath := func(in string) string {
 		if *confProxyPrefix == "" {
 			return in

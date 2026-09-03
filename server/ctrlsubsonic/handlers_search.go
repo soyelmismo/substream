@@ -153,6 +153,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		artistsCh <- artists
 		albumsCh <- albums
 	} else {
+		prov := c.providers.Default()
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -160,11 +161,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					tracksCh <- nil
 				}
 			}()
-			if songCount <= 0 {
+			if songCount <= 0 || prov == nil {
 				tracksCh <- nil
 				return
 			}
-			tData, err := c.proxy.SearchTracks(r.Context(), query, songCount, songOffset)
+			tData, err := prov.SearchTracks(r.Context(), query, songCount, songOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchTracks error: %v", err)
 				tracksCh <- nil
@@ -174,8 +175,10 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				tData = tData[:songCount]
 			}
 			out := make([]spec.TrackChild, len(tData))
-			for i := range tData {
-				out[i] = *spec.NewTrackFromTidal(&tData[i])
+			for i, t := range tData {
+				if t != nil {
+					out[i] = *t
+				}
 			}
 			tracksCh <- out
 		}()
@@ -187,11 +190,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					artistsCh <- nil
 				}
 			}()
-			if artistCount <= 0 {
+			if artistCount <= 0 || prov == nil {
 				artistsCh <- nil
 				return
 			}
-			aData, err := c.proxy.SearchArtists(r.Context(), query, artistCount, artistOffset)
+			aData, err := prov.SearchArtists(r.Context(), query, artistCount, artistOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchArtists error: %v", err)
 				artistsCh <- nil
@@ -201,8 +204,10 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				aData = aData[:artistCount]
 			}
 			out := make([]spec.Artist, len(aData))
-			for i := range aData {
-				out[i] = *spec.NewArtistFromTidal(&aData[i])
+			for i, a := range aData {
+				if a != nil {
+					out[i] = *a
+				}
 			}
 			artistsCh <- out
 		}()
@@ -214,11 +219,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					albumsCh <- nil
 				}
 			}()
-			if albumCount <= 0 {
+			if albumCount <= 0 || prov == nil {
 				albumsCh <- nil
 				return
 			}
-			alData, err := c.proxy.SearchAlbums(r.Context(), query, albumCount, albumOffset)
+			alData, err := prov.SearchAlbums(r.Context(), query, albumCount, albumOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchAlbums error: %v", err)
 				albumsCh <- nil
@@ -228,8 +233,10 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				alData = alData[:albumCount]
 			}
 			out := make([]spec.Album, len(alData))
-			for i := range alData {
-				out[i] = *spec.NewAlbumFromTidal(&alData[i])
+			for i, al := range alData {
+				if al != nil {
+					out[i] = *al
+				}
 			}
 			albumsCh <- out
 		}()

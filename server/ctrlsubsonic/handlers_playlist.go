@@ -83,9 +83,10 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 	var tracks []db.PlaylistTrack
 	c.dbc.Where("playlist_id=?", pl.ID).Order("position ASC").Find(&tracks)
 
+	uris := make([]string, len(tracks))
 	tidalIDs := make([]int, len(tracks))
 	for i, t := range tracks {
-		// Extract numeric ID from URI (td:tr:12345 -> 12345)
+		uris[i] = t.URI
 		tidalIDs[i] = extractIDFromURI(t.URI)
 	}
 
@@ -93,7 +94,7 @@ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
 	var owner db.User
 	c.dbc.Where("id=?", pl.UserID).First(&owner)
 
-	trackList := c.batchFetchTracks(r, tidalIDs)
+	trackList := c.batchFetchTracksByURIs(r, uris)
 
 	// [Hydrate] Trigger background hydration for all tracks in the playlist
 	// This ensures tracks are cached for offline playback and faster subsequent access
@@ -244,12 +245,12 @@ func (c *Controller) buildPlaylistResponse(r *http.Request, pl *db.Playlist, use
 	var tracks []db.PlaylistTrack
 	c.dbc.Where("playlist_id=?", pl.ID).Order("position ASC").Find(&tracks)
 
-	tidalIDs := make([]int, len(tracks))
+	uris := make([]string, len(tracks))
 	for i, t := range tracks {
-		tidalIDs[i] = extractIDFromURI(t.URI)
+		uris[i] = t.URI
 	}
 
-	trackList := c.batchFetchTracks(r, tidalIDs)
+	trackList := c.batchFetchTracksByURIs(r, uris)
 
 	totalDuration := 0
 	for _, tc := range trackList {

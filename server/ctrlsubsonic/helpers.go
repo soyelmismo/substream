@@ -17,6 +17,7 @@ import (
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
@@ -96,14 +97,27 @@ func batchFetch[T any, R any](
 
 // batchFetchTracks fetches metadata for multiple tidal track IDs concurrently
 func (c *Controller) batchFetchTracks(r *http.Request, tidalIDs []int) []*spec.TrackChild {
+	uris := make([]string, len(tidalIDs))
+	for i, id := range tidalIDs {
+		uris[i] = fmt.Sprintf("td:tr:%d", id)
+	}
+	return c.batchFetchTracksByURIs(r, uris)
+}
+
+// batchFetchTracksByURIs fetches metadata for multiple track URIs across all providers concurrently
+func (c *Controller) batchFetchTracksByURIs(r *http.Request, uris []string) []*spec.TrackChild {
 	user := r.Context().Value(CtxUser).(*db.User)
-	return batchFetch(r.Context(), c.proxySem, tidalIDs, c.proxy.GetTrackInfo, func(t *tidalproxy.TidalTrack, tid int) *spec.TrackChild {
-		tc := spec.NewTrackFromTidal(t)
-		c.applyTrackStar(user.ID, tc)
-		c.applyTrackPlayCount(user.ID, tc)
-		tc.UserRating = c.getTrackRating(user.ID, fmt.Sprintf("td:tr:%d", tid))
-		return tc
-	})
+	tracks := c.providers.BatchGetTracksByURI(r.Context(), uris)
+	for _, tc := range tracks {
+		if tc != nil {
+			c.applyTrackStar(user.ID, tc)
+			c.applyTrackPlayCount(user.ID, tc)
+			if tc.ID != nil {
+				tc.UserRating = c.getTrackRating(user.ID, tc.ID.String())
+			}
+		}
+	}
+	return tracks
 }
 
 // batchFetchAlbums fetches metadata for multiple tidal album IDs efficiently
@@ -134,7 +148,7 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 
 // prepareStream centralizes the logic for preparing a stream (quality, IP, URL, meta)
 // shared by ServeStream and ServeDownload
-func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID int) (*streamRequest, error) {
+func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *specid.ID) (*streamRequest, error) {
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	// 1. Quality
@@ -167,6 +181,11 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 	// 2a. Client name (for client-specific handling)
 	clientName := p.GetOr("c", "")
 
+	prov := c.getProvider(id.Provider())
+	if prov == nil {
+		return nil, fmt.Errorf("provider %q not found", id.Provider())
+	}
+
 	// 3 & 4. Fetch Stream URL and Track Info concurrently
 	var url string
 	var track *tidalproxy.TidalTrack
@@ -174,7 +193,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 
 	// [CRITICAL FIX] Include clientIP in cache key - Tidal returns IP-locked URLs!
 	// Without this, different users share invalid URLs causing 403 errors
-	cacheKey := fmt.Sprintf("stream:%d:%s:%s", trackID, quality, clientIP)
+	cacheKey := fmt.Sprintf("stream:%s:%s:%s", id.String(), quality, clientIP)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -200,7 +219,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 			<-lp.done
 			url, urlErr = lp.url, lp.err
 		} else {
-			url, urlErr = c.proxy.GetStreamURL(ctx, trackID, quality, clientIP)
+			url, urlErr = prov.GetStreamURL(ctx, id.RawID(), quality, clientIP)
 			lp.url, lp.err = url, urlErr
 			close(lp.done)
 			if urlErr == nil && url != "" {
@@ -216,7 +235,9 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, trackID
 	// Fetch Track Info
 	go func() {
 		defer wg.Done()
-		track, trackErr = c.proxy.GetTrackInfo(ctx, trackID)
+		if id.Provider() == "td" {
+			track, trackErr = c.proxy.GetTrackInfo(ctx, id.Value())
+		}
 	}()
 
 	wg.Wait()

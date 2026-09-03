@@ -115,40 +115,27 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 		return spec.NewError(10, "please provide an artist `id` parameter")
 	}
 
-	var info *tidalproxy.TidalArtistDetail
-	var artistPage *tidalproxy.TidalArtistPage
-	var errInfo, errPage error
+	prov := c.getProvider(id.Provider())
+	if prov == nil {
+		return spec.NewError(0, "provider not found for ID: %s", id.String())
+	}
 
-	artistID := id.Value()
-	done := make(chan struct{}, 2)
-	go func() {
-		info, errInfo = c.proxy.GetArtistInfo(r.Context(), artistID)
-		done <- struct{}{}
-	}()
-	go func() {
-		artistPage, errPage = c.proxy.GetArtistAlbums(r.Context(), artistID, true)
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-
+	artist, errInfo := prov.GetArtist(r.Context(), id.RawID())
 	if errInfo != nil {
 		return spec.NewError(0, "error fetching artist: %v", errInfo)
 	}
+
+	albums, _, errPage := prov.GetArtistAlbums(r.Context(), id.RawID(), true)
 	if errPage != nil {
 		return spec.NewError(0, "error fetching artist albums: %v", errPage)
 	}
 
-	artist := spec.NewArtistFromTidal(&info.Artist)
 	c.applyArtistStar(user.ID, artist)
 
-	items := artistPage.Albums.Items
-	artist.AlbumCount = len(items)
-	artist.Albums = make([]*spec.Album, len(items))
-	for i := range items {
-		artist.Albums[i] = spec.NewAlbumFromTidal(&items[i])
-		c.applyAlbumStar(user.ID, artist.Albums[i])
+	artist.AlbumCount = len(albums)
+	artist.Albums = albums
+	for _, a := range artist.Albums {
+		c.applyAlbumStar(user.ID, a)
 	}
 
 	sub := spec.NewResponse()
@@ -165,36 +152,20 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 		return spec.NewError(10, "please provide an album `id` parameter")
 	}
 
-	album, err := c.proxy.GetAlbumInfo(r.Context(), id.Value())
-	if err != nil {
-		return spec.NewError(0, "error fetching album: %v", err)
+	prov := c.getProvider(id.Provider())
+	if prov == nil {
+		return spec.NewError(0, "provider not found for ID: %s", id.String())
 	}
 
-	a := spec.NewAlbumFromTidal(album)
-	a.TrackCount = len(album.Items)
-	a.Tracks = make([]*spec.TrackChild, len(album.Items))
-
-	totalDuration := 0
-	for i := range album.Items {
-		tc := spec.NewTrackFromTidal(&album.Items[i])
-		// fill in album context that track might be missing
-		if tc.Album == "" {
-			tc.Album = album.Title
-		}
-		if tc.AlbumID == nil {
-			tc.AlbumID = a.ID
-		}
-		a.Tracks[i] = tc
-		totalDuration += tc.Duration
+	a, err := prov.GetAlbum(r.Context(), id.RawID())
+	if err != nil {
+		return spec.NewError(0, "error fetching album: %v", err)
 	}
 
 	// Batch apply user metadata (stars, ratings, play counts) in 3 queries instead of 3*N
 	c.applyTrackStarsBatch(user.ID, a.Tracks)
 	c.applyTrackRatingsBatch(user.ID, a.Tracks)
 	c.applyTrackPlayCountsBatch(user.ID, a.Tracks)
-	if a.Duration == 0 {
-		a.Duration = totalDuration
-	}
 
 	c.applyAlbumStar(user.ID, a)
 	albumURI := id.String()
@@ -512,12 +483,16 @@ func (c *Controller) ServeGetSong(r *http.Request) *spec.Response {
 		return spec.NewError(10, "please provide a track `id` parameter")
 	}
 
-	track, err := c.proxy.GetTrackInfo(r.Context(), id.Value())
+	prov := c.getProvider(id.Provider())
+	if prov == nil {
+		return spec.NewError(0, "provider not found for ID: %s", id.String())
+	}
+
+	tc, err := prov.GetTrack(r.Context(), id.RawID())
 	if err != nil {
 		return spec.NewError(0, "error fetching track: %v", err)
 	}
 
-	tc := spec.NewTrackFromTidal(track)
 	c.applyTrackStar(user.ID, tc)
 	uri := id.String()
 	tc.UserRating = c.getTrackRating(user.ID, uri)
@@ -718,24 +693,33 @@ func (c *Controller) ServeGetArtistInfoTwo(r *http.Request) *spec.Response {
 		return spec.NewError(10, "please provide an artist `id` parameter")
 	}
 
-	info, err := c.proxy.GetArtistInfo(r.Context(), id.Value())
+	prov := c.getProvider(id.Provider())
+	if prov == nil {
+		return spec.NewError(0, "provider not found for ID: %s", id.String())
+	}
+
+	artist, err := prov.GetArtist(r.Context(), id.RawID())
 	if err != nil {
 		return spec.NewError(0, "error fetching artist info")
 	}
 
-	similar, _ := c.proxy.GetSimilarArtists(r.Context(), id.Value())
+	similar, _ := prov.GetSimilarArtists(r.Context(), id.RawID())
+
+	coverRaw := ""
+	if artist.CoverID != nil {
+		coverRaw = artist.CoverID.RawID()
+	}
 
 	artistInfo := &spec.ArtistInfo{
 		Biography:      "",
-		SmallImageURL:  c.proxy.GetCoverURL(info.Artist.Picture, 320),
-		MediumImageURL: c.proxy.GetCoverURL(info.Artist.Picture, 640),
-		LargeImageURL:  c.proxy.GetCoverURL(info.Artist.Picture, 1280),
-		ArtistImageURL: c.proxy.GetCoverURL(info.Artist.Picture, 1280),
+		SmallImageURL:  prov.GetCoverURL(coverRaw, 320),
+		MediumImageURL: prov.GetCoverURL(coverRaw, 640),
+		LargeImageURL:  prov.GetCoverURL(coverRaw, 1280),
+		ArtistImageURL: prov.GetCoverURL(coverRaw, 1280),
 	}
 
 	user := r.Context().Value(CtxUser).(*db.User)
-	for _, a := range similar {
-		sa := spec.NewArtistFromTidal(&a)
+	for _, sa := range similar {
 		c.applyArtistStar(user.ID, sa)
 		artistInfo.Similar = append(artistInfo.Similar, sa)
 	}

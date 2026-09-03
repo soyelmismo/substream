@@ -24,6 +24,8 @@ import (
 	"go.senan.xyz/gonic/internal/importer"
 	lfmclient "go.senan.xyz/gonic/lastfm"
 	lastfmprovider "go.senan.xyz/gonic/providers/lastfm"
+	"go.senan.xyz/gonic/provider"
+	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/recommendations"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
@@ -46,6 +48,7 @@ type Controller struct {
 
 	dbc              *db.DB
 	proxy            tidalproxy.TidalProxy
+	providers        *provider.Registry
 	scrobblers       []scrobble.Scrobbler
 	cachePath        string
 	searchCache      *cache.Cache[cachedSearch]
@@ -82,14 +85,20 @@ type userPreferences struct {
 	LoadedAt time.Time            // for TTL checking
 }
 
-func New(dbc *db.DB, proxy tidalproxy.TidalProxy, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
+func New(dbc *db.DB, proxy tidalproxy.TidalProxy, providers *provider.Registry, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
 	// Load configuration from environment variables
 	initConfig()
+
+	if providers == nil && proxy != nil {
+		providers = provider.NewRegistry()
+		providers.Register(tidal.New(proxy))
+	}
 
 	c := &Controller{
 		ServeMux:      http.NewServeMux(),
 		dbc:           dbc,
 		proxy:         proxy,
+		providers:     providers,
 		scrobblers:    scrobblers,
 		cachePath:     cachePath,
 		proxySem:      make(chan struct{}, 30),  // limit total concurrent proxy calls
@@ -702,4 +711,17 @@ func (c *Controller) withWarmUserPrefs() handlerutil.Middleware {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// getProvider resolves a provider by its ID/prefix, falling back to default provider
+func (c *Controller) getProvider(id string) provider.MusicProvider {
+	if c.providers != nil {
+		if p, err := c.providers.Get(id); err == nil && p != nil {
+			return p
+		}
+		if def := c.providers.Default(); def != nil {
+			return def
+		}
+	}
+	return nil
 }

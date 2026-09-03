@@ -180,7 +180,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		}
 	}()
 
-	prep, err := c.prepareStream(r.Context(), r, id.Value())
+	prep, err := c.prepareStream(r.Context(), r, &id)
 	if err != nil {
 		streamErr = err
 		log.Printf("[STREAM] ERROR: prepare failed: %v", err)
@@ -330,7 +330,7 @@ func (c *Controller) ServeHLS(w http.ResponseWriter, r *http.Request) *spec.Resp
 
 	// Get stream info using existing prepareStream logic
 	ctx := r.Context()
-	prep, err := c.prepareStream(ctx, r, id.Value())
+	prep, err := c.prepareStream(ctx, r, &id)
 	if err != nil {
 		log.Printf("[HLS] Failed to prepare stream for track %d: %v", id.Value(), err)
 		return spec.NewError(0, "failed to get stream: %v", err)

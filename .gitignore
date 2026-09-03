@@ -25,3 +25,4 @@ substream_linux
 config
 genre-tree
 substream_linux.*
+substream.*

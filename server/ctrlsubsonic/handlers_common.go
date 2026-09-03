@@ -179,8 +179,7 @@ func (c *Controller) ServeGetPlayQueue(r *http.Request) *spec.Response {
 
 	// parse items JSON (now URIs) and batch-fetch metadata
 	itemURIs := parseURIList(queue.Items)
-	tidalIDs := extractIDsFromURIs(itemURIs)
-	sub.PlayQueue.List = c.batchFetchTracks(r, tidalIDs)
+	sub.PlayQueue.List = c.batchFetchTracksByURIs(r, itemURIs)
 
 	return sub
 }

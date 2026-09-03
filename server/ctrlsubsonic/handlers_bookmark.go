@@ -16,20 +16,19 @@ func (c *Controller) ServeGetBookmarks(r *http.Request) *spec.Response {
 	var bookmarks []db.Bookmark
 	c.dbc.Where("user_id=?", user.ID).Order("updated_at DESC").Find(&bookmarks)
 
-	// Extract IDs from URIs for fetching track metadata
-	tidalIDs := make([]int, len(bookmarks))
+	// Extract URIs for fetching track metadata
+	uris := make([]string, len(bookmarks))
 	for i, bm := range bookmarks {
-		tidalIDs[i] = extractIDFromURI(bm.URI)
+		uris[i] = bm.URI
 	}
-	tracks := c.batchFetchTracks(r, tidalIDs)
+	tracks := c.batchFetchTracksByURIs(r, uris)
 
 	results := make([]*spec.Bookmark, 0, len(bookmarks))
 	for _, b := range bookmarks {
 		// Find matching track child
 		var track *spec.TrackChild
-		tid := extractIDFromURI(b.URI)
 		for _, t := range tracks {
-			if t != nil && t.ID != nil && t.ID.Value() == tid {
+			if t != nil && t.ID != nil && t.ID.String() == b.URI {
 				track = t
 				break
 			}

@@ -158,7 +158,8 @@ func (c *Controller) servePlaylistDownload(_ http.ResponseWriter, _ *http.Reques
 }
 
 func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, trackID int, _ *db.User) *spec.Response {
-	prep, err := c.prepareStream(r.Context(), r, trackID)
+	id := &specid.ID{URI: fmt.Sprintf("td:tr:%d", trackID)}
+	prep, err := c.prepareStream(r.Context(), r, id)
 	if err != nil {
 		return spec.NewError(0, "error preparing download: %v", err)
 	}
