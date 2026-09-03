@@ -3,6 +3,7 @@ package spotify
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
@@ -248,7 +249,30 @@ func (p *Provider) GetStreamURL(ctx context.Context, rawID string, quality strin
 		if err == nil && streamURL != "" {
 			return streamURL, nil
 		}
-		return "", fmt.Errorf("failed to resolve stream for ISRC %s: %w", isrc, err)
+
+		// Fallback to YouTube Music matching by Title + Artist
+		if ytProv, err := p.registry.Get("yt"); err == nil && ytProv != nil {
+			artistName := ""
+			if len(track.Artists) > 0 {
+				artistName = track.Artists[0].Name
+			}
+			durationSec := track.DurationMs / 1000
+
+			if matcher, ok := ytProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				matchedTrack, err := matcher.MatchTrackByMetadata(ctx, artistName, track.Name, durationSec)
+				if err == nil && matchedTrack != nil && matchedTrack.ID != nil {
+					streamURL, err := ytProv.GetStreamURL(ctx, matchedTrack.ID.RawID(), quality, clientIP)
+					if err == nil && streamURL != "" {
+						log.Printf("[SPOTIFY] ✅ Resolved fallback stream for %q by %q via YouTube Music (%s)", track.Name, artistName, matchedTrack.ID.RawID())
+						return streamURL, nil
+					}
+				}
+			}
+		}
+
+		return "", fmt.Errorf("failed to resolve stream for ISRC %s across providers and YouTube Music: %w", isrc, err)
 	}
 	return "", fmt.Errorf("no provider registry available")
 }

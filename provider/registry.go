@@ -242,7 +242,7 @@ func (r *Registry) ResolveStreamByISRC(ctx context.Context, isrc string, quality
 
 	r.mu.RLock()
 	providers := make([]MusicProvider, 0, len(r.providers))
-	priorityOrder := []string{"qb", "dz", "am", "td"}
+	priorityOrder := []string{"qb", "dz", "am", "td", "yt"}
 	for _, id := range priorityOrder {
 		if p, ok := r.providers[id]; ok && id != excludeProviderID {
 			providers = append(providers, p)

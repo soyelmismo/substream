@@ -20,6 +20,7 @@ import (
 	"go.senan.xyz/gonic/provider/qobuz"
 	"go.senan.xyz/gonic/provider/spotify"
 	"go.senan.xyz/gonic/provider/tidal"
+	"go.senan.xyz/gonic/provider/ytmusic"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrladmin"
 	"go.senan.xyz/gonic/server/ctrlsubsonic"
@@ -155,7 +156,12 @@ func main() {
 	providers.Register(amazonProvider)
 	log.Printf("[PROVIDER] Registered Amazon Music provider (am) -> URL: %s", *confAmazonURL)
 
-	// 5. Spotify Provider (Universal Metadata & ISRC Resolution via Anonymous TOTP)
+	// 5. YouTube Music Provider (Universal Fallback & Opus 160kbps streaming)
+	ytProvider := ytmusic.New()
+	providers.Register(ytProvider)
+	log.Printf("[PROVIDER] Registered YouTube Music provider (yt)")
+
+	// 6. Spotify Provider (Universal Metadata & ISRC Resolution via Anonymous TOTP)
 	spotifyProvider := spotify.New(providers)
 	providers.Register(spotifyProvider)
 	log.Printf("[PROVIDER] Registered Spotify provider (sp)")

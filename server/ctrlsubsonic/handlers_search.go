@@ -154,6 +154,15 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 		albumsCh <- albums
 	} else {
 		prov := c.providers.Default()
+		searchQuery := query
+		if colonIdx := strings.Index(query, ":"); colonIdx > 0 && colonIdx <= 4 {
+			prefix := strings.ToLower(query[:colonIdx])
+			if p, err := c.providers.Get(prefix); err == nil && p != nil {
+				prov = p
+				searchQuery = strings.TrimSpace(query[colonIdx+1:])
+			}
+		}
+
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -165,7 +174,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				tracksCh <- nil
 				return
 			}
-			tData, err := prov.SearchTracks(r.Context(), query, songCount, songOffset)
+			tData, err := prov.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchTracks error: %v", err)
 				tracksCh <- nil
@@ -194,7 +203,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				artistsCh <- nil
 				return
 			}
-			aData, err := prov.SearchArtists(r.Context(), query, artistCount, artistOffset)
+			aData, err := prov.SearchArtists(r.Context(), searchQuery, artistCount, artistOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchArtists error: %v", err)
 				artistsCh <- nil
@@ -223,7 +232,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				albumsCh <- nil
 				return
 			}
-			alData, err := prov.SearchAlbums(r.Context(), query, albumCount, albumOffset)
+			alData, err := prov.SearchAlbums(r.Context(), searchQuery, albumCount, albumOffset)
 			if err != nil {
 				log.Printf("[SUBS] SearchAlbums error: %v", err)
 				albumsCh <- nil
