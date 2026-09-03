@@ -728,5 +728,6 @@ func (db *DB) Migrate() error {
 		&TidalAccount{},
 		&TrackMetadata{},
 		&MetadataCache{},
+		&TrackSource{},
 	).Error
 }

@@ -13,26 +13,27 @@ func MatchScore(queryArtist, queryTitle string, track tidalproxy.TidalTrack) flo
 	return MatchScoreWithAlbum(queryArtist, queryTitle, "", track)
 }
 
+// Normalize cleans up artist, title, or album strings for matching
+func Normalize(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, " (feat.", " ")
+	s = strings.ReplaceAll(s, " (ft.", " ")
+	s = strings.ReplaceAll(s, " (featuring", " ")
+	s = strings.ReplaceAll(s, " - ", " ")
+	s = strings.ReplaceAll(s, "  ", " ")
+	return strings.TrimSpace(s)
+}
+
 // MatchScoreWithAlbum includes album name in matching for better precision
 func MatchScoreWithAlbum(queryArtist, queryTitle, queryAlbum string, track tidalproxy.TidalTrack) float64 {
-	normalize := func(s string) string {
-		s = strings.ToLower(s)
-		s = strings.ReplaceAll(s, " (feat.", " ")
-		s = strings.ReplaceAll(s, " (ft.", " ")
-		s = strings.ReplaceAll(s, " (featuring", " ")
-		s = strings.ReplaceAll(s, " - ", " ")
-		s = strings.ReplaceAll(s, "  ", " ")
-		return strings.TrimSpace(s)
-	}
-
-	qArtist := normalize(queryArtist)
-	qTitle := normalize(queryTitle)
-	tArtist := normalize(track.Artist.Name)
-	tTitle := normalize(track.Title)
+	qArtist := Normalize(queryArtist)
+	qTitle := Normalize(queryTitle)
+	tArtist := Normalize(track.Artist.Name)
+	tTitle := Normalize(track.Title)
 
 	artistMatch := Similarity(qArtist, tArtist)
 	for _, a := range track.Artists {
-		if s := Similarity(qArtist, normalize(a.Name)); s > artistMatch {
+		if s := Similarity(qArtist, Normalize(a.Name)); s > artistMatch {
 			artistMatch = s
 		}
 	}
@@ -41,7 +42,7 @@ func MatchScoreWithAlbum(queryArtist, queryTitle, queryAlbum string, track tidal
 
 	albumMatch := 0.0
 	if queryAlbum != "" {
-		albumMatch = Similarity(normalize(queryAlbum), normalize(track.Album.Title))
+		albumMatch = Similarity(Normalize(queryAlbum), Normalize(track.Album.Title))
 		if albumMatch > 0.8 {
 			titleMatch = maxFloat(titleMatch, 0.9)
 		}

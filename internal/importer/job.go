@@ -213,22 +213,63 @@ func (jm *JobManager) runJob(ctx context.Context, cancel context.CancelFunc, pla
 // findTrack searches for a track across all registered providers with intelligent fallback.
 // Priority: Direct ID -> Lossless ISRC (Tidal/Deezer/Qobuz) -> Tidal Fuzzy Search -> YouTube Music Fallback
 func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string {
+	clusterKey := db.MakeClusterKey(track.ISRC, track.Artist, track.Title)
+
 	// Priority 1: Use TidalID directly if available (from Tidal playlist import)
 	if track.TidalID > 0 {
 		if jm.proxy != nil {
 			if _, err := jm.proxy.GetTrackInfo(ctx, track.TidalID); err == nil {
+				tdURI := fmt.Sprintf("td:tr:%d", track.TidalID)
 				log.Printf("[IMPORT] Direct Tidal ID match: %d (%s - %s)", track.TidalID, track.Artist, track.Title)
-				return fmt.Sprintf("td:tr:%d", track.TidalID)
+				if jm.db != nil {
+					_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+						ClusterKey:  clusterKey,
+						Provider:    "td",
+						URI:         tdURI,
+						QualityTier: db.QualityTierLossless,
+						IsAvailable: true,
+					})
+				}
+				return tdURI
 			}
 		}
 	}
 
-	// Priority 2: Direct SourceURI / VideoID if already populated (e.g. from YouTube Music playlist)
-	if track.SourceURI != "" {
-		return track.SourceURI
+	// Priority 2: Track has direct VideoID or SourceURI (e.g. from YouTube Music playlist)
+	ytURI := ""
+	if track.SourceURI != "" && strings.HasPrefix(track.SourceURI, "yt:tr:") {
+		ytURI = track.SourceURI
+	} else if track.VideoID != "" {
+		ytURI = fmt.Sprintf("yt:tr:%s", track.VideoID)
 	}
-	if track.VideoID != "" {
-		return fmt.Sprintf("yt:tr:%s", track.VideoID)
+
+	// If it has a YouTube source, attempt Lossless Upgrade to Tidal if Tidal metadata is enabled
+	if ytURI != "" {
+		if jm.proxy != nil && (jm.providers == nil || jm.providers.IsMetadataEnabled("td")) {
+			if tidalID := jm.searchByText(ctx, track.Artist, track.Title, track.Album); tidalID > 0 {
+				tdURI := fmt.Sprintf("td:tr:%d", tidalID)
+				log.Printf("[IMPORT] 🚀 Lossless Upgrade: YouTube track %q by %q matched to Tidal FLAC %s (linked with %s)",
+					track.Title, track.Artist, tdURI, ytURI)
+				if jm.db != nil {
+					_ = db.SaveTrackSources(jm.db.DB, clusterKey,
+						db.TrackSource{ClusterKey: clusterKey, Provider: "td", URI: tdURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: "yt", URI: ytURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+					)
+				}
+				return tdURI
+			}
+		}
+		// If Tidal didn't match, record YouTube source in track_sources and return it
+		if jm.db != nil {
+			_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+				ClusterKey:  clusterKey,
+				Provider:    "yt",
+				URI:         ytURI,
+				QualityTier: db.QualityTierStandard,
+				IsAvailable: true,
+			})
+		}
+		return ytURI
 	}
 
 	// Priority 3: Try ISRC across lossless providers (Tidal, Deezer, Qobuz)
@@ -245,8 +286,18 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 				}
 				if isrcRes, ok := prov.(provider.ISRCResolver); ok {
 					if matchedTrack, err := isrcRes.GetTrackByISRC(ctx, track.ISRC); err == nil && matchedTrack != nil {
+						targetURI := fmt.Sprintf("%s:tr:%s", pID, matchedTrack.ID.RawID())
 						log.Printf("[IMPORT] ✅ ISRC match on %s (%s): %s - %s", pID, track.ISRC, track.Artist, track.Title)
-						return fmt.Sprintf("%s:tr:%s", pID, matchedTrack.ID.RawID())
+						if jm.db != nil {
+							_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+								ClusterKey:  clusterKey,
+								Provider:    pID,
+								URI:         targetURI,
+								QualityTier: db.QualityTierLossless,
+								IsAvailable: true,
+							})
+						}
+						return targetURI
 					}
 				}
 			}
@@ -254,8 +305,18 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 		// Fallback ISRC directly on Tidal proxy
 		if jm.proxy != nil {
 			if tidalTrack := jm.searchByISRC(ctx, track.ISRC); tidalTrack != nil {
+				tdURI := fmt.Sprintf("td:tr:%d", tidalTrack.ID)
 				log.Printf("[IMPORT] ✅ ISRC match on Tidal proxy (%s): %s - %s", track.ISRC, track.Artist, track.Title)
-				return fmt.Sprintf("td:tr:%d", tidalTrack.ID)
+				if jm.db != nil {
+					_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+						ClusterKey:  clusterKey,
+						Provider:    "td",
+						URI:         tdURI,
+						QualityTier: db.QualityTierLossless,
+						IsAvailable: true,
+					})
+				}
+				return tdURI
 			}
 		}
 	}
@@ -263,8 +324,18 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 	// Priority 4: Fuzzy text search on Tidal (High fidelity primary)
 	if jm.proxy != nil && (jm.providers == nil || jm.providers.IsMetadataEnabled("td")) {
 		if tidalID := jm.searchByText(ctx, track.Artist, track.Title, track.Album); tidalID > 0 {
+			tdURI := fmt.Sprintf("td:tr:%d", tidalID)
 			log.Printf("[IMPORT] ✅ Text match on Tidal: %s - %s -> td:tr:%d", track.Artist, track.Title, tidalID)
-			return fmt.Sprintf("td:tr:%d", tidalID)
+			if jm.db != nil {
+				_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+					ClusterKey:  clusterKey,
+					Provider:    "td",
+					URI:         tdURI,
+					QualityTier: db.QualityTierLossless,
+					IsAvailable: true,
+				})
+			}
+			return tdURI
 		}
 	}
 
@@ -275,9 +346,19 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
 			}); ok {
 				if ytTrack, err := matcher.MatchTrackByMetadata(ctx, track.Artist, track.Title, track.Duration); err == nil && ytTrack != nil {
-					log.Printf("[IMPORT] ✅ Cross-provider fallback to YouTube Music for %q by %q: yt:tr:%s",
-						track.Title, track.Artist, ytTrack.ID.RawID())
-					return fmt.Sprintf("yt:tr:%s", ytTrack.ID.RawID())
+					ytFallbackURI := fmt.Sprintf("yt:tr:%s", ytTrack.ID.RawID())
+					log.Printf("[IMPORT] ✅ Cross-provider fallback to YouTube Music for %q by %q: %s",
+						track.Title, track.Artist, ytFallbackURI)
+					if jm.db != nil {
+						_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+							ClusterKey:  clusterKey,
+							Provider:    "yt",
+							URI:         ytFallbackURI,
+							QualityTier: db.QualityTierStandard,
+							IsAvailable: true,
+						})
+					}
+					return ytFallbackURI
 				}
 			}
 		}

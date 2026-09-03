@@ -181,6 +181,19 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	// 2a. Client name (for client-specific handling)
 	clientName := p.GetOr("c", "")
 
+	// 2b. Quality Upgrade / Provider Availability Check via track_sources
+	if c.dbc != nil && c.providers != nil {
+		if bestSource, _ := db.GetBestStreamableSource(c.dbc.DB, id.String(), c.providers.IsAudioEnabled); bestSource != nil && bestSource.URI != id.String() {
+			if altID, err := specid.New(bestSource.URI); err == nil {
+				if altProv := c.getProvider(altID.Provider()); altProv != nil {
+					log.Printf("[STREAM] ⚡ Auto-upgrade/redirect: %s -> %s (Quality Tier: %d)",
+						id.String(), bestSource.URI, bestSource.QualityTier)
+					id = &altID
+				}
+			}
+		}
+	}
+
 	prov := c.getProvider(id.Provider())
 	if prov == nil {
 		return nil, fmt.Errorf("provider %q not found", id.Provider())
@@ -300,12 +313,38 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 
 	wg.Wait()
 
-	// Cross-Provider ISRC Fallback:
-	// If primary provider stream failed or returned a preview sample for a longer track,
-	// attempt resolution across other registered providers by ISRC
+	// Cross-Provider Fallback:
+	// If primary provider stream failed or returned a preview sample for a longer track:
 	isSamplePreview := strings.Contains(url, "range=20-30") || strings.Contains(url, "range=0-30") || strings.Contains(url, "preview")
 	needsFallback := urlErr != nil || url == "" || (isSamplePreview && track != nil && track.Duration > 45)
 
+	// 1. Rescuing via mapped track_sources in local DB (0 ms fast path)
+	if needsFallback && c.dbc != nil {
+		if altSources, err := db.GetAlternativeSources(c.dbc.DB, id.String()); err == nil {
+			for _, alt := range altSources {
+				if alt.URI == id.String() || (c.providers != nil && !c.providers.IsAudioEnabled(alt.Provider)) {
+					continue
+				}
+				if altID, err := specid.New(alt.URI); err == nil {
+					if altProv := c.getProvider(altID.Provider()); altProv != nil {
+						log.Printf("[STREAM] 🔄 Rescuing stream via mapped track_source %s (Quality: %d)", alt.URI, alt.QualityTier)
+						if altURL, altErr := altProv.GetStreamURL(ctx, altID.RawID(), quality, clientIP); altErr == nil && altURL != "" {
+							altIsPreview := strings.Contains(altURL, "range=20-30") || strings.Contains(altURL, "range=0-30") || strings.Contains(altURL, "preview")
+							if !altIsPreview {
+								url = altURL
+								urlErr = nil
+								isSamplePreview = false
+								needsFallback = false
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Cross-Provider ISRC Fallback across registered providers
 	if needsFallback && track != nil && track.ISRC != "" && c.providers != nil {
 		log.Printf("[STREAM] Triggering cross-provider ISRC fallback for %s (ISRC: %s)", id.String(), track.ISRC)
 		if fallbackURL, fallbackProv, err := c.providers.ResolveStreamByISRC(ctx, track.ISRC, quality, clientIP, id.Provider()); err == nil && fallbackURL != "" {
@@ -315,13 +354,24 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 				url = fallbackURL
 				urlErr = nil
 				isSamplePreview = false
+				needsFallback = false
+
+				// Memorize cross-provider link in track_sources
+				if c.dbc != nil && track != nil {
+					clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+					fbURI := fmt.Sprintf("%s:tr:%s", fallbackProv.ID(), track.ISRC)
+					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+						db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: fallbackProv.ID(), URI: fbURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+					)
+				}
 			}
 		} else {
 			log.Printf("[STREAM] Cross-provider ISRC fallback failed for %s (ISRC: %s): %v", id.String(), track.ISRC, err)
 		}
 	}
 
-	// Universal Fallback to YouTube Music if stream still failed or missing
+	// 3. Universal Fallback to YouTube Music if stream still failed or missing
 	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("yt") && track != nil {
 		if ytProv, err := c.providers.Get("yt"); err == nil && ytProv != nil {
 			if matcher, ok := ytProv.(interface {
@@ -333,6 +383,16 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 						url = ytURL
 						urlErr = nil
 						isSamplePreview = false
+
+						// Memorize cross-provider link in track_sources
+						if c.dbc != nil && track != nil {
+							clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+							ytURI := fmt.Sprintf("yt:tr:%s", matched.ID.RawID())
+							_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+								db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+								db.TrackSource{ClusterKey: clusterKey, Provider: "yt", URI: ytURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+							)
+						}
 					}
 				}
 			}
