@@ -467,6 +467,18 @@ func scrobbleTrackFromTidal(t *tidal.TidalTrack) scrobble.Track {
 	}
 }
 
+// scrobbleTrackFromSubsonic converts a generic provider TrackChild to a scrobble.Track
+func scrobbleTrackFromSubsonic(t *spec.TrackChild) scrobble.Track {
+	return scrobble.Track{
+		Track:       t.Title,
+		Artist:      t.Artist,
+		Album:       t.Album,
+		AlbumArtist: t.Artist,
+		TrackNumber: uint(t.TrackNumber),
+		Duration:    time.Duration(t.Duration) * time.Second,
+	}
+}
+
 // parseURIList parses a JSON array string of URIs
 func parseURIList(jsonStr string) []string {
 	var uris []string

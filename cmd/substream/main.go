@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/sentriz/gormstore"
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/lastfm"
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/provider/amazon"
 	"go.senan.xyz/gonic/provider/deezer"
@@ -169,8 +171,16 @@ func main() {
 	// Load persistent provider toggle settings (metadata & audio)
 	providers.LoadDBSettings(dbc.GetSetting)
 
-	// Scrobblers (Keep empty for Phase 1 MVP, can add ListenBrainz here)
-	var scrobblers []scrobble.Scrobbler
+	// Scrobblers (Per-user Last.fm scrobbling)
+	lastfmClient := lastfm.NewClient("Substream/1.0", func() (string, string, error) {
+		k := dbc.GetSetting("lastfm_api_key", "")
+		s := dbc.GetSetting("lastfm_api_secret", "")
+		if k == "" || s == "" {
+			return "", "", errors.New("last.fm api key/secret not set")
+		}
+		return k, s, nil
+	})
+	scrobblers := []scrobble.Scrobbler{lastfmClient}
 
 	// Sessions
 	sessDB := gormstore.New(dbc.DB, []byte("substream-secret-change-me"))

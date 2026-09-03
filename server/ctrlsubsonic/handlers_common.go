@@ -7,10 +7,11 @@ import (
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/provider/tidal"
+	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/provider/tidal"
 )
 
 func (c *Controller) ServePing(_ *http.Request) *spec.Response {
@@ -164,11 +165,24 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 		}
 	}
 
-	// fetch track info for scrobbling (fire and forget if fails)
+	// fetch track info for scrobbling across all providers (fire and forget if fails)
+	var sTrack *scrobble.Track
 	if track != nil {
+		st := scrobbleTrackFromTidal(track)
+		sTrack = &st
+	} else if c.providers != nil {
+		if prov, err := c.providers.Get(id.Provider()); err == nil && prov != nil {
+			if t, err := prov.GetTrack(r.Context(), id.RawID()); err == nil && t != nil {
+				st := scrobbleTrackFromSubsonic(t)
+				sTrack = &st
+			}
+		}
+	}
+
+	if sTrack != nil {
 		for _, s := range c.scrobblers {
 			if s.IsUserAuthenticated(*user) {
-				_ = s.Scrobble(*user, scrobbleTrackFromTidal(track), time.Now(), isSubmission)
+				_ = s.Scrobble(*user, *sTrack, time.Now(), isSubmission)
 			}
 		}
 	}
