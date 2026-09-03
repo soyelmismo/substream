@@ -52,3 +52,8 @@ type SeedProvider interface {
 	DefaultSeeds() []string
 	DefaultTrackers() []string
 }
+
+// ISRCResolver is an optional interface implemented by providers that support resolving tracks by ISRC
+type ISRCResolver interface {
+	GetTrackByISRC(ctx context.Context, isrc string) (*spec.TrackChild, error)
+}

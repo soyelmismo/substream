@@ -15,6 +15,9 @@ import (
 	"github.com/sentriz/gormstore"
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/provider"
+	"go.senan.xyz/gonic/provider/amazon"
+	"go.senan.xyz/gonic/provider/deezer"
+	"go.senan.xyz/gonic/provider/qobuz"
 	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrladmin"
@@ -77,6 +80,13 @@ func main() {
 	confCertPath := flag.String("cert-path", getEnv("SUBSTREAM_CERT_PATH", ""), "path to SSL certificate")
 	confKeyPath := flag.String("key-path", getEnv("SUBSTREAM_KEY_PATH", ""), "path to SSL key")
 
+	// Provider Configuration Flags
+	confQobuzToken := flag.String("qobuz-token", getEnv("SUBSTREAM_QOBUZ_TOKEN", ""), "optional Qobuz user auth token for full Hi-Res FLAC")
+	confQobuzURL := flag.String("qobuz-url", getEnv("SUBSTREAM_QOBUZ_URL", ""), "optional custom Qobuz proxy/mirror URL")
+	confDeezerURL := flag.String("deezer-url", getEnv("SUBSTREAM_DEEZER_URL", ""), "optional custom Deezer proxy/mirror URL")
+	confDeezerARL := flag.String("deezer-arl", getEnv("SUBSTREAM_DEEZER_ARL", ""), "optional Deezer ARL cookie")
+	confAmazonURL := flag.String("amazon-url", getEnv("SUBSTREAM_AMAZON_URL", ""), "optional custom Amazon Music proxy/mirror URL")
+
 	flag.Parse()
 
 	// Configure compact colored logging
@@ -115,10 +125,33 @@ func main() {
 	// Multi-Provider Registry
 	providers := provider.NewRegistry()
 
-	// Tidal Provider (self-contained mirror pool, default seeds, and auto-discovery)
+	// 1. Tidal Provider (self-contained mirror pool, default seeds, and auto-discovery)
 	cliURLs := strings.Split(*confProxyURLs, ",")
 	tidalProvider := tidal.Bootstrap(dbc, cliURLs)
 	providers.Register(tidalProvider)
+
+	// 2. Qobuz Provider (Hi-Res Lossless FLAC)
+	qobuzProvider := qobuz.New(qobuz.ClientOptions{
+		UserAuthToken: *confQobuzToken,
+		CustomURL:     *confQobuzURL,
+	})
+	providers.Register(qobuzProvider)
+	log.Printf("[PROVIDER] Registered Qobuz provider (qb)")
+
+	// 3. Deezer Provider (Lossless FLAC)
+	deezerProvider := deezer.New(deezer.ClientOptions{
+		CustomURL: *confDeezerURL,
+		ARL:       *confDeezerARL,
+	})
+	providers.Register(deezerProvider)
+	log.Printf("[PROVIDER] Registered Deezer provider (dz)")
+
+	// 4. Amazon Music Provider
+	amazonProvider := amazon.New(amazon.ClientOptions{
+		CustomURL: *confAmazonURL,
+	})
+	providers.Register(amazonProvider)
+	log.Printf("[PROVIDER] Registered Amazon Music provider (am)")
 
 	// Scrobblers (Keep empty for Phase 1 MVP, can add ListenBrainz here)
 	var scrobblers []scrobble.Scrobbler

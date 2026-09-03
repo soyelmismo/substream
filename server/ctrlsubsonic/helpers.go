@@ -237,10 +237,47 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		defer wg.Done()
 		if id.Provider() == "td" {
 			track, trackErr = c.proxy.GetTrackInfo(ctx, id.Value())
+		} else {
+			specTrack, err := prov.GetTrack(ctx, id.RawID())
+			if err == nil && specTrack != nil {
+				albumIDVal := 0
+				if specTrack.AlbumID != nil {
+					albumIDVal = specTrack.AlbumID.Value()
+				}
+				artistIDVal := 0
+				if specTrack.ArtistID != nil {
+					artistIDVal = specTrack.ArtistID.Value()
+				}
+				track = &tidalproxy.TidalTrack{
+					ID:       id.Value(),
+					Title:    specTrack.Title,
+					Duration: specTrack.Duration,
+					Album: tidalproxy.TidalAlbumRef{
+						ID:    albumIDVal,
+						Title: specTrack.Album,
+					},
+					Artist: tidalproxy.TidalArtist{
+						ID:   artistIDVal,
+						Name: specTrack.Artist,
+					},
+				}
+			} else {
+				trackErr = err
+			}
 		}
 	}()
 
 	wg.Wait()
+
+	// Cross-Provider ISRC Fallback:
+	// If primary provider stream failed, attempt resolution across other registered providers by ISRC
+	if (urlErr != nil || url == "") && track != nil && track.ISRC != "" && c.providers != nil {
+		if fallbackURL, fallbackProv, err := c.providers.ResolveStreamByISRC(ctx, track.ISRC, quality, clientIP, id.Provider()); err == nil && fallbackURL != "" {
+			log.Printf("[STREAM] ISRC RESOLUTION: Resolved %s (ISRC %s) via %s", id.String(), track.ISRC, fallbackProv.Name())
+			url = fallbackURL
+			urlErr = nil
+		}
+	}
 
 	if urlErr != nil {
 		return nil, urlErr
