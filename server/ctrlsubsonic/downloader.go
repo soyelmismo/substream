@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -128,30 +129,53 @@ func createFakeSidx(segments []segmentInfo, bytesPerSec int64, firstOffset uint3
 // offsetSeconds allows time-based seeking (skip segments until offset)
 // clientName is used to determine if Content-Type fix is needed for clients like supersonic
 func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64, startByte int64, totalBytes int64, clientName string) error {
-	// 1. Fetch the manifest
-	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-	if clientIP != "" {
-		req.Header.Set("X-Forwarded-For", clientIP)
-	}
+	// 1. Fetch or decode the manifest
+	var manifestReader io.Reader
+	if strings.HasPrefix(manifestURL, "data:") {
+		commaIdx := strings.Index(manifestURL, ",")
+		if commaIdx == -1 {
+			return fmt.Errorf("invalid data URL for manifest")
+		}
+		dataPart := manifestURL[commaIdx+1:]
+		if strings.Contains(manifestURL[:commaIdx], ";base64") {
+			decoded, err := base64.StdEncoding.DecodeString(dataPart)
+			if err != nil {
+				return fmt.Errorf("decode base64 manifest: %w", err)
+			}
+			manifestReader = bytes.NewReader(decoded)
+		} else {
+			manifestReader = strings.NewReader(dataPart)
+		}
+	} else {
+		req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+		if clientIP != "" {
+			req.Header.Set("X-Forwarded-For", clientIP)
+		}
 
-	resp, err := c.streamClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+		resp, err := c.streamClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("manifest fetch failed: %d", resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("manifest fetch failed: %d", resp.StatusCode)
+		}
+		manifestBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		manifestReader = bytes.NewReader(manifestBytes)
 	}
 
 	// 2. Parse segments with duration info
 	var segments []segmentInfo
 	var variantURL string
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(manifestReader)
 	// Increase scanner buffer to handle large manifests (default 64KB may be too small)
 	const maxCapacity = 512 * 1024 // 512KB
 	buf := make([]byte, maxCapacity)
@@ -287,47 +311,54 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 		if rw, ok := w.(http.ResponseWriter); ok {
 			// Check for MP4 signature ("ftyp" at offset 4)
 			if len(initData) >= 8 && string(initData[4:8]) == "ftyp" {
-				// [MPV FIX] Use audio/x-m4a which MPV/ffmpeg handles better for seeking
-				rw.Header().Set("Content-Type", "audio/x-m4a")
-				log.Printf("[DOWNLOAD] fMP4 container detected, using Content-Type audio/x-m4a for MPV compatibility")
+				// Standard MIME type for MP4 container audio
+				rw.Header().Set("Content-Type", "audio/mp4")
+				log.Printf("[DOWNLOAD] fMP4 container detected, using Content-Type audio/mp4 for %s", clientName)
 				// Remove any incorrect Content-Disposition from ServeStream
 				if rw.Header().Get("Content-Disposition") != "" && track != nil {
 					cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s", track.Artist.Name, track.Title), "/", "_")
 					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
 				}
 
-				// Inject fake sidx to force ExoPlayer to show seek bar
-				ftypLen := binary.BigEndian.Uint32(initData[0:4])
-				if ftypLen > 0 && ftypLen < uint32(len(initData)) && track != nil && track.Duration > 0 && startByte == 0 {
-					bps := int64(125000)
-					if totalBytes > 0 {
-						bps = totalBytes / int64(track.Duration)
+				// Inject fake sidx ONLY for Android ExoPlayer/Tempus/Symfonium to force seek bar.
+				// NEVER inject for MPV / Supersonic / FFmpeg as it corrupts the MP4 box structure
+				// and causes "could not find corresponding track id 1" decode failure.
+				isExoPlayer := isExoPlayerClient(clientName)
+				if isExoPlayer {
+					ftypLen := binary.BigEndian.Uint32(initData[0:4])
+					if ftypLen > 0 && ftypLen < uint32(len(initData)) && track != nil && track.Duration > 0 && startByte == 0 {
+						bps := int64(125000)
+						if totalBytes > 0 {
+							bps = totalBytes / int64(track.Duration)
+						}
+
+						fixMp4Durations(initData, float64(track.Duration))
+
+						firstOffset := uint32(len(initData)) - ftypLen
+						fakeSidx := createFakeSidx(segments, bps, firstOffset)
+
+						newInitData := make([]byte, 0, len(initData)+len(fakeSidx))
+						newInitData = append(newInitData, initData[:ftypLen]...)
+						newInitData = append(newInitData, fakeSidx...)
+						newInitData = append(newInitData, initData[ftypLen:]...)
+
+						initData = newInitData
+						if totalBytes > 0 {
+							totalBytes += int64(len(fakeSidx))
+						}
+						log.Printf("[DOWNLOAD] Injected simulated sidx index box (%d bytes) to support seeking", len(fakeSidx))
 					}
-
-					fixMp4Durations(initData, float64(track.Duration))
-
-					firstOffset := uint32(len(initData)) - ftypLen
-					fakeSidx := createFakeSidx(segments, bps, firstOffset)
-
-					newInitData := make([]byte, 0, len(initData)+len(fakeSidx))
-					newInitData = append(newInitData, initData[:ftypLen]...)
-					newInitData = append(newInitData, fakeSidx...)
-					newInitData = append(newInitData, initData[ftypLen:]...)
-
-					initData = newInitData
-					if totalBytes > 0 {
-						totalBytes += int64(len(fakeSidx))
-					}
-					log.Printf("[DOWNLOAD] Injected simulated sidx index box (%d bytes) to support seeking", len(fakeSidx))
 				}
-			}
 
-			if totalBytes > 0 {
-				rw.Header().Set("Accept-Ranges", "bytes")
-			}
-			if startByte > 0 && totalBytes > 0 {
-				rw.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startByte, totalBytes-1, totalBytes))
-				rw.WriteHeader(http.StatusPartialContent)
+				if isExoPlayer && totalBytes > 0 {
+					rw.Header().Set("Accept-Ranges", "bytes")
+					if startByte > 0 {
+						rw.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startByte, totalBytes-1, totalBytes))
+						rw.WriteHeader(http.StatusPartialContent)
+					}
+				} else {
+					rw.Header().Set("Accept-Ranges", "none")
+				}
 			}
 		}
 

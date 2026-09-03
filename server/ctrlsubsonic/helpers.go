@@ -303,7 +303,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	}
 
 	// 5. Detection
-	isHLS := strings.Contains(url, ".m3u8") || strings.Contains(url, "manifestType=HLS")
+	isHLS := strings.Contains(url, ".m3u8") || strings.Contains(url, "manifestType=HLS") || strings.HasPrefix(url, "data:")
 	isDASH := strings.Contains(url, ".mpd") || strings.Contains(url, "manifestType=MPEG_DASH")
 	ext := "flac"
 	if strings.Contains(url, ".m4a") || quality == "HIGH" || quality == "LOW" {

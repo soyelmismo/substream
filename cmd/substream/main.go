@@ -82,7 +82,7 @@ func main() {
 	confKeyPath := flag.String("key-path", getEnv("SUBSTREAM_KEY_PATH", ""), "path to SSL key")
 
 	// Provider Configuration Flags
-	confTidalToken := flag.String("tidal-token", getEnv("SUBSTREAM_TIDAL_TOKEN", ""), "optional Tidal subscriber session token for full HiFi FLAC")
+	confTidalToken := flag.String("tidal-token", getEnv("SUBSTREAM_TIDAL_TOKEN", getEnv("SUBSTREAM_TIDAL_TOKENS", "")), "optional Tidal subscriber session token(s), comma-separated for multi-account rotation")
 	confQobuzToken := flag.String("qobuz-token", getEnv("SUBSTREAM_QOBUZ_TOKEN", ""), "optional Qobuz user auth token for full Hi-Res FLAC")
 	confQobuzURL := flag.String("qobuz-url", getEnv("SUBSTREAM_QOBUZ_URL", ""), "optional custom Qobuz proxy/mirror URL")
 	confDeezerURL := flag.String("deezer-url", getEnv("SUBSTREAM_DEEZER_URL", "https://dzr.tabs-vs-spaces.wtf"), "Deezer proxy/mirror URL")

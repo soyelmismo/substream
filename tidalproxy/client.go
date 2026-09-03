@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -30,8 +31,9 @@ type streamCacheEntry struct {
 type PoolConfig struct {
 	HealthInterval time.Duration
 	Timeout        time.Duration
-	Quality        string // default streaming quality
-	UserToken      string // user bearer token for full playback
+	Quality        string   // default streaming quality
+	UserToken      string   // user bearer token or comma-separated tokens
+	UserTokens     []string // multiple user subscriber tokens
 }
 
 type instance struct {
@@ -39,13 +41,15 @@ type instance struct {
 	healthy atomic.Bool
 }
 
-// Pool implements TidalProxy with multi-instance failover
+// Pool implements TidalProxy with multi-instance failover and multi-account token rotation
 type Pool struct {
 	instances []*instance
 	client    *http.Client
 	quality   string
-	userToken string
-	mu        sync.RWMutex
+	userTokens []string
+	tokenIdx   uint64
+	tokenMu    sync.RWMutex
+	mu         sync.RWMutex
 
 	// New mirror manager for intelligent selection
 	mirrorMgr *MirrorManager
@@ -53,6 +57,32 @@ type Pool struct {
 	// Micro-cache for stream URLs (10s TTL) to reduce redundant requests
 	streamCache   map[int]streamCacheEntry
 	streamCacheMu sync.RWMutex
+}
+
+func (p *Pool) getUserToken() string {
+	p.tokenMu.RLock()
+	defer p.tokenMu.RUnlock()
+	if len(p.userTokens) == 0 {
+		return ""
+	}
+	idx := atomic.AddUint64(&p.tokenIdx, 1) - 1
+	return p.userTokens[idx%uint64(len(p.userTokens))]
+}
+
+func (p *Pool) reportTokenAuthFailure(token string) {
+	p.tokenMu.Lock()
+	defer p.tokenMu.Unlock()
+	for i, t := range p.userTokens {
+		if t == token {
+			previewLen := 10
+			if len(t) < previewLen {
+				previewLen = len(t)
+			}
+			log.Printf("[TIDAL] ⚠️ Token %s... expired or invalid (401 Unauthorized), removing from active rotation pool", t[:previewLen])
+			p.userTokens = append(p.userTokens[:i], p.userTokens[i+1:]...)
+			break
+		}
+	}
 }
 
 // NewPool creates a proxy pool from a list of hifi-api base URLs
@@ -67,13 +97,40 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 		cfg.HealthInterval = 30 * time.Second
 	}
 
+	var allTokens []string
+	for _, t := range cfg.UserTokens {
+		if trimmed := strings.TrimSpace(t); trimmed != "" {
+			allTokens = append(allTokens, trimmed)
+		}
+	}
+	if strings.TrimSpace(cfg.UserToken) != "" {
+		for _, t := range strings.Split(cfg.UserToken, ",") {
+			if trimmed := strings.TrimSpace(t); trimmed != "" {
+				exists := false
+				for _, existing := range allTokens {
+					if existing == trimmed {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					allTokens = append(allTokens, trimmed)
+				}
+			}
+		}
+	}
+
 	p := &Pool{
 		client: &http.Client{
 			Timeout: cfg.Timeout,
 		},
 		quality:     cfg.Quality,
-		userToken:   strings.TrimSpace(cfg.UserToken),
+		userTokens:  allTokens,
 		streamCache: make(map[int]streamCacheEntry),
+	}
+
+	if len(allTokens) > 0 {
+		log.Printf("[TIDAL] Initialized token pool with %d subscriber account token(s) (round-robin + auto-failover enabled)", len(allTokens))
 	}
 
 	// Initialize mirror manager for intelligent routing
@@ -316,8 +373,9 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		req.Header.Set("X-Forwarded-For", clientIP)
 		req.Header.Set("X-Real-IP", clientIP)
 	}
-	if p.userToken != "" {
-		req.Header.Set("Authorization", "Bearer "+p.userToken)
+	usedToken := p.getUserToken()
+	if usedToken != "" {
+		req.Header.Set("Authorization", "Bearer "+usedToken)
 	}
 
 	start := time.Now()
@@ -329,6 +387,10 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 			p.mirrorMgr.ReportResult(m, latency, err)
 		}
 		return nil, fmt.Errorf("request %s: %w", path, err)
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized && usedToken != "" {
+		p.reportTokenAuthFailure(usedToken)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -402,8 +464,9 @@ func (p *Pool) doFetchRawWithMirror(ctx context.Context, path string, query url.
 		req.Header.Set("X-Forwarded-For", clientIP)
 		req.Header.Set("X-Real-IP", clientIP)
 	}
-	if p.userToken != "" {
-		req.Header.Set("Authorization", "Bearer "+p.userToken)
+	rawUsedToken := p.getUserToken()
+	if rawUsedToken != "" {
+		req.Header.Set("Authorization", "Bearer "+rawUsedToken)
 	}
 
 	start := time.Now()
@@ -415,6 +478,10 @@ func (p *Pool) doFetchRawWithMirror(ctx context.Context, path string, query url.
 			p.mirrorMgr.ReportResult(m, latency, err)
 		}
 		return fmt.Errorf("request %s: %w", path, err)
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized && rawUsedToken != "" {
+		p.reportTokenAuthFailure(rawUsedToken)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -1363,6 +1430,142 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 	return res
 }
 
+type dashMPD struct {
+	Period struct {
+		AdaptationSet struct {
+			Representation struct {
+				SegmentTemplate struct {
+					Timescale       int64  `xml:"timescale,attr"`
+					Initialization  string `xml:"initialization,attr"`
+					Media           string `xml:"media,attr"`
+					StartNumber     int    `xml:"startNumber,attr"`
+					SegmentTimeline struct {
+						S []struct {
+							D int64 `xml:"d,attr"`
+							R int   `xml:"r,attr"`
+						} `xml:"S"`
+					} `xml:"SegmentTimeline"`
+				} `xml:"SegmentTemplate"`
+			} `xml:"Representation"`
+		} `xml:"AdaptationSet"`
+	} `xml:"Period"`
+}
+
+func dashToM3U8DataURL(manifestBase64 string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(manifestBase64)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(manifestBase64)
+		if err != nil {
+			decoded = []byte(manifestBase64)
+		}
+	}
+
+	var mpd dashMPD
+	if err := xml.Unmarshal(decoded, &mpd); err != nil {
+		return "", fmt.Errorf("unmarshal dash xml: %w", err)
+	}
+
+	tmpl := mpd.Period.AdaptationSet.Representation.SegmentTemplate
+	timescale := tmpl.Timescale
+	if timescale <= 0 {
+		timescale = 44100
+	}
+
+	initURL := strings.ReplaceAll(tmpl.Initialization, "&amp;", "&")
+	mediaPattern := strings.ReplaceAll(tmpl.Media, "&amp;", "&")
+	startNum := tmpl.StartNumber
+	if startNum <= 0 {
+		startNum = 1
+	}
+
+	var sb strings.Builder
+	sb.WriteString("#EXTM3U\n")
+	sb.WriteString("#EXT-X-VERSION:7\n")
+	sb.WriteString("#EXT-X-TARGETDURATION:6\n")
+	if initURL != "" {
+		sb.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", initURL))
+	}
+
+	curNum := startNum
+	for _, s := range tmpl.SegmentTimeline.S {
+		durSec := float64(s.D) / float64(timescale)
+		count := s.R + 1
+		if count < 1 {
+			count = 1
+		}
+		for i := 0; i < count; i++ {
+			segURL := strings.ReplaceAll(mediaPattern, "$Number$", fmt.Sprint(curNum))
+			sb.WriteString(fmt.Sprintf("#EXTINF:%.4f,\n%s\n", durSec, segURL))
+			curNum++
+		}
+	}
+	sb.WriteString("#EXT-X-ENDLIST\n")
+
+	b64M3U8 := base64.StdEncoding.EncodeToString([]byte(sb.String()))
+	return "data:application/vnd.apple.mpegurl;base64," + b64M3U8, nil
+}
+
+func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality string, clientIP string, token string) (string, error) {
+	audioQuality := "LOSSLESS"
+	switch strings.ToUpper(quality) {
+	case "HI_RES", "HI_RES_LOSSLESS":
+		audioQuality = "HI_RES_LOSSLESS"
+	case "LOW":
+		audioQuality = "LOW"
+	case "HIGH":
+		audioQuality = "HIGH"
+	}
+
+	endpoint := fmt.Sprintf("https://api.tidal.com/v1/tracks/%d/playbackinfopostpaywall?audioquality=%s&playbackmode=STREAM&assetpresentation=FULL", trackID, audioQuality)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+	if clientIP != "" {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		p.reportTokenAuthFailure(token)
+		return "", fmt.Errorf("tidal token unauthorized or expired (401)")
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("api.tidal.com returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var playInfo struct {
+		TrackID           int    `json:"trackId"`
+		AssetPresentation string `json:"assetPresentation"`
+		AudioQuality      string `json:"audioQuality"`
+		ManifestMimeType  string `json:"manifestMimeType"`
+		Manifest          string `json:"manifest"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&playInfo); err != nil {
+		return "", fmt.Errorf("decode tidal playback info: %w", err)
+	}
+
+	if playInfo.AssetPresentation == "PREVIEW" {
+		return "", fmt.Errorf("track requires subscription (preview only)")
+	}
+
+	if playInfo.ManifestMimeType == "application/dash+xml" {
+		return dashToM3U8DataURL(playInfo.Manifest)
+	}
+
+	// For any other manifest type (e.g. BTS), use parseManifestURL
+	return parseManifestURL(trackID, "DIRECT-TIDAL", playInfo.ManifestMimeType, playInfo.Manifest)
+}
+
 func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality string, clientIP string) (string, error) {
 	if requestedQuality == "" {
 		requestedQuality = p.quality
@@ -1385,6 +1588,23 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 		}
 	}
 	p.streamCacheMu.RUnlock()
+
+	// [DIRECT-TIDAL] If user subscriber tokens are configured, attempt direct playback from Tidal official API
+	if tok := p.getUserToken(); tok != "" {
+		directURL, err := p.fetchDirectTidalStream(ctx, trackID, requestedQuality, clientIP, tok)
+		if err == nil && directURL != "" {
+			log.Printf("[TIDAL] ✅ Direct Tidal official API stream resolved for track %d (lossless full playback)", trackID)
+			p.streamCacheMu.Lock()
+			p.streamCache[trackID] = streamCacheEntry{
+				URL:       directURL,
+				Timestamp: time.Now(),
+				Quality:   requestedQuality,
+			}
+			p.streamCacheMu.Unlock()
+			return directURL, nil
+		}
+		log.Printf("[TIDAL] Direct official API attempt failed for track %d: %v (falling back to mirror pool)", trackID, err)
+	}
 
 	// Obtener TODOS los mirrors sanos sin importar el Tier
 	var mirrors []*Mirror

@@ -457,6 +457,8 @@ func (p *Provider) trackToSpec(t *tidalproxy.TidalTrack) *spec.TrackChild {
 	bitrate := 320
 	contentType := "audio/mp4"
 	if t.AudioQuality == "LOSSLESS" || t.AudioQuality == "HI_RES_LOSSLESS" {
+		suffix = "flac"
+		contentType = "audio/flac"
 		bitrate = 1411
 	}
 

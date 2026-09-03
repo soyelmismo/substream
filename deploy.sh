@@ -5,12 +5,21 @@
 set -e
 
 # --- Configuration (Adjust these or use .env) ---
+if [ -f ".env" ]; then
+    set -a
+    source .env
+    set +a
+fi
+
 SERVER="${DEPLOY_SERVER:-100.66.0.2}"
 SSH_PORT="${DEPLOY_PORT:-2369}"
 SSH_USER="${DEPLOY_USER:-root}"
 PATH_REMOTE="${DEPLOY_PATH:-/root/.substream}"
 SERVICE_NAME="${SERVICE_NAME:-substream}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:4533}"
+TIDAL_TOKEN="${TIDAL_TOKENS:-${TIDAL_TOKEN:-${SUBSTREAM_TIDAL_TOKENS:-${SUBSTREAM_TIDAL_TOKEN:-}}}}"
+DEEZER_ARL="${DEEZER_ARL:-${SUBSTREAM_DEEZER_ARL:-}}"
+QOBUZ_TOKEN="${QOBUZ_TOKEN:-${SUBSTREAM_QOBUZ_TOKEN:-}}"
 
 REMOTE="${SSH_USER}@${SERVER}"
 
@@ -62,6 +71,9 @@ After=network.target
 Type=simple
 User=${SSH_USER}
 WorkingDirectory=${PATH_REMOTE}
+Environment="SUBSTREAM_TIDAL_TOKEN=${TIDAL_TOKEN}"
+Environment="SUBSTREAM_DEEZER_ARL=${DEEZER_ARL}"
+Environment="SUBSTREAM_QOBUZ_TOKEN=${QOBUZ_TOKEN}"
 ExecStart=${PATH_REMOTE}/substream --listen-addr="${LISTEN_ADDR}" --cert-path="cert.pem" --key-path="key.pem"
 Restart=always
 RestartSec=5

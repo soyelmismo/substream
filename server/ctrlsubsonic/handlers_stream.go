@@ -19,6 +19,16 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
 
+// isExoPlayerClient returns true for Android ExoPlayer-based clients (Tempus, Symfonium, DSub)
+// that require a synthesized sidx box and byte ranges to enable and operate the seek bar.
+func isExoPlayerClient(clientName string) bool {
+	lower := strings.ToLower(clientName)
+	return strings.Contains(lower, "tempus") ||
+		strings.Contains(lower, "symfonium") ||
+		strings.Contains(lower, "exoplayer") ||
+		strings.Contains(lower, "dsub")
+}
+
 // doesntSupportHLS returns true for clients that cannot natively decode HLS manifests.
 // These clients require the server to stitch segments into a continuous raw audio stream.
 // The list can be pruned as developers add proper HLS support to their clients.
@@ -49,6 +59,11 @@ func isClientDisconnectError(err error) bool {
 		"write: connection reset",
 		"read: connection reset",
 		"http: request body closed",
+		"http2: request body closed",
+		"request body closed",
+		"handler exiting",
+		"stream closed",
+		"client disconnected",
 	}
 	for _, pattern := range clientErrors {
 		if strings.Contains(errStr, pattern) {
@@ -117,8 +132,9 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// Skip deduplication for clients that need stitching - prioritize latency
 	var lockVal interface{}
 	var loaded bool
-	if clientNeedsHelp {
-		// For HLS-stitching clients, don't wait - process immediately
+	clientNameLower := strings.ToLower(p.GetOr("c", ""))
+	if clientNeedsHelp || clientNameLower == "supersonic" {
+		// For HLS-stitching clients or Supersonic, don't wait - process immediately
 		log.Printf("[STREAM] LATENCY PRIORITY: Processing track=%d immediately for %s (no dedup)", id.Value(), p.GetOr("c", ""))
 		loaded = false
 	} else {
@@ -129,16 +145,11 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		// Another request is already streaming this track, wait for it to complete
 		lock := lockVal.(*streamLock)
 		<-lock.done
-		// If the first request failed, propagate the error (unless it's a client disconnect)
+		// If the first request failed, do NOT return a cached error to this new request!
 		if lock.err != nil {
-			log.Printf("[STREAM] Deduplicated request failed (original error: %v)", lock.err)
+			log.Printf("[STREAM] Previous request had error (%v), starting fresh for track=%d", lock.err, id.Value())
 			c.streamLocks.Delete(streamKey)
-			return spec.NewError(0, "stream failed: %v", lock.err)
-		}
-		// Note: Client disconnection errors (connection reset, broken pipe) are NOT stored
-		// in lock.err, so they won't propagate to other waiting requests
-		// [GAPLESS] Return cached result if within 10-minute window (HLS manifests last ~10 min)
-		if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute {
+		} else if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute && !strings.HasPrefix(lock.prep.StreamURL, "data:") {
 			// Safe to redirect to cached URL (client supports HLS natively)
 			log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
 			urlPreview := lock.prep.StreamURL
@@ -223,7 +234,8 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	}
 
 	// Redirect if not proxying and not stitching
-	needsStitch := clientNeedsHelp && prep.IsHLS
+	isDataURL := strings.HasPrefix(streamURL, "data:")
+	needsStitch := (clientNeedsHelp && prep.IsHLS) || isDataURL
 	if proxyStreams != "true" && !needsStitch {
 		urlPreview := streamURL
 		if len(urlPreview) > 100 {
@@ -232,6 +244,25 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s",
 			id.Value(), prep.IsHLS, urlPreview)
 		http.Redirect(w, r, streamURL, http.StatusFound)
+		return nil
+	}
+
+	if r.Method == http.MethodHead {
+		contentType := "audio/mp4"
+		if prep.Ext == "flac" && !prep.IsHLS {
+			contentType = "audio/flac"
+		}
+		w.Header().Set("Content-Type", contentType)
+		if isExoPlayerClient(prep.ClientName) {
+			w.Header().Set("Accept-Ranges", "bytes")
+			if prep.Track != nil && prep.Track.Duration > 0 {
+				bytesPerSec := int64(125000)
+				w.Header().Set("Content-Length", fmt.Sprint(int64(prep.Track.Duration)*bytesPerSec))
+			}
+		} else {
+			w.Header().Set("Accept-Ranges", "none")
+		}
+		w.WriteHeader(http.StatusOK)
 		return nil
 	}
 
@@ -257,40 +288,43 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		}
 		log.Printf("[STREAM] Starting HLS stitch for %s track=%d", prep.ClientName, id.Value())
 
-		// --- RANGE CALCULATION LOGIC ---
-		rangeHdr := r.Header.Get("Range")
-		offsetSeconds := 0.0
+		// Subsonic time-based seeking (via timeOffset query param)
+		offsetSeconds := p.GetOrFloat("timeOffset", 0.0)
 		startByte := int64(0)
 		var totalBytes int64 = 0
 
-		bytesPerSec := int64(125000)
-		if prep.Quality == "HIGH" || prep.Quality == "LOW" || prep.Ext == "m4a" {
-			bytesPerSec = 40000
-		} else if prep.Quality == "HI_RES_LOSSLESS" {
-			bytesPerSec = 175000
-		}
+		if isExoPlayerClient(prep.ClientName) {
+			bytesPerSec := int64(125000)
+			if prep.Quality == "HIGH" || prep.Quality == "LOW" || prep.Ext == "m4a" {
+				bytesPerSec = 40000
+			} else if prep.Quality == "HI_RES_LOSSLESS" {
+				bytesPerSec = 175000
+			}
+			if prep.Track != nil && prep.Track.Duration > 0 {
+				totalBytes = int64(prep.Track.Duration) * bytesPerSec
+			}
 
-		if prep.Track != nil && prep.Track.Duration > 0 {
-			totalBytes = int64(prep.Track.Duration) * bytesPerSec
-		}
-
-		timeOffsetParam := p.GetOrFloat("timeOffset", 0.0)
-		if timeOffsetParam > 0 {
-			offsetSeconds = timeOffsetParam
-		} else if rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") && totalBytes > 0 {
-			parts := strings.Split(strings.TrimPrefix(rangeHdr, "bytes="), "-")
-			if len(parts) > 0 && parts[0] != "" {
-				if parsedByte, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
-					startByte = parsedByte
-					offsetSeconds = float64(startByte) / float64(bytesPerSec)
-					if offsetSeconds > float64(prep.Track.Duration) {
-						offsetSeconds = float64(prep.Track.Duration) - 1
-					}
-					if offsetSeconds < 0 {
-						offsetSeconds = 0
+			rangeHdr := r.Header.Get("Range")
+			if offsetSeconds == 0 && rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") && totalBytes > 0 {
+				parts := strings.Split(strings.TrimPrefix(rangeHdr, "bytes="), "-")
+				if len(parts) > 0 && parts[0] != "" {
+					if parsedByte, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+						startByte = parsedByte
+						offsetSeconds = float64(startByte) / float64(bytesPerSec)
+						if offsetSeconds > float64(prep.Track.Duration) {
+							offsetSeconds = float64(prep.Track.Duration) - 1
+						}
+						if offsetSeconds < 0 {
+							offsetSeconds = 0
+						}
 					}
 				}
 			}
+			w.Header().Set("Accept-Ranges", "bytes")
+		} else {
+			// Live stitched fMP4/HLS streams must NOT advertise byte ranges to MPV/ffmpeg:
+			// doing so causes MPV to attempt random byte seeking which corrupts the MP4 atom structure.
+			w.Header().Set("Accept-Ranges", "none")
 		}
 
 		err = c.downloadAndStitchHLS(streamCtx, prep.StreamURL, w, prep.ClientIP, prep.Track, offsetSeconds, startByte, totalBytes, prep.ClientName)
