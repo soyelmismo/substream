@@ -89,7 +89,8 @@ func (db *DB) GetTidalAccounts() ([]*TidalAccount, error) {
 
 func (db *DB) GetActiveTidalAccounts() ([]*TidalAccount, error) {
 	var accounts []*TidalAccount
-	err := db.Where("is_active = ?", true).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
+	// Only return accounts with active paid streaming access (tier >= 50: Premium or HiFi)
+	err := db.Where("is_active = ? AND quality_tier >= 50", true).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
 	return accounts, err
 }
 

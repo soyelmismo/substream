@@ -47,8 +47,10 @@
                         {{ end }}
                         {{ if ge .QualityTier 80 }}
                             <span class="text-xs font-bold text-purple-700 bg-purple-50 border border-purple-200 px-2 py-0.5 rounded" title="Full Lossless FLAC streams">HiFi (FLAC Lossless)</span>
-                        {{ else }}
+                        {{ else if ge .QualityTier 50 }}
                             <span class="text-xs font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded" title="Standard Tidal streams up to 320kbps AAC">Premium (320k AAC)</span>
+                        {{ else }}
+                            <span class="text-xs font-bold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded" title="No active subscription on Tidal (only 30s previews)">Free / Expired (No Sub)</span>
                         {{ end }}
                         <div class="flex flex-col items-end">
                             <span class="font-bold text-gray-900">{{ .Username }}</span>

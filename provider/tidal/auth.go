@@ -236,27 +236,31 @@ func FetchAccountSubscription(ctx context.Context, userID, accessToken string) (
 	var subResp struct {
 		HighestSoundQuality string `json:"highestSoundQuality"`
 		Status              string `json:"status"`
+		PremiumAccess       bool   `json:"premiumAccess"`
 		Subscription        struct {
 			Type string `json:"type"`
 		} `json:"subscription"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&subResp); err != nil {
-		return "PREMIUM", "HIGH", 50, err
+		return "FREE", "LOW", 10, err
 	}
 
-	subType := strings.ToUpper(strings.TrimSpace(subResp.Subscription.Type))
+	subType := "PREMIUM"
 	highestQuality := strings.ToUpper(strings.TrimSpace(subResp.HighestSoundQuality))
 
 	tier := 50 // High (320kbps AAC)
-	if subType == "HIFI" || subType == "TIDAL_HI_FI" || subType == "HI_RES" || (highestQuality == "HI_RES" && subType != "PREMIUM") {
-		tier = 80 // Lossless FLAC
-		if highestQuality == "HI_RES" {
-			tier = 100 // Hi-Res FLAC
-		}
-	} else if subType == "PREMIUM" {
-		tier = 50 // 320kbps AAC
-	} else if subType == "FREE" {
-		tier = 30
+	if !subResp.PremiumAccess || highestQuality == "" {
+		subType = "FREE"
+		tier = 10 // Free / Expired (No full playback)
+	} else if highestQuality == "HI_RES" {
+		subType = "HI_RES"
+		tier = 100 // 24-bit Hi-Res FLAC
+	} else if highestQuality == "LOSSLESS" {
+		subType = "HIFI"
+		tier = 80 // Lossless CD FLAC
+	} else {
+		subType = "PREMIUM"
+		tier = 50 // High 320kbps AAC
 	}
 
 	return subType, highestQuality, tier, nil

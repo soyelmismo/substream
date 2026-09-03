@@ -1527,6 +1527,45 @@ func dashToM3U8DataURL(manifestBase64 string) (string, error) {
 }
 
 func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality string, clientIP string, token string) (string, error) {
+	isLosslessReq := strings.ToUpper(quality) == "LOSSLESS" || strings.ToUpper(quality) == "HI_RES_LOSSLESS" || strings.ToUpper(quality) == "HI_RES"
+
+	// [OPENAPI V2] For Lossless / Hi-Res playback, use modern OpenAPI v2 trackManifests (delivers authentic FLAC stream)
+	if isLosslessReq {
+		v2Endpoint := fmt.Sprintf("https://openapi.tidal.com/v2/trackManifests/%d?formats=FLAC&formats=FLAC_HIRES&manifestType=HLS&uriScheme=HTTPS&usage=PLAYBACK&adaptive=true", trackID)
+		req, err := http.NewRequestWithContext(ctx, "GET", v2Endpoint, nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("User-Agent", DeviceAuthUserAgent)
+			if clientIP != "" {
+				req.Header.Set("X-Forwarded-For", clientIP)
+			}
+
+			resp, err := p.client.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var v2Resp struct {
+						Data struct {
+							Attributes struct {
+								TrackPresentation string   `json:"trackPresentation"`
+								URI               string   `json:"uri"`
+								Formats           []string `json:"formats"`
+							} `json:"attributes"`
+						} `json:"data"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&v2Resp); err == nil {
+						if v2Resp.Data.Attributes.TrackPresentation == "FULL" && v2Resp.Data.Attributes.URI != "" {
+							log.Printf("[TIDAL] 🚀 Official OpenAPI v2 resolved LOSSLESS stream for track %d: Formats=%v", trackID, v2Resp.Data.Attributes.Formats)
+							return v2Resp.Data.Attributes.URI, nil
+						}
+					}
+				} else if resp.StatusCode == http.StatusUnauthorized {
+					p.reportTokenAuthFailure(token)
+				}
+			}
+		}
+	}
+
 	audioQuality := "LOSSLESS"
 	switch strings.ToUpper(quality) {
 	case "HI_RES", "HI_RES_LOSSLESS":
