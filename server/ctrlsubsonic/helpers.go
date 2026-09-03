@@ -274,10 +274,15 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 				if specTrack.ArtistID != nil {
 					artistIDVal = specTrack.ArtistID.Value()
 				}
+				isrcVal := ""
+				if len(specTrack.ISRC) > 0 {
+					isrcVal = specTrack.ISRC[0]
+				}
 				track = &tidalproxy.TidalTrack{
 					ID:       id.Value(),
 					Title:    specTrack.Title,
 					Duration: specTrack.Duration,
+					ISRC:     isrcVal,
 					Album: tidalproxy.TidalAlbumRef{
 						ID:    albumIDVal,
 						Title: specTrack.Album,
@@ -313,6 +318,24 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 			}
 		} else {
 			log.Printf("[STREAM] Cross-provider ISRC fallback failed for %s (ISRC: %s): %v", id.String(), track.ISRC, err)
+		}
+	}
+
+	// Universal Fallback to YouTube Music if stream still failed or missing
+	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("yt") && track != nil {
+		if ytProv, err := c.providers.Get("yt"); err == nil && ytProv != nil {
+			if matcher, ok := ytProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if matched, mErr := matcher.MatchTrackByMetadata(ctx, track.Artist.Name, track.Title, track.Duration); mErr == nil && matched != nil && matched.ID != nil {
+					log.Printf("[STREAM] 🚀 Universal fallback to YouTube Music for %s (%s - %s) -> %s", id.String(), track.Artist.Name, track.Title, matched.ID.RawID())
+					if ytURL, ytErr := ytProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP); ytErr == nil && ytURL != "" {
+						url = ytURL
+						urlErr = nil
+						isSamplePreview = false
+					}
+				}
+			}
 		}
 	}
 

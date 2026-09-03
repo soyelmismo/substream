@@ -226,12 +226,17 @@ func (c *Controller) handleImportPlaylist(ctx context.Context, user *db.User, so
 	// Return the placeholder playlist immediately
 	sub := spec.NewResponse()
 	sub.Playlist = &spec.Playlist{
-		ID:      specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
-		Name:    pl.Name,
-		Comment: pl.Comment,
-		Owner:   user.Name,
-		Created: pl.CreatedAt,
-		Changed: pl.UpdatedAt,
+		ID:        specid.ID{URI: fmt.Sprintf("td:pl:%d", pl.ID)},
+		Name:      pl.Name,
+		Comment:   pl.Comment,
+		Owner:     user.Name,
+		SongCount: 0,
+		Created:   pl.CreatedAt,
+		Changed:   pl.UpdatedAt,
+		Public:    pl.IsPublic,
+	}
+	if pl.CoverURL != "" || pl.CoverPath != "" {
+		sub.Playlist.CoverID = &specid.ID{URI: fmt.Sprintf("pl:%d", pl.ID)}
 	}
 	return sub
 }

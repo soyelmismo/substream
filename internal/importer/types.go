@@ -5,8 +5,11 @@ type ImportedTrack struct {
 	ISRC    string
 	Title   string
 	Artist  string
-	Album   string
-	TidalID int // Tidal track ID from API - allows direct lookup without search
+	Album     string
+	Duration  int    // Track duration in seconds for fuzzy tolerance matching
+	TidalID   int    // Tidal track ID from API - allows direct lookup without search
+	VideoID   string // YouTube Music video ID if imported from YouTube
+	SourceURI string // Optional explicit source URI (e.g. yt:tr:...)
 }
 
 // ImportedPlaylist represents a playlist fetched from an external source

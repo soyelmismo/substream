@@ -20,6 +20,9 @@ import (
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/internal/matchutil"
+	"go.senan.xyz/gonic/provider"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 	"go.senan.xyz/gonic/tidalproxy"
 )
 
@@ -36,6 +39,7 @@ type JobManager struct {
 	activeJobs sync.Map      // playlistID -> context.CancelFunc
 	db         *db.DB
 	proxy      tidalproxy.TidalProxy
+	providers  *provider.Registry
 	cachePath  string // Path for storing generated playlist covers
 }
 
@@ -46,12 +50,13 @@ type coverInfo struct {
 }
 
 // NewJobManager creates a new import job manager
-func NewJobManager(dbc *db.DB, proxy tidalproxy.TidalProxy, cachePath string) *JobManager {
+func NewJobManager(dbc *db.DB, proxy tidalproxy.TidalProxy, providers *provider.Registry, cachePath string) *JobManager {
 	return &JobManager{
 		registry:  NewRegistry(proxy),
 		semaphore: make(chan struct{}, maxConcurrentImports),
 		db:        dbc,
 		proxy:     proxy,
+		providers: providers,
 		cachePath: cachePath,
 	}
 }
@@ -156,13 +161,13 @@ func (jm *JobManager) runJob(ctx context.Context, cancel context.CancelFunc, pla
 	results := jm.processTracksConcurrent(ctx, playlist.Tracks)
 
 	// Collect results and maintain order
-	usedTrackIDs := make(map[int]bool)
+	usedTrackURIs := make(map[string]bool)
 	successCount := 0
 	failCount := 0
 	skippedDuplicates := 0
 
 	for _, result := range results {
-		if result.tidalID == 0 {
+		if result.uri == "" {
 			failCount++
 			log.Printf("[IMPORT] Track %d/%d not found: %s - %s",
 				result.index+1, len(playlist.Tracks), result.artist, result.title)
@@ -170,21 +175,21 @@ func (jm *JobManager) runJob(ctx context.Context, cancel context.CancelFunc, pla
 		}
 
 		// Skip duplicates
-		if usedTrackIDs[result.tidalID] {
+		if usedTrackURIs[result.uri] {
 			skippedDuplicates++
-			log.Printf("[IMPORT] Track %d/%d skipped (duplicate Tidal ID %d): %s - %s",
-				result.index+1, len(playlist.Tracks), result.tidalID, result.artist, result.title)
+			log.Printf("[IMPORT] Track %d/%d skipped (duplicate URI %s): %s - %s",
+				result.index+1, len(playlist.Tracks), result.uri, result.artist, result.title)
 			continue
 		}
 
 		// Add to playlist
-		if err := jm.addTrack(playlistID, result.tidalID, successCount); err != nil {
+		if err := jm.addTrack(playlistID, result.uri, successCount); err != nil {
 			failCount++
 			log.Printf("[IMPORT] Failed to add track %d/%d: %v", result.index+1, len(playlist.Tracks), err)
 			continue
 		}
 
-		usedTrackIDs[result.tidalID] = true
+		usedTrackURIs[result.uri] = true
 		successCount++
 	}
 
@@ -205,35 +210,80 @@ func (jm *JobManager) runJob(ctx context.Context, cancel context.CancelFunc, pla
 	}
 }
 
-// findTrack searches for a track in Tidal by ID, ISRC, or text
-// Priority: TidalID (direct) > ISRC > Text search
-func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) int {
+// findTrack searches for a track across all registered providers with intelligent fallback.
+// Priority: Direct ID -> Lossless ISRC (Tidal/Deezer/Qobuz) -> Tidal Fuzzy Search -> YouTube Music Fallback
+func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string {
 	// Priority 1: Use TidalID directly if available (from Tidal playlist import)
-	// This avoids unnecessary search calls to the proxy
 	if track.TidalID > 0 {
-		// Verify the track exists by fetching its info
-		if _, err := jm.proxy.GetTrackInfo(ctx, track.TidalID); err == nil {
-			log.Printf("[IMPORT] Direct ID match: %d (%s - %s)", track.TidalID, track.Artist, track.Title)
-			return track.TidalID
+		if jm.proxy != nil {
+			if _, err := jm.proxy.GetTrackInfo(ctx, track.TidalID); err == nil {
+				log.Printf("[IMPORT] Direct Tidal ID match: %d (%s - %s)", track.TidalID, track.Artist, track.Title)
+				return fmt.Sprintf("td:tr:%d", track.TidalID)
+			}
 		}
-		// Track ID exists but fetch failed - fall through to search
-		log.Printf("[IMPORT] TidalID %d failed validation, falling back to search (%s - %s)",
-			track.TidalID, track.Artist, track.Title)
 	}
 
-	// Priority 2: Try ISRC if available
+	// Priority 2: Direct SourceURI / VideoID if already populated (e.g. from YouTube Music playlist)
+	if track.SourceURI != "" {
+		return track.SourceURI
+	}
+	if track.VideoID != "" {
+		return fmt.Sprintf("yt:tr:%s", track.VideoID)
+	}
+
+	// Priority 3: Try ISRC across lossless providers (Tidal, Deezer, Qobuz)
 	if track.ISRC != "" {
-		tidalTrack := jm.searchByISRC(ctx, track.ISRC)
-		if tidalTrack != nil {
-			return tidalTrack.ID
+		if jm.providers != nil {
+			losslessProvIDs := []string{"td", "dz", "qb"}
+			for _, pID := range losslessProvIDs {
+				if !jm.providers.IsMetadataEnabled(pID) {
+					continue
+				}
+				prov, err := jm.providers.Get(pID)
+				if err != nil || prov == nil {
+					continue
+				}
+				if isrcRes, ok := prov.(provider.ISRCResolver); ok {
+					if matchedTrack, err := isrcRes.GetTrackByISRC(ctx, track.ISRC); err == nil && matchedTrack != nil {
+						log.Printf("[IMPORT] ✅ ISRC match on %s (%s): %s - %s", pID, track.ISRC, track.Artist, track.Title)
+						return fmt.Sprintf("%s:tr:%s", pID, matchedTrack.ID.RawID())
+					}
+				}
+			}
+		}
+		// Fallback ISRC directly on Tidal proxy
+		if jm.proxy != nil {
+			if tidalTrack := jm.searchByISRC(ctx, track.ISRC); tidalTrack != nil {
+				log.Printf("[IMPORT] ✅ ISRC match on Tidal proxy (%s): %s - %s", track.ISRC, track.Artist, track.Title)
+				return fmt.Sprintf("td:tr:%d", tidalTrack.ID)
+			}
 		}
 	}
 
-	// Priority 3: Fallback to text search (with album for better matching)
-	if track.Album == "" {
-		log.Printf("[IMPORT DEBUG] No album info for track: %s - %s", track.Artist, track.Title)
+	// Priority 4: Fuzzy text search on Tidal (High fidelity primary)
+	if jm.proxy != nil && (jm.providers == nil || jm.providers.IsMetadataEnabled("td")) {
+		if tidalID := jm.searchByText(ctx, track.Artist, track.Title, track.Album); tidalID > 0 {
+			log.Printf("[IMPORT] ✅ Text match on Tidal: %s - %s -> td:tr:%d", track.Artist, track.Title, tidalID)
+			return fmt.Sprintf("td:tr:%d", tidalID)
+		}
 	}
-	return jm.searchByText(ctx, track.Artist, track.Title, track.Album)
+
+	// Priority 5: Fallback to YouTube Music (The "No track left behind" guarantee)
+	if jm.providers != nil && jm.providers.IsMetadataEnabled("yt") {
+		if ytProv, err := jm.providers.Get("yt"); err == nil && ytProv != nil {
+			if matcher, ok := ytProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if ytTrack, err := matcher.MatchTrackByMetadata(ctx, track.Artist, track.Title, track.Duration); err == nil && ytTrack != nil {
+					log.Printf("[IMPORT] ✅ Cross-provider fallback to YouTube Music for %q by %q: yt:tr:%s",
+						track.Title, track.Artist, ytTrack.ID.RawID())
+					return fmt.Sprintf("yt:tr:%s", ytTrack.ID.RawID())
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 // searchByISRC searches for a track by ISRC code
@@ -368,11 +418,11 @@ func (jm *JobManager) searchByText(ctx context.Context, artist, title, album str
 
 // trackResult represents the result of processing a single track
 type trackResult struct {
-	index   int
-	tidalID int
-	artist  string
-	title   string
-	album   string
+	index  int
+	uri    string
+	artist string
+	title  string
+	album  string
 }
 
 // processTracksConcurrent processes tracks using a worker pool for concurrent searches
@@ -404,19 +454,19 @@ func (jm *JobManager) processTracksConcurrent(ctx context.Context, tracks []Impo
 				// Check context
 				select {
 				case <-ctx.Done():
-					results <- trackResult{index: job.index, tidalID: 0, artist: job.track.Artist, title: job.track.Title}
+					results <- trackResult{index: job.index, uri: "", artist: job.track.Artist, title: job.track.Title}
 					continue
 				default:
 				}
 
-				// Find track
-				tidalID := jm.findTrack(ctx, job.track)
+				// Find track across providers
+				uri := jm.findTrack(ctx, job.track)
 				results <- trackResult{
-					index:   job.index,
-					tidalID: tidalID,
-					artist:  job.track.Artist,
-					title:   job.track.Title,
-					album:   job.track.Album,
+					index:  job.index,
+					uri:    uri,
+					artist: job.track.Artist,
+					title:  job.track.Title,
+					album:  job.track.Album,
 				}
 
 				// Rate limiting per worker (still respects proxy limits)
@@ -459,10 +509,10 @@ func (jm *JobManager) processTracksConcurrent(ctx context.Context, tracks []Impo
 }
 
 // addTrack adds a track to the playlist
-func (jm *JobManager) addTrack(playlistID, tidalID, position int) error {
+func (jm *JobManager) addTrack(playlistID int, uri string, position int) error {
 	pt := db.PlaylistTrack{
 		PlaylistID: playlistID,
-		URI:        fmt.Sprintf("td:tr:%d", tidalID),
+		URI:        uri,
 		Position:   position,
 	}
 	return jm.db.Create(&pt).Error
@@ -540,24 +590,46 @@ func (jm *JobManager) generateCompositeCover(playlistID int) string {
 	var covers []coverInfo
 
 	for _, track := range tracks {
-		tidalID := extractIDFromURI(track.URI)
-		if tidalID == 0 {
+		id, err := specid.New(track.URI)
+		if err != nil {
 			continue
 		}
 
-		// Get track info to find album
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		trackInfo, err := jm.proxy.GetTrackInfo(ctx, tidalID)
-		cancel()
+		// 1. Try via Tidal proxy if provider is td
+		if id.Provider() == "td" && jm.proxy != nil {
+			tidalID := extractIDFromURI(track.URI)
+			if tidalID > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				trackInfo, err := jm.proxy.GetTrackInfo(ctx, tidalID)
+				cancel()
 
-		if err == nil && trackInfo.Album.ID > 0 {
-			// Get album cover
-			albumID := trackInfo.Album.ID
-			coverUUID := jm.proxy.GetCoverUUIDForAlbum(context.Background(), albumID)
-			if coverUUID != "" {
-				coverURL := jm.proxy.GetCoverURL(coverUUID, 320) // Medium size for grid
-				if coverURL != "" {
-					covers = append(covers, coverInfo{url: coverURL, albumID: albumID})
+				if err == nil && trackInfo.Album.ID > 0 {
+					albumID := trackInfo.Album.ID
+					coverUUID := jm.proxy.GetCoverUUIDForAlbum(context.Background(), albumID)
+					if coverUUID != "" {
+						if coverURL := jm.proxy.GetCoverURL(coverUUID, 320); coverURL != "" {
+							covers = append(covers, coverInfo{url: coverURL, albumID: albumID})
+							continue
+						}
+					}
+				}
+			}
+		}
+
+		// 2. Try via universal provider registry
+		if jm.providers != nil {
+			prov, err := jm.providers.Get(id.Provider())
+			if err == nil && prov != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				tChild, err := prov.GetTrack(ctx, id.RawID())
+				cancel()
+
+				if err == nil && tChild != nil && tChild.CoverID != nil {
+					coverURL := prov.GetCoverURL(tChild.CoverID.RawID(), 320)
+					if coverURL != "" {
+						covers = append(covers, coverInfo{url: coverURL, albumID: 0})
+						continue
+					}
 				}
 			}
 		}
