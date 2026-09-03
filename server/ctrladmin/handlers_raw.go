@@ -131,20 +131,20 @@ func (c *Controller) ServeLoginDo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate username format before DB lookup
-	if err := validateUsername(username); err != nil {
-		sessAddFlashW(session, []string{"invalid username format"})
-		sessLogSave(session, w, r)
-		http.Redirect(w, r, safeRedirectPath(r.Referer(), "/admin/login"), http.StatusSeeOther)
-		return
-	}
-
 	user := c.dbc.GetUserByName(username)
 
 	// If user doesn't exist, check if auto-register is enabled
 	if user == nil {
 		autoRegister := c.dbc.GetSetting("auto_register", "false")
 		if autoRegister == "true" {
+			// Validate username format for new user registration
+			if err := validateUsername(username); err != nil {
+				sessAddFlashW(session, []string{"invalid username format"})
+				sessLogSave(session, w, r)
+				http.Redirect(w, r, safeRedirectPath(r.Referer(), "/admin/login"), http.StatusSeeOther)
+				return
+			}
+
 			// Validate password before creating user
 			if err := validatePasswordCreation(password); err != nil {
 				sessAddFlashW(session, []string{err.Error()})
@@ -214,7 +214,7 @@ func (c *Controller) ServeLoginDo(w http.ResponseWriter, r *http.Request) {
 
 	// CRITICAL: Set cookie flags (same as withSession middleware)
 	session.Options.HttpOnly = true
-	session.Options.SameSite = http.SameSiteStrictMode
+	session.Options.SameSite = http.SameSiteLaxMode
 	session.Options.Path = "/"       // Make cookie available site-wide
 	session.Options.MaxAge = 2592000 // 30 days in seconds (ensures DB persistence)
 	if isHTTPS(r) {
@@ -494,11 +494,9 @@ var usernameRegex = regexp.MustCompile("^[a-zA-Z0-9._-]+$")
 
 // reservedUsernames that cannot be used
 var reservedUsernames = map[string]bool{
-	"admin":  true,
 	"root":   true,
 	"system": true,
 	"guest":  true,
-	"test":   true,
 }
 
 func validateUsername(username string) error {

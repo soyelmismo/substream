@@ -67,24 +67,12 @@
         <span class="text-gray-900 font-bold">last.fm</span>
     </div>
     <hr class="bg-gray-900/30 my-1" />
-    <div class="font-medium text-gray-500 max-w-[700px]">scrobble to last.fm on a per user basis</div>
+    <div class="font-medium text-gray-500 max-w-[700px]">server last.fm integration for scrobbling and recommendations</div>
     <div class="mt-3 max-w-[700px] ml-auto space-y-2 text-right">
         <div class="flex flex-col gap-2 items-end">
-            {{ if .User.LastfmSession }}
-                <p class="text-gray-500">current status <span class="font-bold text-green-500">linked</span></p>
-                <form class="contents" action="{{ path "/admin/unlink_lastfm_do" }}" method="post">
-                    <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
-                    <input type="submit" value="unlink">
-                </form>
-            {{ else }}
-                <p class="text-gray-500">current status <span class="font-bold text-red-400">unlinked</span></p>
-                <p class="text-xs text-gray-400">link via client app or profile page</p>
-            {{ end }}
             {{ if .User.IsAdmin }}
-                <div class="pt-2 border-t border-gray-200 mt-2 w-full">
-                    <p class="text-gray-500 text-sm">api key: <span class="font-bold {{ if .CurrentLastFMAPIKey }}text-green-500{{ else }}text-red-400{{ end }}">{{ if .CurrentLastFMAPIKey }}configured{{ else }}not set{{ end }}</span></p>
-                    <a class="text-blue-500 text-sm" href="{{ path "/admin/update_lastfm_api_key" }}">configure last.fm api key&#8230;</a>
-                </div>
+                <p class="text-gray-500 text-sm">api key: <span class="font-bold {{ if .CurrentLastFMAPIKey }}text-green-500{{ else }}text-red-400{{ end }}">{{ if .CurrentLastFMAPIKey }}configured{{ else }}not set{{ end }}</span></p>
+                <a class="text-blue-500 text-sm" href="{{ path "/admin/update_lastfm_api_key" }}">configure last.fm api key&#8230;</a>
             {{ end }}
         </div>
     </div>

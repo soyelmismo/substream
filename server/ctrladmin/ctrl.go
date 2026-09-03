@@ -292,9 +292,9 @@ func withSession(sessDB *gormstore.Store) handlerutil.Middleware {
 			for k, v := range session.Values {
 				log.Printf("[DEBUG] withSession: loaded session.Values[%v] = %v (type=%T)", k, v, v)
 			}
-			// Harden session cookie settings
+			// Harden session cookie settings (Lax allows OAuth callbacks to preserve session)
 			session.Options.HttpOnly = true
-			session.Options.SameSite = http.SameSiteStrictMode
+			session.Options.SameSite = http.SameSiteLaxMode
 			session.Options.Path = "/" // Make cookie available site-wide
 			// Set Secure flag when using HTTPS to prevent cookie theft via MITM
 			if isHTTPS(r) {

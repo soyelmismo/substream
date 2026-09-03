@@ -214,6 +214,20 @@ func main() {
 	mux.Handle(restPath, http.StripPrefix(strings.TrimRight(restPath, "/"), ctrlSubsonic))
 	mux.Handle(adminPath, http.StripPrefix(strings.TrimRight(adminPath, "/"), ctrlAdmin))
 
+	// Root redirect: redirect "/" directly to web panel / login
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && r.URL.Path != "" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, adminPath, http.StatusFound)
+	})
+
+	// Convenience "/login" shortcut -> "/admin/login"
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, adminPath+"login", http.StatusFound)
+	})
+
 	// CORS & Path Cleaning Middleware
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")

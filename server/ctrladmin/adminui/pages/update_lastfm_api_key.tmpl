@@ -15,6 +15,7 @@
         <p class="text-gray-500">current key <span class="font-bold text-gray-800 italic">{{ default "not set" .CurrentLastFMAPIKey }}</span></p>
         <p class="text-gray-500">current secret <span class="font-bold text-gray-800 italic">{{ default "not set" .CurrentLastFMAPISecret }}</span></p>
         <form class="contents" action="{{ path "/admin/update_lastfm_api_key_do" }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
         <input type="text" id="api_key" name="api_key" placeholder="new key">
         <input type="text" id="secret" name="secret" placeholder="new secret">
         <input type="submit" value="update">

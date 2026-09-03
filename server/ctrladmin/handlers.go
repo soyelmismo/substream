@@ -530,6 +530,9 @@ func (c *Controller) ServeChangePasswordDo(r *http.Request) *Response {
 
 	// Check if user parameter is provided
 	selectedUsername := r.URL.Query().Get("user")
+	if selectedUsername == "" {
+		selectedUsername = r.FormValue("user")
+	}
 	if selectedUsername != "" {
 		// Admin changing another user's password
 		user, err = selectedUserIfAdmin(c, r)
@@ -1018,30 +1021,21 @@ func getAvatarFile(r *http.Request) ([]byte, error) {
 }
 
 func selectedUserIfAdmin(c *Controller, r *http.Request) (*db.User, error) {
-	clientIP := getClientIP(r)
-
-	// Rate limit user lookups to prevent username enumeration attacks
-	if allowed, _ := c.rateLimiter.CheckLimit(clientIP + ":user_lookup"); !allowed {
-		return nil, fmt.Errorf("invalid user")
-	}
-
 	selectedUsername := r.URL.Query().Get("user")
+	if selectedUsername == "" {
+		selectedUsername = r.FormValue("user")
+	}
 	if selectedUsername == "" {
 		return nil, fmt.Errorf("invalid user")
 	}
-	// Validate username format to prevent injection attacks
-	if err := validateUsername(selectedUsername); err != nil {
-		return nil, fmt.Errorf("invalid user")
-	}
+
 	user := r.Context().Value(CtxUser).(*db.User)
 	if !user.IsAdmin && user.Name != selectedUsername {
-		// Use generic error to prevent username enumeration
-		return nil, fmt.Errorf("invalid user")
+		return nil, fmt.Errorf("permission denied")
 	}
 	selectedUser := c.dbc.GetUserByName(selectedUsername)
 	if selectedUser == nil {
-		// Use generic error to prevent username enumeration
-		return nil, fmt.Errorf("invalid user")
+		return nil, fmt.Errorf("user not found")
 	}
 	return selectedUser, nil
 }
