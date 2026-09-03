@@ -36,6 +36,11 @@ func (p *Provider) Name() string {
 	return "YouTube Music"
 }
 
+func sanitizeFilename(s string) string {
+	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	return replacer.Replace(s)
+}
+
 func (p *Provider) trackToSpec(t *YTTrack) *spec.TrackChild {
 	if t == nil {
 		return nil
@@ -59,6 +64,10 @@ func (p *Provider) trackToSpec(t *YTTrack) *spec.TrackChild {
 	bitrate := 160
 	estSize := t.Duration * (bitrate * 1000 / 8)
 
+	safeArtist := sanitizeFilename(artistName)
+	safeTitle := sanitizeFilename(t.Title)
+	path := fmt.Sprintf("audio/%s/%s - %s.flac", safeArtist, safeArtist, safeTitle)
+
 	return &spec.TrackChild{
 		ID:          trackID,
 		Title:       t.Title,
@@ -76,6 +85,7 @@ func (p *Provider) trackToSpec(t *YTTrack) *spec.TrackChild {
 		Year:        t.Year,
 		IsDir:       false,
 		Type:        "music",
+		Path:        path,
 	}
 }
 

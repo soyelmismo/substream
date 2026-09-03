@@ -33,6 +33,11 @@ func (p *Provider) Name() string {
 	return "Amazon Music"
 }
 
+func sanitizeFilename(s string) string {
+	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	return replacer.Replace(s)
+}
+
 func (p *Provider) trackToSpec(t *AmazonTrack) *spec.TrackChild {
 	if t == nil {
 		return nil
@@ -41,6 +46,10 @@ func (p *Provider) trackToSpec(t *AmazonTrack) *spec.TrackChild {
 	albumID := &specid.ID{URI: fmt.Sprintf("am:al:%s", t.AlbumASIN)}
 	artistID := &specid.ID{URI: fmt.Sprintf("am:ar:%s", t.ArtistASIN)}
 	coverID := &specid.ID{URI: fmt.Sprintf("am:al:%s", t.AlbumASIN)}
+
+	safeArtist := sanitizeFilename(t.Artist)
+	safeTitle := sanitizeFilename(t.Title)
+	path := fmt.Sprintf("audio/%s/%02d. %s - %s.flac", safeArtist, t.TrackNumber, safeArtist, safeTitle)
 
 	return &spec.TrackChild{
 		ID:          trackID,
@@ -59,6 +68,7 @@ func (p *Provider) trackToSpec(t *AmazonTrack) *spec.TrackChild {
 		Size:        t.Duration * 176400,
 		IsDir:       false,
 		Type:        "music",
+		Path:        path,
 	}
 }
 

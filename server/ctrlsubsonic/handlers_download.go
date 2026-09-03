@@ -198,12 +198,42 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 	} else if prep.Ext != "" {
 		ext = prep.Ext
 	}
+
+	var meta *tagger.Metadata
 	if prep.Track != nil {
+		meta = c.buildTaggerMetadata(r.Context(), prep.Track)
 		if prep.Track.Artist.Name != "" {
 			cleanArtist = prep.Track.Artist.Name
 		}
 		if prep.Track.Title != "" {
 			cleanTitle = prep.Track.Title
+		}
+	}
+
+	prov := c.getProvider(id.Provider())
+	if prov != nil {
+		if tc, err := prov.GetTrack(r.Context(), id.RawID()); err == nil && tc != nil {
+			if tc.Artist != "" {
+				cleanArtist = tc.Artist
+			}
+			if tc.Title != "" {
+				cleanTitle = tc.Title
+			}
+			if meta == nil {
+				coverURL := ""
+				if tc.CoverID != nil {
+					coverURL = fmt.Sprintf("https://%s/rest/getCoverArt?id=%s", r.Host, tc.CoverID.String())
+				}
+				meta = &tagger.Metadata{
+					Title:       tc.Title,
+					Artist:      tc.Artist,
+					Album:       tc.Album,
+					AlbumArtist: tc.Artist,
+					TrackNumber: tc.TrackNumber,
+					DiscNumber:  tc.DiscNumber,
+					CoverURL:    coverURL,
+				}
+			}
 		}
 	}
 
@@ -221,10 +251,7 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 
 	log.Printf("[DOWNLOAD] Starting single track download: id=%s artist=%q title=%q quality=%s", id.String(), cleanArtist, cleanTitle, prep.Quality)
 
-	meta := c.buildTaggerMetadata(r.Context(), prep.Track)
-
 	// Delegate to provider if it implements MediaDownloader (e.g. Tidal, YouTube Music)
-	prov := c.getProvider(id.Provider())
 	if prov != nil {
 		if dl, ok := prov.(provider.MediaDownloader); ok {
 			req := provider.DownloadRequest{
