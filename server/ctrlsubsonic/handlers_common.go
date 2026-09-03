@@ -10,6 +10,7 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
+	"go.senan.xyz/gonic/tidalproxy"
 )
 
 func (c *Controller) ServePing(_ *http.Request) *spec.Response {
@@ -96,14 +97,31 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 
 	log.Printf("[SCROBBLE] track=%s user=%s submission=%s isSubmission=%v", uri, user.Name, submissionStr, isSubmission)
 
-	if isSubmission {
-		// Auto-ingest: Record track metadata for virtual library (same as ServeStream)
-		track, _ := c.proxy.GetTrackInfo(r.Context(), trackID)
-		if track != nil {
-			albumURI := fmt.Sprintf("td:al:%d", track.Album.ID)
-			artistURI := fmt.Sprintf("td:ar:%d", track.Artist.ID)
+	var track *tidalproxy.TidalTrack
+	if id.Provider() == "td" || id.Provider() == "" {
+		track, _ = c.proxy.GetTrackInfo(r.Context(), trackID)
+	}
 
-			// Insert or update track_metadata
+	if isSubmission {
+		// Auto-ingest: Record track metadata for virtual library
+		var albumURI, artistURI string
+		if track != nil {
+			albumURI = fmt.Sprintf("td:al:%d", track.Album.ID)
+			artistURI = fmt.Sprintf("td:ar:%d", track.Artist.ID)
+		} else if c.providers != nil {
+			if prov, err := c.providers.Get(id.Provider()); err == nil && prov != nil {
+				if t, err := prov.GetTrack(r.Context(), id.RawID()); err == nil && t != nil {
+					if t.AlbumID != nil {
+						albumURI = t.AlbumID.String()
+					}
+					if t.ArtistID != nil {
+						artistURI = t.ArtistID.String()
+					}
+				}
+			}
+		}
+
+		if albumURI != "" || artistURI != "" {
 			c.dbc.Exec(`
 				INSERT OR REPLACE INTO track_metadata (uri, album_uri, artist_uri, updated_at)
 				VALUES (?, ?, ?, ?)
@@ -147,8 +165,7 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 	}
 
 	// fetch track info for scrobbling (fire and forget if fails)
-	track, err := c.proxy.GetTrackInfo(r.Context(), trackID)
-	if err == nil && track != nil {
+	if track != nil {
 		for _, s := range c.scrobblers {
 			if s.IsUserAuthenticated(*user) {
 				_ = s.Scrobble(*user, scrobbleTrackFromTidal(track), time.Now(), isSubmission)

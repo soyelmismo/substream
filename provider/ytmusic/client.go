@@ -19,6 +19,7 @@ import (
 const (
 	innertubeSearchURL = "https://music.youtube.com/youtubei/v1/search?alt=json"
 	innertubePlayerURL = "https://music.youtube.com/youtubei/v1/player?alt=json"
+	innertubeNextURL   = "https://music.youtube.com/youtubei/v1/next?alt=json"
 	songsFilterParam   = "Eg-KAQwIABAAGAAgACgB" // Strict Songs filter in YouTube Music
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -56,6 +57,8 @@ type Client struct {
 
 	streamCache   map[string]cachedStream
 	streamCacheMu sync.RWMutex
+
+	trackCache sync.Map // videoID -> *YTTrack
 
 	// In-flight request de-duplication
 	inFlightMu sync.Mutex
@@ -344,12 +347,190 @@ func parseTimeString(s string) int {
 	return 0
 }
 
-// GetTrack fetches track metadata by video ID
+// GetCachedTrack returns cached track metadata if available
+func (c *Client) GetCachedTrack(videoID string) (*YTTrack, bool) {
+	if val, ok := c.trackCache.Load(videoID); ok {
+		return val.(*YTTrack), true
+	}
+	return nil, false
+}
+
+// GetTrack fetches track metadata by video ID, enriching with album, artist, and year
 func (c *Client) GetTrack(ctx context.Context, videoID string) (*YTTrack, error) {
 	if videoID == "" {
 		return nil, fmt.Errorf("empty videoId")
 	}
 
+	if val, ok := c.trackCache.Load(videoID); ok {
+		return val.(*YTTrack), nil
+	}
+
+	// 1. Try next endpoint for rich metadata (artist, album, year, duration, cover)
+	track := c.fetchTrackViaNext(ctx, videoID)
+	if track != nil && track.Title != "" {
+		c.trackCache.Store(videoID, track)
+		return track, nil
+	}
+
+	// 2. Fallback to player endpoint
+	track, err := c.fetchTrackViaPlayer(ctx, videoID)
+	if err == nil && track != nil {
+		c.trackCache.Store(videoID, track)
+		return track, nil
+	}
+
+	return nil, err
+}
+
+func extractRuns(obj map[string]interface{}) string {
+	if obj == nil {
+		return ""
+	}
+	runs, ok := obj["runs"].([]interface{})
+	if !ok {
+		return ""
+	}
+	var sb strings.Builder
+	for _, r := range runs {
+		if rMap, ok := r.(map[string]interface{}); ok {
+			if txt, ok := rMap["text"].(string); ok {
+				sb.WriteString(txt)
+			}
+		}
+	}
+	return sb.String()
+}
+
+func (c *Client) fetchTrackViaNext(ctx context.Context, videoID string) *YTTrack {
+	bodyData := map[string]interface{}{
+		"context": c.buildContextPayload(),
+		"videoId": videoID,
+	}
+	bodyBytes, err := json.Marshal(bodyData)
+	if err != nil {
+		return nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, innertubeNextURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var parsed map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil
+	}
+
+	contents, _ := parsed["contents"].(map[string]interface{})
+	singleCol, _ := contents["singleColumnMusicWatchNextResultsRenderer"].(map[string]interface{})
+	tabbed, _ := singleCol["tabbedRenderer"].(map[string]interface{})
+	watchNextTabbed, _ := tabbed["watchNextTabbedResultsRenderer"].(map[string]interface{})
+	tabs, _ := watchNextTabbed["tabs"].([]interface{})
+	if len(tabs) == 0 {
+		return nil
+	}
+
+	tab0, _ := tabs[0].(map[string]interface{})
+	tabRenderer, _ := tab0["tabRenderer"].(map[string]interface{})
+	tabContent, _ := tabRenderer["content"].(map[string]interface{})
+	musicQueue, _ := tabContent["musicQueueRenderer"].(map[string]interface{})
+	queueContent, _ := musicQueue["content"].(map[string]interface{})
+	playlistPanel, _ := queueContent["playlistPanelRenderer"].(map[string]interface{})
+	panelContents, _ := playlistPanel["contents"].([]interface{})
+	if len(panelContents) == 0 {
+		return nil
+	}
+
+	first, _ := panelContents[0].(map[string]interface{})
+	renderer, _ := first["playlistPanelVideoRenderer"].(map[string]interface{})
+	if renderer == nil {
+		return nil
+	}
+
+	titleObj, _ := renderer["title"].(map[string]interface{})
+	title := extractRuns(titleObj)
+
+	bylineObj, _ := renderer["longBylineText"].(map[string]interface{})
+	bylineRuns, _ := bylineObj["runs"].([]interface{})
+	var bylineTexts []string
+	for _, r := range bylineRuns {
+		if rMap, ok := r.(map[string]interface{}); ok {
+			if txt, ok := rMap["text"].(string); ok && txt != " • " && strings.TrimSpace(txt) != "" {
+				bylineTexts = append(bylineTexts, txt)
+			}
+		}
+	}
+
+	isStatsText := func(s string) bool {
+		lower := strings.ToLower(s)
+		return strings.Contains(lower, "view") ||
+			strings.Contains(lower, "visualiz") ||
+			strings.Contains(lower, "reprod") ||
+			strings.Contains(lower, "like") ||
+			strings.Contains(lower, "vue") ||
+			strings.Contains(lower, "aufruf") ||
+			strings.Contains(lower, "suscriptor") ||
+			strings.Contains(lower, "subscriber")
+	}
+
+	artist := ""
+	album := ""
+	year := 0
+	if len(bylineTexts) > 0 {
+		artist = bylineTexts[0]
+	}
+	if len(bylineTexts) > 1 && !isStatsText(bylineTexts[1]) {
+		album = bylineTexts[1]
+	}
+	if len(bylineTexts) > 2 && !isStatsText(bylineTexts[2]) {
+		y, _ := strconv.Atoi(bylineTexts[2])
+		year = y
+	}
+
+	// Thumbnails
+	bestThumb := ""
+	if thumbObj, ok := renderer["thumbnail"].(map[string]interface{}); ok {
+		if thumbs, ok := thumbObj["thumbnails"].([]interface{}); ok && len(thumbs) > 0 {
+			if last, ok := thumbs[len(thumbs)-1].(map[string]interface{}); ok {
+				if u, ok := last["url"].(string); ok {
+					bestThumb = u
+				}
+			}
+		}
+	}
+
+	// Duration
+	duration := 0
+	if lenObj, ok := renderer["lengthText"].(map[string]interface{}); ok {
+		if durStr := extractRuns(lenObj); durStr != "" {
+			duration = parseTimeString(durStr)
+		}
+	}
+
+	if title == "" {
+		return nil
+	}
+
+	return &YTTrack{
+		VideoID:   videoID,
+		Title:     title,
+		Artist:    artist,
+		Album:     album,
+		Year:      year,
+		Duration:  duration,
+		Thumbnail: bestThumb,
+	}
+}
+
+func (c *Client) fetchTrackViaPlayer(ctx context.Context, videoID string) (*YTTrack, error) {
 	bodyData := map[string]interface{}{
 		"context": c.buildContextPayload(),
 		"videoId": videoID,

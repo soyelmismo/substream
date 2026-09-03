@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -72,6 +73,7 @@ func (p *Provider) trackToSpec(t *YTTrack) *spec.TrackChild {
 		ContentType: "audio/webm",
 		Suffix:      "webm",
 		Size:        estSize,
+		Year:        t.Year,
 		IsDir:       false,
 		Type:        "music",
 	}
@@ -87,12 +89,21 @@ func (p *Provider) GetTrack(ctx context.Context, rawID string) (*spec.TrackChild
 
 func (p *Provider) GetTracksBatch(ctx context.Context, rawIDs []string) []*spec.TrackChild {
 	res := make([]*spec.TrackChild, len(rawIDs))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 6)
 	for i, raw := range rawIDs {
-		t, err := p.GetTrack(ctx, raw)
-		if err == nil {
-			res[i] = t
-		}
+		wg.Add(1)
+		go func(idx int, rID string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			t, err := p.GetTrack(ctx, rID)
+			if err == nil {
+				res[idx] = t
+			}
+		}(i, raw)
 	}
+	wg.Wait()
 	return res
 }
 
@@ -156,10 +167,19 @@ func (p *Provider) GetCoverURL(coverID string, size int) string {
 	if strings.HasPrefix(coverID, "http") {
 		return coverID
 	}
-	// If it's a video ID, return YouTube max resolution or high resolution thumbnail
 	rawID := coverID
 	if strings.HasPrefix(rawID, "yt:tr:") {
 		rawID = strings.TrimPrefix(rawID, "yt:tr:")
+	} else if strings.HasPrefix(rawID, "yt:al:") {
+		rawID = strings.TrimPrefix(rawID, "yt:al:")
+	} else if strings.HasPrefix(rawID, "yt:ar:") {
+		rawID = strings.TrimPrefix(rawID, "yt:ar:")
+	}
+
+	if p.client != nil {
+		if t, ok := p.client.GetCachedTrack(rawID); ok && t.Thumbnail != "" {
+			return t.Thumbnail
+		}
 	}
 	return fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", rawID)
 }

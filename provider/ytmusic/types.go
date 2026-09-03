@@ -8,6 +8,7 @@ type YTTrack struct {
 	ArtistID  string `json:"artistId"`
 	Album     string `json:"album"`
 	AlbumID   string `json:"albumId"`
+	Year      int    `json:"year"`
 	Duration  int    `json:"duration"` // in seconds
 	Thumbnail string `json:"thumbnail"`
 }

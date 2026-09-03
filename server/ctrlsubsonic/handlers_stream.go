@@ -573,7 +573,15 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		}
 	}
 
-	cacheKey := fmt.Sprintf("%s-%d-%d", id.Type(), id.Value(), size)
+	var cacheKey, negKey string
+	if id.Provider() == "td" || id.Provider() == "" {
+		cacheKey = fmt.Sprintf("%s-%d-%d", id.Type(), id.Value(), size)
+		negKey = fmt.Sprintf("neg-%s-%d", id.Type(), id.Value())
+	} else {
+		safeRaw := strings.ReplaceAll(id.RawID(), "/", "_")
+		cacheKey = fmt.Sprintf("%s-%s-%s-%d", id.Provider(), id.Type(), safeRaw, size)
+		negKey = fmt.Sprintf("neg-%s-%s-%s", id.Provider(), id.Type(), safeRaw)
+	}
 	cachePath := filepath.Join(c.cachePath, cacheKey+".jpg")
 
 	// check disk cache first (fast path)
@@ -585,10 +593,9 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 	}
 
 	// negative cache: avoid re-fetching covers we know are missing
-	negKey := fmt.Sprintf("neg-%s-%d", id.Type(), id.Value())
 	if c.negCoverCache.Get(negKey) {
 		w.Header().Set("Content-Type", "image/gif")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Cache-Control", "no-cache, no-store")
 		w.Write(transparentPixel)
 		return nil
 	}
@@ -616,7 +623,7 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 		} else {
 			lp.mu.Unlock()
 			w.Header().Set("Content-Type", "image/gif")
-			w.Header().Set("Cache-Control", "public, max-age=3600")
+			w.Header().Set("Cache-Control", "no-cache, no-store")
 			w.Write(transparentPixel)
 		}
 		return nil
@@ -643,7 +650,7 @@ func (c *Controller) ServeGetCoverArt(w http.ResponseWriter, r *http.Request) *s
 
 	if err != nil {
 		w.Header().Set("Content-Type", "image/gif")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Cache-Control", "no-cache, no-store")
 		w.Write(transparentPixel)
 		return nil
 	}
@@ -661,16 +668,37 @@ func (c *Controller) fetchAndCacheCover(ctx context.Context, id *specid.ID, size
 
 	switch id.Type() {
 	case specid.Album:
-		coverUUID = c.proxy.GetCoverUUIDForAlbum(ctx, id.Value())
+		if id.Provider() == "td" || id.Provider() == "" {
+			coverUUID = c.proxy.GetCoverUUIDForAlbum(ctx, id.Value())
+		} else if c.providers != nil {
+			prov, err := c.providers.Get(id.Provider())
+			if err == nil && prov != nil {
+				coverURL = prov.GetCoverURL(id.RawID(), size)
+			}
+		}
 	case specid.Artist:
-		info, err := c.proxy.GetArtistInfo(ctx, id.Value())
-		if err == nil {
-			coverUUID = info.Artist.Picture
+		if id.Provider() == "td" || id.Provider() == "" {
+			info, err := c.proxy.GetArtistInfo(ctx, id.Value())
+			if err == nil {
+				coverUUID = info.Artist.Picture
+			}
+		} else if c.providers != nil {
+			prov, err := c.providers.Get(id.Provider())
+			if err == nil && prov != nil {
+				coverURL = prov.GetCoverURL(id.RawID(), size)
+			}
 		}
 	case specid.Track:
-		track, err := c.proxy.GetTrackInfo(ctx, id.Value())
-		if err == nil {
-			coverUUID = track.Album.Cover
+		if id.Provider() == "td" || id.Provider() == "" {
+			track, err := c.proxy.GetTrackInfo(ctx, id.Value())
+			if err == nil {
+				coverUUID = track.Album.Cover
+			}
+		} else if c.providers != nil {
+			prov, err := c.providers.Get(id.Provider())
+			if err == nil && prov != nil {
+				coverURL = prov.GetCoverURL(id.RawID(), size)
+			}
 		}
 	case specid.Playlist:
 		// Fetch playlist cover from DB
