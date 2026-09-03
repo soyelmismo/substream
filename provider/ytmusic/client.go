@@ -20,6 +20,7 @@ const (
 	innertubeSearchURL = "https://music.youtube.com/youtubei/v1/search?alt=json"
 	innertubePlayerURL = "https://music.youtube.com/youtubei/v1/player?alt=json"
 	innertubeNextURL   = "https://music.youtube.com/youtubei/v1/next?alt=json"
+	innertubeBrowseURL = "https://music.youtube.com/youtubei/v1/browse?alt=json"
 	songsFilterParam   = "Eg-KAQwIABAAGAAgACgB" // Strict Songs filter in YouTube Music
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -58,7 +59,9 @@ type Client struct {
 	streamCache   map[string]cachedStream
 	streamCacheMu sync.RWMutex
 
-	trackCache sync.Map // videoID -> *YTTrack
+	trackCache  sync.Map // videoID -> *YTTrack
+	albumCache  sync.Map // browseID -> *YTAlbum
+	artistCache sync.Map // artistID -> *YTArtistDetail
 
 	// In-flight request de-duplication
 	inFlightMu sync.Mutex
@@ -282,6 +285,7 @@ func (c *Client) parseFlexItem(flex map[string]interface{}) *YTTrack {
 	artist := ""
 	artistID := ""
 	album := ""
+	albumID := ""
 	duration := 0
 
 	for _, r := range runs1 {
@@ -296,9 +300,10 @@ func (c *Client) parseFlexItem(flex map[string]interface{}) *YTTrack {
 				artist = t
 				artistID = browseID
 			}
-		} else if strings.HasPrefix(browseID, "MPRE") || strings.HasPrefix(browseID, "FEmusic_library_privately_owned_release") {
+		} else if strings.HasPrefix(browseID, "MPRE") || strings.HasPrefix(browseID, "OLAK") || strings.HasPrefix(browseID, "FEmusic_library_privately_owned_release") {
 			if album == "" {
 				album = t
+				albumID = browseID
 			}
 		} else if strings.Contains(t, ":") {
 			duration = parseTimeString(t)
@@ -327,6 +332,7 @@ func (c *Client) parseFlexItem(flex map[string]interface{}) *YTTrack {
 		Artist:    artist,
 		ArtistID:  artistID,
 		Album:     album,
+		AlbumID:   albumID,
 		Duration:  duration,
 		Thumbnail: bestThumb,
 	}
@@ -482,15 +488,51 @@ func (c *Client) fetchTrackViaNext(ctx context.Context, videoID string) *YTTrack
 	}
 
 	artist := ""
+	artistID := ""
 	album := ""
+	albumID := ""
 	year := 0
-	if len(bylineTexts) > 0 {
+
+	for _, r := range bylineRuns {
+		if rMap, ok := r.(map[string]interface{}); ok {
+			txt, _ := rMap["text"].(string)
+			txt = strings.TrimSpace(txt)
+			if txt == "" || txt == "•" {
+				continue
+			}
+			nav, _ := rMap["navigationEndpoint"].(map[string]interface{})
+			browse, _ := nav["browseEndpoint"].(map[string]interface{})
+			browseID, _ := browse["browseId"].(string)
+			pageConfig, _ := browse["browseEndpointContextSupportedConfigs"].(map[string]interface{})
+			musicConfig, _ := pageConfig["browseEndpointContextMusicConfig"].(map[string]interface{})
+			pageType, _ := musicConfig["pageType"].(string)
+
+			if pageType == "MUSIC_PAGE_TYPE_ARTIST" || strings.HasPrefix(browseID, "UC") {
+				if artist == "" {
+					artist = txt
+					artistID = browseID
+				}
+			} else if pageType == "MUSIC_PAGE_TYPE_ALBUM" || strings.HasPrefix(browseID, "MPRE") || strings.HasPrefix(browseID, "OLAK") {
+				if album == "" {
+					album = txt
+					albumID = browseID
+				}
+			} else if len(txt) == 4 {
+				if y, err := strconv.Atoi(txt); err == nil && y > 1900 && y < 2100 {
+					year = y
+				}
+			}
+		}
+	}
+
+	// Fallback to bylineTexts if not resolved via navigation endpoints
+	if artist == "" && len(bylineTexts) > 0 {
 		artist = bylineTexts[0]
 	}
-	if len(bylineTexts) > 1 && !isStatsText(bylineTexts[1]) {
+	if album == "" && len(bylineTexts) > 1 && !isStatsText(bylineTexts[1]) {
 		album = bylineTexts[1]
 	}
-	if len(bylineTexts) > 2 && !isStatsText(bylineTexts[2]) {
+	if year == 0 && len(bylineTexts) > 2 && !isStatsText(bylineTexts[2]) {
 		y, _ := strconv.Atoi(bylineTexts[2])
 		year = y
 	}
@@ -523,7 +565,9 @@ func (c *Client) fetchTrackViaNext(ctx context.Context, videoID string) *YTTrack
 		VideoID:   videoID,
 		Title:     title,
 		Artist:    artist,
+		ArtistID:  artistID,
 		Album:     album,
+		AlbumID:   albumID,
 		Year:      year,
 		Duration:  duration,
 		Thumbnail: bestThumb,
@@ -792,3 +836,761 @@ func (c *Client) GetStreamURL(ctx context.Context, videoID string) (string, erro
 
 	return streamURL, nil
 }
+
+// GetCachedAlbum returns cached album metadata if available
+func (c *Client) GetCachedAlbum(browseID string) (*YTAlbum, bool) {
+	if val, ok := c.albumCache.Load(browseID); ok {
+		return val.(*YTAlbum), true
+	}
+	return nil, false
+}
+
+// GetAlbum fetches album metadata and its tracks from YouTube Music via InnerTube browse endpoint
+func (c *Client) GetAlbum(ctx context.Context, browseID string) (*YTAlbum, []*YTTrack, error) {
+	if browseID == "" {
+		return nil, nil, fmt.Errorf("empty browseId")
+	}
+
+	bodyData := map[string]interface{}{
+		"context":  c.buildContextPayload(),
+		"browseId": browseID,
+	}
+	bodyBytes, err := json.Marshal(bodyData)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal album payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, innertubeBrowseURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build album request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Origin", "https://music.youtube.com")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("execute album browse: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, nil, fmt.Errorf("innertube browse returned %d: %s", resp.StatusCode, string(b))
+	}
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, nil, fmt.Errorf("decode album response: %w", err)
+	}
+
+	album := &YTAlbum{ID: browseID}
+	var tracks []*YTTrack
+
+	// 1. Find musicResponsiveHeaderRenderer for album header
+	var findHeader func(v interface{}) map[string]interface{}
+	findHeader = func(v interface{}) map[string]interface{} {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			if arr, ok := v.([]interface{}); ok {
+				for _, item := range arr {
+					if res := findHeader(item); res != nil {
+						return res
+					}
+				}
+			}
+			return nil
+		}
+		if h, ok := m["musicResponsiveHeaderRenderer"].(map[string]interface{}); ok {
+			return h
+		}
+		for _, val := range m {
+			if res := findHeader(val); res != nil {
+				return res
+			}
+		}
+		return nil
+	}
+
+	if header := findHeader(data); header != nil {
+		if tObj, _ := header["title"].(map[string]interface{}); tObj != nil {
+			if runs, _ := tObj["runs"].([]interface{}); len(runs) > 0 {
+				if r0, _ := runs[0].(map[string]interface{}); r0 != nil {
+					album.Title, _ = r0["text"].(string)
+				}
+			}
+		}
+		if strapline, _ := header["straplineTextOne"].(map[string]interface{}); strapline != nil {
+			if runs, _ := strapline["runs"].([]interface{}); len(runs) > 0 {
+				if r0, _ := runs[0].(map[string]interface{}); r0 != nil {
+					album.Artist, _ = r0["text"].(string)
+					if nav, _ := r0["navigationEndpoint"].(map[string]interface{}); nav != nil {
+						if bEnd, _ := nav["browseEndpoint"].(map[string]interface{}); bEnd != nil {
+							album.ArtistID, _ = bEnd["browseId"].(string)
+						}
+					}
+				}
+			}
+		}
+		if sub, _ := header["subtitle"].(map[string]interface{}); sub != nil {
+			if runs, _ := sub["runs"].([]interface{}); len(runs) > 0 {
+				for _, r := range runs {
+					if rm, _ := r.(map[string]interface{}); rm != nil {
+						txt, _ := rm["text"].(string)
+						txt = strings.TrimSpace(txt)
+						if len(txt) == 4 {
+							if y, err := strconv.Atoi(txt); err == nil && y > 1900 && y < 2100 {
+								album.Year = y
+							}
+						}
+					}
+				}
+			}
+		}
+		if thumbObj, _ := header["thumbnail"].(map[string]interface{}); thumbObj != nil {
+			if mThumb, _ := thumbObj["musicThumbnailRenderer"].(map[string]interface{}); mThumb != nil {
+				if thumb, _ := mThumb["thumbnail"].(map[string]interface{}); thumb != nil {
+					if thumbs, _ := thumb["thumbnails"].([]interface{}); len(thumbs) > 0 {
+						if last, _ := thumbs[len(thumbs)-1].(map[string]interface{}); last != nil {
+							album.Thumbnail, _ = last["url"].(string)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Find all shelves (musicShelfRenderer or musicPlaylistShelfRenderer)
+	var findShelves func(v interface{}) []map[string]interface{}
+	findShelves = func(v interface{}) []map[string]interface{} {
+		var res []map[string]interface{}
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			if arr, ok := v.([]interface{}); ok {
+				for _, item := range arr {
+					res = append(res, findShelves(item)...)
+				}
+			}
+			return res
+		}
+		if shelf, ok := m["musicShelfRenderer"].(map[string]interface{}); ok {
+			res = append(res, shelf)
+		}
+		if playlistShelf, ok := m["musicPlaylistShelfRenderer"].(map[string]interface{}); ok {
+			res = append(res, playlistShelf)
+		}
+		for _, val := range m {
+			res = append(res, findShelves(val)...)
+		}
+		return res
+	}
+
+	shelves := findShelves(data)
+	trackIdx := 1
+	for _, shelf := range shelves {
+		contents, _ := shelf["contents"].([]interface{})
+		for _, item := range contents {
+			itmMap, _ := item.(map[string]interface{})
+			flex, ok := itmMap["musicResponsiveListItemRenderer"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// VideoID
+			videoID := ""
+			if plItem, ok := flex["playlistItemData"].(map[string]interface{}); ok {
+				videoID, _ = plItem["videoId"].(string)
+			}
+			if videoID == "" {
+				if overlay, _ := flex["overlay"].(map[string]interface{}); overlay != nil {
+					if thumbOverlay, _ := overlay["musicItemThumbnailOverlayRenderer"].(map[string]interface{}); thumbOverlay != nil {
+						if content, _ := thumbOverlay["content"].(map[string]interface{}); content != nil {
+							if btn, _ := content["musicPlayButtonRenderer"].(map[string]interface{}); btn != nil {
+								if playNav, _ := btn["playNavigationEndpoint"].(map[string]interface{}); playNav != nil {
+									if watch, _ := playNav["watchEndpoint"].(map[string]interface{}); watch != nil {
+										videoID, _ = watch["videoId"].(string)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Title
+			title := ""
+			flexCols, _ := flex["flexColumns"].([]interface{})
+			if len(flexCols) > 0 {
+				if col0, _ := flexCols[0].(map[string]interface{}); col0 != nil {
+					if rend0, _ := col0["musicResponsiveListItemFlexColumnRenderer"].(map[string]interface{}); rend0 != nil {
+						if text0, _ := rend0["text"].(map[string]interface{}); text0 != nil {
+							if runs0, _ := text0["runs"].([]interface{}); len(runs0) > 0 {
+								if r0, _ := runs0[0].(map[string]interface{}); r0 != nil {
+									title, _ = r0["text"].(string)
+								}
+							}
+						}
+					}
+				}
+			}
+
+			if title == "" || videoID == "" {
+				continue
+			}
+
+			// Track index / number
+			trNum := trackIdx
+			if idxObj, _ := flex["index"].(map[string]interface{}); idxObj != nil {
+				if runs, _ := idxObj["runs"].([]interface{}); len(runs) > 0 {
+					if r0, _ := runs[0].(map[string]interface{}); r0 != nil {
+						if numStr, _ := r0["text"].(string); numStr != "" {
+							if n, err := strconv.Atoi(numStr); err == nil && n > 0 {
+								trNum = n
+							}
+						}
+					}
+				}
+			}
+
+			// Duration
+			duration := 0
+			fixedCols, _ := flex["fixedColumns"].([]interface{})
+			if len(fixedCols) > 0 {
+				if col0, _ := fixedCols[0].(map[string]interface{}); col0 != nil {
+					if rend0, _ := col0["musicResponsiveListItemFixedColumnRenderer"].(map[string]interface{}); rend0 != nil {
+						if text0, _ := rend0["text"].(map[string]interface{}); text0 != nil {
+							if runs0, _ := text0["runs"].([]interface{}); len(runs0) > 0 {
+								if r0, _ := runs0[0].(map[string]interface{}); r0 != nil {
+									if durStr, _ := r0["text"].(string); durStr != "" {
+										duration = parseTimeString(durStr)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Artist if different or present in flexCols[1]
+			trackArtist := album.Artist
+			trackArtistID := album.ArtistID
+			if len(flexCols) > 1 {
+				if col1, _ := flexCols[1].(map[string]interface{}); col1 != nil {
+					if rend1, _ := col1["musicResponsiveListItemFlexColumnRenderer"].(map[string]interface{}); rend1 != nil {
+						if text1, _ := rend1["text"].(map[string]interface{}); text1 != nil {
+							if runs1, _ := text1["runs"].([]interface{}); len(runs1) > 0 {
+								for _, r := range runs1 {
+									if rm, _ := r.(map[string]interface{}); rm != nil {
+										txt, _ := rm["text"].(string)
+										txt = strings.TrimSpace(txt)
+										if txt != "" && txt != "•" {
+											if nav, _ := rm["navigationEndpoint"].(map[string]interface{}); nav != nil {
+												if bEnd, _ := nav["browseEndpoint"].(map[string]interface{}); bEnd != nil {
+													bID, _ := bEnd["browseId"].(string)
+													if strings.HasPrefix(bID, "UC") {
+														trackArtist = txt
+														trackArtistID = bID
+														break
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			track := &YTTrack{
+				VideoID:     videoID,
+				Title:       title,
+				Artist:      trackArtist,
+				ArtistID:    trackArtistID,
+				Album:       album.Title,
+				AlbumID:     album.ID,
+				Year:        album.Year,
+				Duration:    duration,
+				Thumbnail:   album.Thumbnail,
+				TrackNumber: trNum,
+			}
+
+			// Cache track for instant lookup
+			c.trackCache.Store(videoID, track)
+
+			tracks = append(tracks, track)
+			trackIdx++
+		}
+	}
+
+	if album.Title != "" {
+		c.albumCache.Store(browseID, album)
+	}
+
+	return album, tracks, nil
+}
+
+// GetCachedArtist returns cached artist metadata if available
+func (c *Client) GetCachedArtist(artistID string) (*YTArtist, bool) {
+	if val, ok := c.artistCache.Load(artistID); ok {
+		detail := val.(*YTArtistDetail)
+		if detail != nil && detail.Artist != nil {
+			return detail.Artist, true
+		}
+	}
+	return nil, false
+}
+
+// ResolveArtistID resolves an artist name or query to a YouTube Music channel ID (e.g. UC...)
+func (c *Client) ResolveArtistID(ctx context.Context, nameOrID string) (string, error) {
+	if strings.HasPrefix(nameOrID, "UC") || strings.HasPrefix(nameOrID, "FEmusic") {
+		return nameOrID, nil
+	}
+	if strings.TrimSpace(nameOrID) == "" {
+		return "", fmt.Errorf("empty artist query")
+	}
+
+	bodyData := map[string]interface{}{
+		"context": c.buildContextPayload(),
+		"query":   nameOrID,
+	}
+	bodyBytes, err := json.Marshal(bodyData)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, innertubeSearchURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Origin", "https://music.youtube.com")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+
+	var findArtistBrowseID func(v interface{}) string
+	findArtistBrowseID = func(v interface{}) string {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			if arr, ok := v.([]interface{}); ok {
+				for _, item := range arr {
+					if id := findArtistBrowseID(item); id != "" {
+						return id
+					}
+				}
+			}
+			return ""
+		}
+		if bEnd, ok := m["browseEndpoint"].(map[string]interface{}); ok {
+			if bID, ok := bEnd["browseId"].(string); ok && strings.HasPrefix(bID, "UC") {
+				if cfg, ok := bEnd["browseEndpointContextSupportedConfigs"].(map[string]interface{}); ok {
+					if mCfg, ok := cfg["browseEndpointContextMusicConfig"].(map[string]interface{}); ok {
+						if pType, ok := mCfg["pageType"].(string); ok && pType == "MUSIC_PAGE_TYPE_ARTIST" {
+							return bID
+						}
+					}
+				}
+			}
+		}
+		for _, val := range m {
+			if id := findArtistBrowseID(val); id != "" {
+				return id
+			}
+		}
+		return ""
+	}
+
+	if id := findArtistBrowseID(data); id != "" {
+		return id, nil
+	}
+	return "", fmt.Errorf("artist ID not found for query %q", nameOrID)
+}
+
+// GetArtist fetches full artist details including discography, top songs, and similar artists
+func (c *Client) GetArtist(ctx context.Context, nameOrID string) (*YTArtistDetail, error) {
+	if strings.TrimSpace(nameOrID) == "" {
+		return nil, fmt.Errorf("empty artist ID")
+	}
+
+	artistID := nameOrID
+	if !strings.HasPrefix(artistID, "UC") && !strings.HasPrefix(artistID, "FEmusic") {
+		if resolved, err := c.ResolveArtistID(ctx, nameOrID); err == nil && resolved != "" {
+			artistID = resolved
+		}
+	}
+
+	// Fast path: check in-memory cache
+	if val, ok := c.artistCache.Load(artistID); ok {
+		return val.(*YTArtistDetail), nil
+	}
+	if val, ok := c.artistCache.Load(nameOrID); ok {
+		return val.(*YTArtistDetail), nil
+	}
+
+	bodyData := map[string]interface{}{
+		"context":  c.buildContextPayload(),
+		"browseId": artistID,
+	}
+	bodyBytes, err := json.Marshal(bodyData)
+	if err != nil {
+		return nil, fmt.Errorf("marshal artist payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, innertubeBrowseURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("build artist request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Origin", "https://music.youtube.com")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute artist browse: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("innertube artist browse returned %d: %s", resp.StatusCode, string(b))
+	}
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("decode artist response: %w", err)
+	}
+
+	detail := &YTArtistDetail{
+		Artist: &YTArtist{ID: artistID},
+	}
+
+	// 1. Parse artist header
+	var findHeader func(v interface{}) map[string]interface{}
+	findHeader = func(v interface{}) map[string]interface{} {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			if arr, ok := v.([]interface{}); ok {
+				for _, item := range arr {
+					if res := findHeader(item); res != nil {
+						return res
+					}
+				}
+			}
+			return nil
+		}
+		if h, ok := m["musicImmersiveHeaderRenderer"].(map[string]interface{}); ok {
+			return h
+		}
+		if h, ok := m["musicVisualHeaderRenderer"].(map[string]interface{}); ok {
+			return h
+		}
+		if h, ok := m["musicHeaderRenderer"].(map[string]interface{}); ok {
+			return h
+		}
+		for _, val := range m {
+			if res := findHeader(val); res != nil {
+				return res
+			}
+		}
+		return nil
+	}
+
+	if header := findHeader(data); header != nil {
+		if tObj, _ := header["title"].(map[string]interface{}); tObj != nil {
+			if runs, _ := tObj["runs"].([]interface{}); len(runs) > 0 {
+				if r0, _ := runs[0].(map[string]interface{}); r0 != nil {
+					detail.Artist.Name, _ = r0["text"].(string)
+				}
+			}
+		}
+		if descObj, _ := header["description"].(map[string]interface{}); descObj != nil {
+			if runs, _ := descObj["runs"].([]interface{}); len(runs) > 0 {
+				var sb strings.Builder
+				for _, r := range runs {
+					if rm, _ := r.(map[string]interface{}); rm != nil {
+						if txt, _ := rm["text"].(string); txt != "" {
+							sb.WriteString(txt)
+						}
+					}
+				}
+				detail.Artist.Description = sb.String()
+			}
+		}
+		if thumbObj, _ := header["thumbnail"].(map[string]interface{}); thumbObj != nil {
+			if mThumb, _ := thumbObj["musicThumbnailRenderer"].(map[string]interface{}); mThumb != nil {
+				if thumb, _ := mThumb["thumbnail"].(map[string]interface{}); thumb != nil {
+					if thumbs, _ := thumb["thumbnails"].([]interface{}); len(thumbs) > 0 {
+						if last, _ := thumbs[len(thumbs)-1].(map[string]interface{}); last != nil {
+							detail.Artist.Thumbnail, _ = last["url"].(string)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If artist name wasn't in header, fallback to query
+	if detail.Artist.Name == "" {
+		detail.Artist.Name = nameOrID
+	}
+
+	// 2. Scan sections for Top songs, Albums, Singles & EPs, Fans might also like
+	contents, _ := data["contents"].(map[string]interface{})
+	singleCol, _ := contents["singleColumnBrowseResultsRenderer"].(map[string]interface{})
+	tabs, _ := singleCol["tabs"].([]interface{})
+	var sectionContents []interface{}
+	if len(tabs) > 0 {
+		tab0, _ := tabs[0].(map[string]interface{})
+		tabRend, _ := tab0["tabRenderer"].(map[string]interface{})
+		tabContent, _ := tabRend["content"].(map[string]interface{})
+		secList, _ := tabContent["sectionListRenderer"].(map[string]interface{})
+		sectionContents, _ = secList["contents"].([]interface{})
+	}
+
+	for _, sec := range sectionContents {
+		secMap, ok := sec.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// A. Check musicShelfRenderer (Top songs)
+		if shelf, ok := secMap["musicShelfRenderer"].(map[string]interface{}); ok {
+			title := ""
+			if tObj, _ := shelf["title"].(map[string]interface{}); tObj != nil {
+				if runs, _ := tObj["runs"].([]interface{}); len(runs) > 0 {
+					if r0, _ := runs[0].(map[string]interface{}); r0 != nil {
+						title, _ = r0["text"].(string)
+					}
+				}
+			}
+			if strings.EqualFold(title, "Top songs") || strings.EqualFold(title, "Songs") {
+				items, _ := shelf["contents"].([]interface{})
+				for trIdx, item := range items {
+					itmMap, _ := item.(map[string]interface{})
+					flex, ok := itmMap["musicResponsiveListItemRenderer"].(map[string]interface{})
+					if !ok {
+						continue
+					}
+					videoID := ""
+					if plItem, _ := flex["playlistItemData"].(map[string]interface{}); plItem != nil {
+						videoID, _ = plItem["videoId"].(string)
+					}
+					songTitle := ""
+					flexCols, _ := flex["flexColumns"].([]interface{})
+					if len(flexCols) > 0 {
+						if col0, _ := flexCols[0].(map[string]interface{}); col0 != nil {
+							if rend0, _ := col0["musicResponsiveListItemFlexColumnRenderer"].(map[string]interface{}); rend0 != nil {
+								if text0, _ := rend0["text"].(map[string]interface{}); text0 != nil {
+									if runs0, _ := text0["runs"].([]interface{}); len(runs0) > 0 {
+										if r0, _ := runs0[0].(map[string]interface{}); r0 != nil {
+											songTitle, _ = r0["text"].(string)
+											if videoID == "" {
+												nav, _ := r0["navigationEndpoint"].(map[string]interface{})
+												watch, _ := nav["watchEndpoint"].(map[string]interface{})
+												videoID, _ = watch["videoId"].(string)
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					albumTitle := ""
+					albumID := ""
+					duration := 0
+					if len(flexCols) > 1 {
+						if col1, _ := flexCols[1].(map[string]interface{}); col1 != nil {
+							if rend1, _ := col1["musicResponsiveListItemFlexColumnRenderer"].(map[string]interface{}); rend1 != nil {
+								if text1, _ := rend1["text"].(map[string]interface{}); text1 != nil {
+									if runs1, _ := text1["runs"].([]interface{}); len(runs1) > 0 {
+										for _, r := range runs1 {
+											if rm, _ := r.(map[string]interface{}); rm != nil {
+												txt, _ := rm["text"].(string)
+												nav, _ := rm["navigationEndpoint"].(map[string]interface{})
+												browse, _ := nav["browseEndpoint"].(map[string]interface{})
+												bID, _ := browse["browseId"].(string)
+												if strings.HasPrefix(bID, "MPRE") || strings.HasPrefix(bID, "OLAK") {
+													albumTitle = txt
+													albumID = bID
+												} else if strings.Contains(txt, ":") {
+													duration = parseTimeString(txt)
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					if duration == 0 {
+						fixedCols, _ := flex["fixedColumns"].([]interface{})
+						if len(fixedCols) > 0 {
+							if col0, _ := fixedCols[0].(map[string]interface{}); col0 != nil {
+								if rend0, _ := col0["musicResponsiveListItemFixedColumnRenderer"].(map[string]interface{}); rend0 != nil {
+									if text0, _ := rend0["text"].(map[string]interface{}); text0 != nil {
+										if runs0, _ := text0["runs"].([]interface{}); len(runs0) > 0 {
+											if r0, _ := runs0[0].(map[string]interface{}); r0 != nil {
+												if durStr, _ := r0["text"].(string); durStr != "" {
+													duration = parseTimeString(durStr)
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+
+					thumb := ""
+					if thumbObj, _ := flex["thumbnail"].(map[string]interface{}); thumbObj != nil {
+						if mThumb, _ := thumbObj["musicThumbnailRenderer"].(map[string]interface{}); mThumb != nil {
+							if thumbnail, _ := mThumb["thumbnail"].(map[string]interface{}); thumbnail != nil {
+								if thumbs, _ := thumbnail["thumbnails"].([]interface{}); len(thumbs) > 0 {
+									if last, _ := thumbs[len(thumbs)-1].(map[string]interface{}); last != nil {
+										thumb, _ = last["url"].(string)
+									}
+								}
+							}
+						}
+					}
+
+					if songTitle != "" && videoID != "" {
+						tr := &YTTrack{
+							VideoID:     videoID,
+							Title:       songTitle,
+							Artist:      detail.Artist.Name,
+							ArtistID:    detail.Artist.ID,
+							Album:       albumTitle,
+							AlbumID:     albumID,
+							Duration:    duration,
+							Thumbnail:   thumb,
+							TrackNumber: trIdx + 1,
+						}
+						c.trackCache.Store(videoID, tr)
+						detail.TopTracks = append(detail.TopTracks, tr)
+					}
+				}
+			}
+		}
+
+		// B. Check musicCarouselShelfRenderer (Albums, Singles & EPs, Fans might also like)
+		if carousel, ok := secMap["musicCarouselShelfRenderer"].(map[string]interface{}); ok {
+			headerObj, _ := carousel["header"].(map[string]interface{})
+			basicHeader, _ := headerObj["musicCarouselShelfBasicHeaderRenderer"].(map[string]interface{})
+			cTitleObj, _ := basicHeader["title"].(map[string]interface{})
+			runs, _ := cTitleObj["runs"].([]interface{})
+			cTitle := ""
+			if len(runs) > 0 {
+				if r0, _ := runs[0].(map[string]interface{}); r0 != nil {
+					cTitle, _ = r0["text"].(string)
+				}
+			}
+
+			items, _ := carousel["contents"].([]interface{})
+			for _, itm := range items {
+				itmMap, _ := itm.(map[string]interface{})
+				twoRow, ok := itmMap["musicTwoRowItemRenderer"].(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				rowTitle := ""
+				rowBrowseID := ""
+				if tObj, _ := twoRow["title"].(map[string]interface{}); tObj != nil {
+					if tRuns, _ := tObj["runs"].([]interface{}); len(tRuns) > 0 {
+						if r0, _ := tRuns[0].(map[string]interface{}); r0 != nil {
+							rowTitle, _ = r0["text"].(string)
+							if nav, _ := r0["navigationEndpoint"].(map[string]interface{}); nav != nil {
+								if bEnd, _ := nav["browseEndpoint"].(map[string]interface{}); bEnd != nil {
+									rowBrowseID, _ = bEnd["browseId"].(string)
+								}
+							}
+						}
+					}
+				}
+
+				rowThumb := ""
+				if thumbRend, _ := twoRow["thumbnailRenderer"].(map[string]interface{}); thumbRend != nil {
+					if mThumb, _ := thumbRend["musicThumbnailRenderer"].(map[string]interface{}); mThumb != nil {
+						if thumbnail, _ := mThumb["thumbnail"].(map[string]interface{}); thumbnail != nil {
+							if thumbs, _ := thumbnail["thumbnails"].([]interface{}); len(thumbs) > 0 {
+								if last, _ := thumbs[len(thumbs)-1].(map[string]interface{}); last != nil {
+									rowThumb, _ = last["url"].(string)
+								}
+							}
+						}
+					}
+				}
+
+				rowYear := 0
+				if subObj, _ := twoRow["subtitle"].(map[string]interface{}); subObj != nil {
+					if sRuns, _ := subObj["runs"].([]interface{}); len(sRuns) > 0 {
+						for _, r := range sRuns {
+							if rm, _ := r.(map[string]interface{}); rm != nil {
+								txt, _ := rm["text"].(string)
+								txt = strings.TrimSpace(txt)
+								if len(txt) == 4 {
+									if y, err := strconv.Atoi(txt); err == nil && y > 1900 && y < 2100 {
+										rowYear = y
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+
+				if strings.Contains(cTitle, "Albums") {
+					alb := &YTAlbum{
+						ID:        rowBrowseID,
+						Title:     rowTitle,
+						Artist:    detail.Artist.Name,
+						ArtistID:  detail.Artist.ID,
+						Year:      rowYear,
+						Thumbnail: rowThumb,
+					}
+					c.albumCache.Store(rowBrowseID, alb)
+					detail.Albums = append(detail.Albums, alb)
+				} else if strings.Contains(cTitle, "Singles") || strings.Contains(cTitle, "EPs") {
+					alb := &YTAlbum{
+						ID:        rowBrowseID,
+						Title:     rowTitle,
+						Artist:    detail.Artist.Name,
+						ArtistID:  detail.Artist.ID,
+						Year:      rowYear,
+						Thumbnail: rowThumb,
+					}
+					c.albumCache.Store(rowBrowseID, alb)
+					detail.Singles = append(detail.Singles, alb)
+				} else if strings.Contains(cTitle, "Fans might also like") || strings.Contains(cTitle, "Similar") {
+					detail.SimilarArtists = append(detail.SimilarArtists, &YTArtist{
+						ID:        rowBrowseID,
+						Name:      rowTitle,
+						Thumbnail: rowThumb,
+					})
+				}
+			}
+		}
+	}
+
+	if detail.Artist.Name != "" {
+		c.artistCache.Store(artistID, detail)
+		if nameOrID != artistID {
+			c.artistCache.Store(nameOrID, detail)
+		}
+	}
+
+	return detail, nil
+}
+
+

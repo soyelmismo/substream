@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -47,8 +48,17 @@ func (p *Provider) trackToSpec(t *YTTrack) *spec.TrackChild {
 	}
 
 	trackID := &specid.ID{URI: fmt.Sprintf("yt:tr:%s", t.VideoID)}
-	albumID := &specid.ID{URI: fmt.Sprintf("yt:al:%s", t.VideoID)}
-	artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", t.ArtistID)}
+	albumRawID := t.AlbumID
+	if albumRawID == "" {
+		albumRawID = t.VideoID
+	}
+	albumID := &specid.ID{URI: fmt.Sprintf("yt:al:%s", albumRawID)}
+
+	artistRawID := t.ArtistID
+	if artistRawID == "" {
+		artistRawID = t.Artist
+	}
+	artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", artistRawID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("yt:tr:%s", t.VideoID)}
 
 	artistName := t.Artist
@@ -86,6 +96,39 @@ func (p *Provider) trackToSpec(t *YTTrack) *spec.TrackChild {
 		IsDir:       false,
 		Type:        "music",
 		Path:        path,
+		TrackNumber: t.TrackNumber,
+	}
+}
+
+func (p *Provider) albumToSpec(ytAlbum *YTAlbum, ytTracks []*YTTrack) *spec.Album {
+	if ytAlbum == nil {
+		return nil
+	}
+	albumID := &specid.ID{URI: fmt.Sprintf("yt:al:%s", ytAlbum.ID)}
+	artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", ytAlbum.ArtistID)}
+	coverID := albumID
+
+	specTracks := make([]*spec.TrackChild, 0, len(ytTracks))
+	totalDuration := 0
+	for _, t := range ytTracks {
+		st := p.trackToSpec(t)
+		if st != nil {
+			specTracks = append(specTracks, st)
+			totalDuration += t.Duration
+		}
+	}
+
+	return &spec.Album{
+		ID:         albumID,
+		Name:       ytAlbum.Title,
+		Title:      ytAlbum.Title,
+		Artist:     ytAlbum.Artist,
+		ArtistID:   artistID,
+		CoverID:    coverID,
+		Year:       ytAlbum.Year,
+		TrackCount: len(specTracks),
+		Duration:   totalDuration,
+		Tracks:     specTracks,
 	}
 }
 
@@ -118,23 +161,122 @@ func (p *Provider) GetTracksBatch(ctx context.Context, rawIDs []string) []*spec.
 }
 
 func (p *Provider) GetAlbum(ctx context.Context, rawID string) (*spec.Album, error) {
-	albumID := &specid.ID{URI: fmt.Sprintf("yt:al:%s", rawID)}
-	return &spec.Album{
-		ID:   albumID,
-		Name: "YouTube Music Album " + rawID,
-	}, nil
+	if rawID == "" {
+		return nil, fmt.Errorf("empty album ID")
+	}
+
+	// 1. If rawID is a browse ID (starts with MPRE, OLAK, VL, FEmusic)
+	if strings.HasPrefix(rawID, "MPRE") || strings.HasPrefix(rawID, "OLAK") || strings.HasPrefix(rawID, "VL") || strings.HasPrefix(rawID, "FEmusic") {
+		ytAlbum, ytTracks, err := p.client.GetAlbum(ctx, rawID)
+		if err != nil {
+			return nil, err
+		}
+		return p.albumToSpec(ytAlbum, ytTracks), nil
+	}
+
+	// 2. Otherwise, rawID might be a track's VideoID
+	track, err := p.client.GetTrack(ctx, rawID)
+	if err == nil && track != nil {
+		if track.AlbumID != "" && (strings.HasPrefix(track.AlbumID, "MPRE") || strings.HasPrefix(track.AlbumID, "OLAK")) {
+			ytAlbum, ytTracks, err := p.client.GetAlbum(ctx, track.AlbumID)
+			if err == nil && ytAlbum != nil && len(ytTracks) > 0 {
+				return p.albumToSpec(ytAlbum, ytTracks), nil
+			}
+		}
+
+		// Single track album fallback
+		specTrack := p.trackToSpec(track)
+		specTrack.TrackNumber = 1
+		albumID := &specid.ID{URI: fmt.Sprintf("yt:al:%s", rawID)}
+		artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", track.ArtistID)}
+		coverID := &specid.ID{URI: fmt.Sprintf("yt:tr:%s", track.VideoID)}
+		albumName := track.Album
+		if albumName == "" {
+			albumName = track.Title + " - Single"
+		}
+		return &spec.Album{
+			ID:         albumID,
+			Name:       albumName,
+			Title:      albumName,
+			Artist:     track.Artist,
+			ArtistID:   artistID,
+			CoverID:    coverID,
+			Year:       track.Year,
+			TrackCount: 1,
+			Duration:   track.Duration,
+			Tracks:     []*spec.TrackChild{specTrack},
+		}, nil
+	}
+
+	// 3. Last resort: try GetAlbum directly
+	ytAlbum, ytTracks, err := p.client.GetAlbum(ctx, rawID)
+	if err != nil {
+		return nil, err
+	}
+	return p.albumToSpec(ytAlbum, ytTracks), nil
 }
 
 func (p *Provider) GetArtist(ctx context.Context, rawID string) (*spec.Artist, error) {
-	artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", rawID)}
+	detail, err := p.client.GetArtist(ctx, rawID)
+	if err != nil {
+		return nil, err
+	}
+	artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", detail.Artist.ID)}
+	coverID := artistID
 	return &spec.Artist{
-		ID:   artistID,
-		Name: "YouTube Music Artist " + rawID,
+		ID:         artistID,
+		Name:       detail.Artist.Name,
+		CoverID:    coverID,
+		AlbumCount: len(detail.Albums) + len(detail.Singles),
 	}, nil
 }
 
 func (p *Provider) GetArtistAlbums(ctx context.Context, rawID string, skipTracks bool) ([]*spec.Album, []*spec.TrackChild, error) {
-	return nil, nil, nil
+	detail, err := p.client.GetArtist(ctx, rawID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	allAlbums := make([]*spec.Album, 0, len(detail.Albums)+len(detail.Singles))
+	for _, alb := range detail.Albums {
+		albumID := &specid.ID{URI: fmt.Sprintf("yt:al:%s", alb.ID)}
+		artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", detail.Artist.ID)}
+		allAlbums = append(allAlbums, &spec.Album{
+			ID:       albumID,
+			Name:     alb.Title,
+			Title:    alb.Title,
+			Artist:   detail.Artist.Name,
+			ArtistID: artistID,
+			CoverID:  albumID,
+			Year:     alb.Year,
+		})
+	}
+	for _, s := range detail.Singles {
+		albumID := &specid.ID{URI: fmt.Sprintf("yt:al:%s", s.ID)}
+		artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", detail.Artist.ID)}
+		allAlbums = append(allAlbums, &spec.Album{
+			ID:       albumID,
+			Name:     s.Title,
+			Title:    s.Title,
+			Artist:   detail.Artist.Name,
+			ArtistID: artistID,
+			CoverID:  albumID,
+			Year:     s.Year,
+		})
+	}
+
+	var tracks []*spec.TrackChild
+	if !skipTracks && len(detail.TopTracks) > 0 {
+		tracks = make([]*spec.TrackChild, 0, len(detail.TopTracks))
+		for _, t := range detail.TopTracks {
+			st := p.trackToSpec(t)
+			if st != nil {
+				tracks = append(tracks, st)
+			}
+		}
+	}
+
+	return allAlbums, tracks, nil
 }
 
 func (p *Provider) SearchTracks(ctx context.Context, query string, limit, offset int) ([]*spec.TrackChild, error) {
@@ -190,6 +332,26 @@ func (p *Provider) GetCoverURL(coverID string, size int) string {
 		if t, ok := p.client.GetCachedTrack(rawID); ok && t.Thumbnail != "" {
 			return t.Thumbnail
 		}
+		if alb, ok := p.client.GetCachedAlbum(rawID); ok && alb.Thumbnail != "" {
+			return alb.Thumbnail
+		}
+		if art, ok := p.client.GetCachedArtist(rawID); ok && art.Thumbnail != "" {
+			return art.Thumbnail
+		}
+		if strings.HasPrefix(rawID, "MPRE") || strings.HasPrefix(rawID, "OLAK") {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			if alb, _, err := p.client.GetAlbum(ctx, rawID); err == nil && alb != nil && alb.Thumbnail != "" {
+				return alb.Thumbnail
+			}
+		}
+		if strings.HasPrefix(rawID, "UC") {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			if detail, err := p.client.GetArtist(ctx, rawID); err == nil && detail != nil && detail.Artist != nil && detail.Artist.Thumbnail != "" {
+				return detail.Artist.Thumbnail
+			}
+		}
 	}
 	return fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", rawID)
 }
@@ -203,11 +365,41 @@ func (p *Provider) GetTopTracks(ctx context.Context, limit int) ([]*spec.TrackCh
 }
 
 func (p *Provider) GetArtistTopTracks(ctx context.Context, artistRawID string, limit int) ([]*spec.TrackChild, error) {
-	return nil, nil
+	detail, err := p.client.GetArtist(ctx, artistRawID)
+	if err != nil {
+		return nil, err
+	}
+	if len(detail.TopTracks) == 0 {
+		return nil, nil
+	}
+	res := make([]*spec.TrackChild, 0, len(detail.TopTracks))
+	for _, t := range detail.TopTracks {
+		st := p.trackToSpec(t)
+		if st != nil {
+			res = append(res, st)
+			if limit > 0 && len(res) >= limit {
+				break
+			}
+		}
+	}
+	return res, nil
 }
 
 func (p *Provider) GetSimilarArtists(ctx context.Context, artistRawID string) ([]*spec.Artist, error) {
-	return nil, nil
+	detail, err := p.client.GetArtist(ctx, artistRawID)
+	if err != nil {
+		return nil, err
+	}
+	res := make([]*spec.Artist, 0, len(detail.SimilarArtists))
+	for _, sa := range detail.SimilarArtists {
+		artistID := &specid.ID{URI: fmt.Sprintf("yt:ar:%s", sa.ID)}
+		res = append(res, &spec.Artist{
+			ID:      artistID,
+			Name:    sa.Name,
+			CoverID: artistID,
+		})
+	}
+	return res, nil
 }
 
 func (p *Provider) GetRecommendations(ctx context.Context, trackRawID string) ([]*spec.TrackChild, error) {
