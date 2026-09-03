@@ -89,18 +89,46 @@ func (db *DB) GetTidalAccounts() ([]*TidalAccount, error) {
 
 func (db *DB) GetActiveTidalAccounts() ([]*TidalAccount, error) {
 	var accounts []*TidalAccount
-	err := db.Where("is_active = ?", true).Order("created_at ASC").Find(&accounts).Error
+	err := db.Where("is_active = ?", true).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
+	return accounts, err
+}
+
+func (db *DB) GetActiveTidalAccountsForQuality(minTier int) ([]*TidalAccount, error) {
+	var accounts []*TidalAccount
+	err := db.Where("is_active = ? AND quality_tier >= ?", true, minTier).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
 	return accounts, err
 }
 
 func (db *DB) AddTidalAccount(userID, username, refreshToken, accessToken string, expiresAt time.Time) (*TidalAccount, error) {
 	acc := &TidalAccount{
-		UserID:       userID,
-		Username:     username,
-		RefreshToken: refreshToken,
-		AccessToken:  accessToken,
-		ExpiresAt:    expiresAt,
-		IsActive:     true,
+		UserID:           userID,
+		Username:         username,
+		RefreshToken:     refreshToken,
+		AccessToken:      accessToken,
+		SubscriptionType: "PREMIUM",
+		HighestQuality:   "HIGH",
+		QualityTier:      QualityTierHigh,
+		ExpiresAt:        expiresAt,
+		IsActive:         true,
+	}
+	err := db.Create(acc).Error
+	return acc, err
+}
+
+func (db *DB) AddTidalAccountWithQuality(userID, username, refreshToken, accessToken, subType, highestQuality string, qualityTier int, expiresAt time.Time) (*TidalAccount, error) {
+	if qualityTier <= 0 {
+		qualityTier = QualityTierHigh
+	}
+	acc := &TidalAccount{
+		UserID:           userID,
+		Username:         username,
+		RefreshToken:     refreshToken,
+		AccessToken:      accessToken,
+		SubscriptionType: subType,
+		HighestQuality:   highestQuality,
+		QualityTier:      qualityTier,
+		ExpiresAt:        expiresAt,
+		IsActive:         true,
 	}
 	err := db.Create(acc).Error
 	return acc, err
@@ -111,6 +139,15 @@ func (db *DB) UpdateTidalAccountTokens(id int, accessToken string, expiresAt tim
 		"access_token": accessToken,
 		"expires_at":   expiresAt,
 		"updated_at":   time.Now(),
+	}).Error
+}
+
+func (db *DB) UpdateTidalAccountSubscription(id int, subType, highestQuality string, qualityTier int) error {
+	return db.Model(&TidalAccount{}).Where("id=?", id).Updates(map[string]interface{}{
+		"subscription_type": subType,
+		"highest_quality":   highestQuality,
+		"quality_tier":      qualityTier,
+		"updated_at":        time.Now(),
 	}).Error
 }
 

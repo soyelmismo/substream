@@ -15,7 +15,6 @@ import (
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/tidalproxy"
 )
 
 var nonAsciiUnsafe = regexp.MustCompile(`[^\p{L}\p{N} ._-]+`)
@@ -66,24 +65,24 @@ func parseYear(date string) int {
 
 // Provider implements provider.MusicProvider and provider.SeedProvider using tidalproxy backend.
 type Provider struct {
-	proxy tidalproxy.TidalProxy
+	proxy TidalProxy
 }
 
-// New creates a new Tidal music provider wrapping tidalproxy.
-func New(proxy tidalproxy.TidalProxy) *Provider {
+// New creates a new Tidal music provider wrapping 
+func New(proxy TidalProxy) *Provider {
 	return &Provider{proxy: proxy}
 }
 
 // Bootstrap creates and initializes a fully autonomous Tidal provider:
 // configuring the mirror pool, auto-seeding SQLite if empty, and launching mirror discovery.
 func Bootstrap(dbc *db.DB, cliURLs []string, userToken string) *Provider {
-	pool := tidalproxy.NewPool(cliURLs, tidalproxy.PoolConfig{
+	pool := NewPool(cliURLs, PoolConfig{
 		HealthInterval: 30 * time.Second,
 		Timeout:        10 * time.Second,
 		UserToken:      userToken,
 	})
 	setupTokenManager(dbc, pool)
-	cachedProxy := tidalproxy.NewCachedProxy(pool, dbc, 30*24*time.Hour)
+	cachedProxy := NewCachedProxy(pool, dbc, 30*24*time.Hour)
 
 	// Seed mirrors if SQLite table is empty
 	dbProxies, _ := dbc.GetProxies()
@@ -131,7 +130,7 @@ func (p *Provider) DefaultTrackers() []string {
 }
 
 // Proxy returns the underlying TidalProxy if direct access is needed
-func (p *Provider) Proxy() tidalproxy.TidalProxy {
+func (p *Provider) Proxy() TidalProxy {
 	return p.proxy
 }
 
@@ -439,7 +438,7 @@ func (p *Provider) GetRecommendations(ctx context.Context, trackRawID string) ([
 
 // --- Spec Conversion Helpers ---
 
-func (p *Provider) trackToSpec(t *tidalproxy.TidalTrack) *spec.TrackChild {
+func (p *Provider) trackToSpec(t *TidalTrack) *spec.TrackChild {
 	artistName := t.Artist.Name
 	if len(t.Artists) > 0 {
 		artistName = t.Artists[0].Name
@@ -504,7 +503,7 @@ func (p *Provider) trackToSpec(t *tidalproxy.TidalTrack) *spec.TrackChild {
 	return tc
 }
 
-func (p *Provider) albumToSpec(a *tidalproxy.TidalAlbum) *spec.Album {
+func (p *Provider) albumToSpec(a *TidalAlbum) *spec.Album {
 	albumID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
 
@@ -541,7 +540,7 @@ func (p *Provider) albumToSpec(a *tidalproxy.TidalAlbum) *spec.Album {
 	}
 }
 
-func (p *Provider) artistToSpec(a *tidalproxy.TidalArtist) *spec.Artist {
+func (p *Provider) artistToSpec(a *TidalArtist) *spec.Artist {
 	id := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
 
@@ -552,25 +551,22 @@ func (p *Provider) artistToSpec(a *tidalproxy.TidalArtist) *spec.Artist {
 	}
 }
 
-// setupTokenManager dynamically provides and auto-refreshes active Tidal OAuth accounts from SQLite
-func setupTokenManager(dbc *db.DB, pool *tidalproxy.Pool) {
+// setupTokenManager dynamically provides and auto-refreshes active Tidal OAuth accounts from SQLite with quality-awareness
+func setupTokenManager(dbc *db.DB, pool *Pool) {
 	var tokenIdx uint64
 	var refreshMu sync.Mutex
 
-	pool.SetTokenGetter(func() string {
-		accounts, err := dbc.GetActiveTidalAccounts()
-		if err != nil || len(accounts) == 0 {
-			return "" // Fall back to static CLI / .env tokens
+	getTokenForAccounts := func(accounts []*db.TidalAccount) string {
+		if len(accounts) == 0 {
+			return ""
 		}
 
-		// Select account round-robin
 		idx := atomic.AddUint64(&tokenIdx, 1) - 1
 		acc := accounts[idx%uint64(len(accounts))]
 
 		// Auto-refresh if token expires in less than 5 minutes or is empty
 		if acc.AccessToken == "" || time.Now().After(acc.ExpiresAt.Add(-5*time.Minute)) {
 			refreshMu.Lock()
-			// Double-check after acquiring lock
 			freshAccs, _ := dbc.GetActiveTidalAccounts()
 			for _, fa := range freshAccs {
 				if fa.ID == acc.ID {
@@ -586,7 +582,7 @@ func setupTokenManager(dbc *db.DB, pool *tidalproxy.Pool) {
 				if err != nil {
 					log.Printf("[TIDAL-OAUTH] ❌ Refresh failed for account %s: %v", acc.Username, err)
 					refreshMu.Unlock()
-					return acc.AccessToken // Return current token as fallback
+					return acc.AccessToken
 				}
 				expiresAt := time.Now().Add(time.Duration(tokResp.ExpiresIn) * time.Second)
 				if err := dbc.UpdateTidalAccountTokens(acc.ID, tokResp.AccessToken, expiresAt); err != nil {
@@ -595,10 +591,49 @@ func setupTokenManager(dbc *db.DB, pool *tidalproxy.Pool) {
 					log.Printf("[TIDAL-OAUTH] ✅ Token refreshed successfully for %s! Valid until %s", acc.Username, expiresAt.Format("15:04:05 MST"))
 				}
 				acc.AccessToken = tokResp.AccessToken
+
+				// Also check and update subscription if not yet detected
+				if acc.SubscriptionType == "" || acc.QualityTier == 0 {
+					subCtx, subCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					subType, highestQuality, tier, subErr := FetchAccountSubscription(subCtx, acc.UserID, acc.AccessToken)
+					subCancel()
+					if subErr == nil {
+						_ = dbc.UpdateTidalAccountSubscription(acc.ID, subType, highestQuality, tier)
+						log.Printf("[TIDAL-OAUTH] 🏷️ Detected subscription for %s: Type=%s Quality=%s (Tier=%d)", acc.Username, subType, highestQuality, tier)
+					}
+				}
 			}
 			refreshMu.Unlock()
 		}
 
 		return acc.AccessToken
+	}
+
+	pool.SetTokenGetter(func() string {
+		accounts, err := dbc.GetActiveTidalAccounts()
+		if err != nil || len(accounts) == 0 {
+			return ""
+		}
+		return getTokenForAccounts(accounts)
+	})
+
+	pool.SetQualityTokenGetter(func(quality string) string {
+		var accounts []*db.TidalAccount
+		var err error
+
+		if strings.ToUpper(quality) == "LOSSLESS" || strings.ToUpper(quality) == "HI_RES_LOSSLESS" {
+			// Prioritize HiFi/Lossless accounts
+			accounts, err = dbc.GetActiveTidalAccountsForQuality(db.QualityTierLossless)
+			if err == nil && len(accounts) > 0 {
+				return getTokenForAccounts(accounts)
+			}
+		}
+
+		// Fallback to any active account (e.g. Premium 320k)
+		accounts, err = dbc.GetActiveTidalAccounts()
+		if err != nil || len(accounts) == 0 {
+			return ""
+		}
+		return getTokenForAccounts(accounts)
 	})
 }

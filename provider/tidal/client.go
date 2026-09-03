@@ -1,4 +1,4 @@
-package tidalproxy
+package tidal
 
 import (
 	"context"
@@ -47,10 +47,11 @@ type Pool struct {
 	client      *http.Client
 	quality     string
 	userTokens  []string
-	tokenGetter func() string
-	tokenIdx    uint64
-	tokenMu     sync.RWMutex
-	mu          sync.RWMutex
+	tokenGetter        func() string
+	qualityTokenGetter func(quality string) string
+	tokenIdx           uint64
+	tokenMu            sync.RWMutex
+	mu                 sync.RWMutex
 
 	// New mirror manager for intelligent selection
 	mirrorMgr *MirrorManager
@@ -64,6 +65,12 @@ func (p *Pool) SetTokenGetter(fn func() string) {
 	p.tokenMu.Lock()
 	defer p.tokenMu.Unlock()
 	p.tokenGetter = fn
+}
+
+func (p *Pool) SetQualityTokenGetter(fn func(quality string) string) {
+	p.tokenMu.Lock()
+	defer p.tokenMu.Unlock()
+	p.qualityTokenGetter = fn
 }
 
 func (p *Pool) getUserToken() string {
@@ -84,6 +91,19 @@ func (p *Pool) getUserToken() string {
 	}
 	idx := atomic.AddUint64(&p.tokenIdx, 1) - 1
 	return p.userTokens[idx%uint64(len(p.userTokens))]
+}
+
+func (p *Pool) getUserTokenForQuality(quality string) string {
+	p.tokenMu.RLock()
+	qGetter := p.qualityTokenGetter
+	p.tokenMu.RUnlock()
+
+	if qGetter != nil {
+		if tok := qGetter(quality); tok != "" {
+			return tok
+		}
+	}
+	return p.getUserToken()
 }
 
 func (p *Pool) reportTokenAuthFailure(token string) {
@@ -1559,12 +1579,28 @@ func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality 
 		return "", fmt.Errorf("track requires subscription (preview only)")
 	}
 
+	var streamURL string
 	if playInfo.ManifestMimeType == "application/dash+xml" {
-		return dashToM3U8DataURL(playInfo.Manifest)
+		streamURL, err = dashToM3U8DataURL(playInfo.Manifest)
+	} else {
+		streamURL, err = parseManifestURL(trackID, "DIRECT-TIDAL", playInfo.ManifestMimeType, playInfo.Manifest)
+	}
+	if err != nil {
+		return "", err
 	}
 
-	// For any other manifest type (e.g. BTS), use parseManifestURL
-	return parseManifestURL(trackID, "DIRECT-TIDAL", playInfo.ManifestMimeType, playInfo.Manifest)
+	actualQuality := playInfo.AudioQuality
+	if actualQuality == "" {
+		actualQuality = quality
+	}
+
+	if (quality == "LOSSLESS" || quality == "HI_RES_LOSSLESS") && (actualQuality == "HIGH" || actualQuality == "LOW") {
+		log.Printf("[TIDAL] ℹ️ Direct Tidal stream resolved for track %d: Quality=%s (requested %s, %s)", trackID, actualQuality, quality, playInfo.ManifestMimeType)
+	} else {
+		log.Printf("[TIDAL] ✅ Direct Tidal official API stream resolved for track %d: Quality=%s (%s)", trackID, actualQuality, playInfo.ManifestMimeType)
+	}
+
+	return streamURL, nil
 }
 
 func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality string, clientIP string) (string, error) {
@@ -1590,11 +1626,10 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 	}
 	p.streamCacheMu.RUnlock()
 
-	// [DIRECT-TIDAL] If user subscriber tokens are configured, attempt direct playback from Tidal official API
-	if tok := p.getUserToken(); tok != "" {
+	// [DIRECT-TIDAL] If user subscriber tokens are configured, attempt direct playback from Tidal official API with quality-aware token
+	if tok := p.getUserTokenForQuality(requestedQuality); tok != "" {
 		directURL, err := p.fetchDirectTidalStream(ctx, trackID, requestedQuality, clientIP, tok)
 		if err == nil && directURL != "" {
-			log.Printf("[TIDAL] ✅ Direct Tidal official API stream resolved for track %d (lossless full playback)", trackID)
 			p.streamCacheMu.Lock()
 			p.streamCache[trackID] = streamCacheEntry{
 				URL:       directURL,

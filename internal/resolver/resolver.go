@@ -11,7 +11,7 @@ import (
 
 	"go.senan.xyz/gonic/internal/cache"
 	"go.senan.xyz/gonic/internal/matchutil"
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 // Query represents a text-based track lookup request
@@ -35,12 +35,12 @@ func (q Query) Key() string {
 
 // Resolver provides concurrent text-to-track resolution with caching
 type Resolver struct {
-	proxy tidalproxy.TidalProxy
+	proxy tidal.TidalProxy
 	cache *cache.Cache[int] // Query key -> Tidal track ID
 }
 
 // New creates a new Resolver with the given Tidal proxy
-func New(proxy tidalproxy.TidalProxy) *Resolver {
+func New(proxy tidal.TidalProxy) *Resolver {
 	return &Resolver{
 		proxy: proxy,
 		cache: cache.New[int](cache.Config{
@@ -107,7 +107,7 @@ func (r *Resolver) ResolveBatch(ctx context.Context, queries []Query) map[string
 			}
 
 			// Search Tidal - use Normal priority since this is discovery, not critical streaming
-			searchCtx := tidalproxy.WithPriority(ctx, tidalproxy.PriorityNormal)
+			searchCtx := tidal.WithPriority(ctx, tidal.PriorityNormal)
 
 			// Use artist + title for broader search, or just title if artist empty
 			searchQuery := query.Title

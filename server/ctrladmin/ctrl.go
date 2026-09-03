@@ -31,7 +31,6 @@ import (
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/server/ctrladmin/adminui"
-	"go.senan.xyz/gonic/tidalproxy"
 )
 
 type CtxKey int
@@ -46,7 +45,7 @@ type Controller struct {
 
 	dbc              *db.DB
 	sessDB           *gormstore.Store
-	proxy            tidalproxy.TidalProxy
+	proxy            tidal.TidalProxy
 	resolveProxyPath ProxyPathResolver
 	rateLimiter      *RateLimiter
 	providers        *provider.Registry
@@ -168,7 +167,7 @@ func (rl *RateLimiter) Reset(ip string) {
 
 type ProxyPathResolver func(in string) string
 
-func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resolveProxyPath ProxyPathResolver) (*Controller, error) {
+func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidal.TidalProxy, resolveProxyPath ProxyPathResolver) (*Controller, error) {
 	c := Controller{
 		ServeMux: http.NewServeMux(),
 
@@ -596,7 +595,7 @@ type templateData struct {
 	ProxyStreams bool
 
 	// cache
-	CacheStats tidalproxy.CacheStats
+	CacheStats tidal.CacheStats
 }
 
 func funcMap() template.FuncMap {

@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 // segmentInfo holds HLS segment URL and duration
@@ -128,7 +128,7 @@ func createFakeSidx(segments []segmentInfo, bytesPerSec int64, firstOffset uint3
 // downloadAndStitchHLS fetches an M3U8 manifest and streams all its segments to w
 // offsetSeconds allows time-based seeking (skip segments until offset)
 // clientName is used to determine if Content-Type fix is needed for clients like supersonic
-func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64, startByte int64, totalBytes int64, clientName string) error {
+func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidal.TidalTrack, offsetSeconds float64, startByte int64, totalBytes int64, clientName string) error {
 	// 1. Fetch or decode the manifest
 	var manifestReader io.Reader
 	if strings.HasPrefix(manifestURL, "data:") {
@@ -645,7 +645,7 @@ func downloadSegmentOnce(ctx context.Context, client *http.Client, url, clientIP
 
 // downloadAndStitchDASH fetches a DASH manifest and streams all segments to w
 // offsetSeconds allows time-based seeking (skip segments until offset)
-func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidalproxy.TidalTrack, offsetSeconds float64) error {
+func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL string, w io.Writer, clientIP string, track *tidal.TidalTrack, offsetSeconds float64) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
 	if err != nil {
 		return err
@@ -804,7 +804,7 @@ func (c *Controller) downloadAndStitchDASH(ctx context.Context, manifestURL stri
 
 type flacTagger struct {
 	w          io.Writer
-	track      *tidalproxy.TidalTrack
+	track      *tidal.TidalTrack
 	startByte  int64
 	totalBytes int64
 }

@@ -18,7 +18,7 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 // streamRequest bundle for unified stream preparation
@@ -26,7 +26,7 @@ type streamRequest struct {
 	Quality    string
 	ClientIP   string
 	StreamURL  string
-	Track      *tidalproxy.TidalTrack
+	Track      *tidal.TidalTrack
 	Ext        string
 	IsHLS      bool
 	IsDASH     bool
@@ -136,7 +136,7 @@ func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.A
 	results := make([]*spec.Album, 0, len(albumMap))
 	for _, id := range tidalIDs {
 		if info, ok := albumMap[id]; ok {
-			a := spec.NewAlbumFromTidal(info)
+			a := NewAlbumFromTidal(info)
 			c.applyAlbumStar(user.ID, a)
 			a.UserRating = c.getAlbumRating(user.ID, fmt.Sprintf("td:al:%d", id))
 			results = append(results, a)
@@ -201,7 +201,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 
 	// 3 & 4. Fetch Stream URL and Track Info concurrently
 	var url string
-	var track *tidalproxy.TidalTrack
+	var track *tidal.TidalTrack
 	var urlErr, trackErr error
 
 	// [CRITICAL FIX] Include clientIP in cache key - Tidal returns IP-locked URLs!
@@ -291,16 +291,16 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 				if len(specTrack.ISRC) > 0 {
 					isrcVal = specTrack.ISRC[0]
 				}
-				track = &tidalproxy.TidalTrack{
+				track = &tidal.TidalTrack{
 					ID:       id.Value(),
 					Title:    specTrack.Title,
 					Duration: specTrack.Duration,
 					ISRC:     isrcVal,
-					Album: tidalproxy.TidalAlbumRef{
+					Album: tidal.TidalAlbumRef{
 						ID:    albumIDVal,
 						Title: specTrack.Album,
 					},
-					Artist: tidalproxy.TidalArtist{
+					Artist: tidal.TidalArtist{
 						ID:   artistIDVal,
 						Name: specTrack.Artist,
 					},
@@ -433,18 +433,18 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 
 // batchFetchAlbumsWithContext fetches metadata with custom context (for timeout control)
 func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs []int) []*spec.Album {
-	return batchFetch(ctx, c.proxySem, tidalIDs, c.proxy.GetAlbumMetadata, func(info *tidalproxy.TidalAlbum, _ int) *spec.Album {
-		return spec.NewAlbumFromTidal(info)
+	return batchFetch(ctx, c.proxySem, tidalIDs, c.proxy.GetAlbumMetadata, func(info *tidal.TidalAlbum, _ int) *spec.Album {
+		return NewAlbumFromTidal(info)
 	})
 }
 
 // batchFetchArtists fetches metadata for multiple tidal artist IDs concurrently
 func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.Artist {
 	user := r.Context().Value(CtxUser).(*db.User)
-	return batchFetch(r.Context(), c.proxySem, tidalIDs, func(ctx context.Context, id int) (*tidalproxy.TidalArtistDetail, error) {
+	return batchFetch(r.Context(), c.proxySem, tidalIDs, func(ctx context.Context, id int) (*tidal.TidalArtistDetail, error) {
 		return c.proxy.GetArtistInfo(ctx, id)
-	}, func(info *tidalproxy.TidalArtistDetail, tid int) *spec.Artist {
-		a := spec.NewArtistFromTidal(&info.Artist)
+	}, func(info *tidal.TidalArtistDetail, tid int) *spec.Artist {
+		a := NewArtistFromTidal(&info.Artist)
 		a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
 		c.applyArtistStar(user.ID, a)
 		return a
@@ -452,7 +452,7 @@ func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.
 }
 
 // scrobbleTrackFromTidal converts a TidalTrack to a scrobble.Track
-func scrobbleTrackFromTidal(t *tidalproxy.TidalTrack) scrobble.Track {
+func scrobbleTrackFromTidal(t *tidal.TidalTrack) scrobble.Track {
 	artist := t.Artist.Name
 	if len(t.Artists) > 0 {
 		artist = t.Artists[0].Name
@@ -520,7 +520,7 @@ func (c *Controller) hydrateTrackBackground(trackID int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		// Enviar al fondo de la piscina (protege a los proxies de streaming)
-		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
+		ctx = tidal.WithPriority(ctx, tidal.PriorityBackground)
 		c.proxy.GetTrackInfo(ctx, trackID)
 	}()
 }
@@ -537,7 +537,7 @@ func (c *Controller) hydrateAlbumBackground(albumID int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		// Enviar al fondo de la piscina (protege a los proxies de streaming)
-		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
+		ctx = tidal.WithPriority(ctx, tidal.PriorityBackground)
 		log.Printf("[HYDRATE] Deep hydrating album %d...", albumID)
 		c.proxy.GetAlbumInfo(ctx, albumID) // GetAlbumInfo triggers caching of all its tracks
 	}()
@@ -557,7 +557,7 @@ func (c *Controller) hydrateArtistBackground(artistID int) {
 		defer cancel()
 
 		// Enviar al fondo de la piscina (protege a los proxies de streaming)
-		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
+		ctx = tidal.WithPriority(ctx, tidal.PriorityBackground)
 
 		log.Printf("[HYDRATE] Deep hydrating artist %d... [Priority:Background]", artistID)
 
@@ -615,7 +615,7 @@ func (c *Controller) hydratePlaylistBackground(playlistID int, trackIDs []int) {
 		defer cancel()
 
 		// Enviar al fondo de la piscina (protege a los proxies de streaming)
-		ctx = tidalproxy.WithPriority(ctx, tidalproxy.PriorityBackground)
+		ctx = tidal.WithPriority(ctx, tidal.PriorityBackground)
 
 		log.Printf("[HYDRATE] Hydrating playlist %d with %d tracks...", playlistID, len(trackIDs))
 

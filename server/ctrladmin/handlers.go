@@ -24,7 +24,6 @@ import (
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/listenbrainz"
 	"go.senan.xyz/gonic/provider/tidal"
-	"go.senan.xyz/gonic/tidalproxy"
 )
 
 func (c *Controller) ServeNotFound(_ *http.Request) *Response {
@@ -1056,7 +1055,7 @@ func (c *Controller) ServeProxies(r *http.Request) *Response {
 	data.Proxies = proxies
 
 	// Get mirror stats from MirrorManager
-	if cachedProxy, ok := c.proxy.(*tidalproxy.CachedProxy); ok {
+	if cachedProxy, ok := c.proxy.(*tidal.CachedProxy); ok {
 		if mgr := cachedProxy.GetMirrorManager(); mgr != nil {
 			data.MirrorStats = mgr.GetStatus()
 		}
@@ -1346,6 +1345,21 @@ func (c *Controller) ServeTidalAccounts(r *http.Request) *Response {
 		return &Response{code: 500, err: fmt.Sprintf("get tidal accounts: %v", err)}
 	}
 
+	// Auto-detect subscription tier for existing accounts that don't have it yet
+	for _, a := range accounts {
+		if a.QualityTier == 0 || a.SubscriptionType == "" {
+			if a.AccessToken != "" && a.UserID != "" {
+				subType, highestQuality, tier, subErr := tidal.FetchAccountSubscription(r.Context(), a.UserID, a.AccessToken)
+				if subErr == nil {
+					_ = c.dbc.UpdateTidalAccountSubscription(a.ID, subType, highestQuality, tier)
+					a.SubscriptionType = subType
+					a.HighestQuality = highestQuality
+					a.QualityTier = tier
+				}
+			}
+		}
+	}
+
 	data := &templateData{}
 	data.TidalAccounts = accounts
 
@@ -1421,7 +1435,13 @@ func (c *Controller) ServeTidalPollOAuthJSON(w http.ResponseWriter, r *http.Requ
 	}
 	expiresAt := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
 
-	_, err = c.dbc.AddTidalAccount(userID, username, tok.RefreshToken, tok.AccessToken, expiresAt)
+	// Fetch subscription info
+	subType, highestQuality, tier, subErr := tidal.FetchAccountSubscription(r.Context(), userID, tok.AccessToken)
+	if subErr != nil {
+		log.Printf("[TIDAL] Warning: could not determine subscription for %s: %v", userID, subErr)
+	}
+
+	_, err = c.dbc.AddTidalAccountWithQuality(userID, username, tok.RefreshToken, tok.AccessToken, subType, highestQuality, tier, expiresAt)
 	if err != nil {
 		log.Printf("[TIDAL] Error saving linked account to DB: %v", err)
 		json.NewEncoder(w).Encode(map[string]any{"status": "error", "message": "error saving account to database"})
@@ -1432,11 +1452,13 @@ func (c *Controller) ServeTidalPollOAuthJSON(w http.ResponseWriter, r *http.Requ
 	c.pendingOAuth = nil
 	c.pendingOAuthMu.Unlock()
 
-	log.Printf("[AUDIT] Tidal OAuth account linked successfully: %s (User ID: %s)", username, userID)
+	log.Printf("[AUDIT] Tidal OAuth account linked successfully: %s (User ID: %s, Plan: %s, Tier: %d)", username, userID, subType, tier)
 	json.NewEncoder(w).Encode(map[string]any{
-		"status":   "success",
-		"user_id":  userID,
-		"username": username,
+		"status":            "success",
+		"user_id":           userID,
+		"username":          username,
+		"subscription_type": subType,
+		"quality_tier":      tier,
 	})
 }
 
@@ -1465,12 +1487,18 @@ func (c *Controller) ServeTidalAddManualDo(r *http.Request) *Response {
 	}
 	expiresAt := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
 
-	if _, err := c.dbc.AddTidalAccount(userID, username, refreshToken, tok.AccessToken, expiresAt); err != nil {
+	// Fetch subscription info
+	subType, highestQuality, tier, subErr := tidal.FetchAccountSubscription(r.Context(), userID, tok.AccessToken)
+	if subErr != nil {
+		log.Printf("[TIDAL] Warning: could not determine subscription for %s: %v", userID, subErr)
+	}
+
+	if _, err := c.dbc.AddTidalAccountWithQuality(userID, username, refreshToken, tok.AccessToken, subType, highestQuality, tier, expiresAt); err != nil {
 		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("could not save account: %v", err)}}
 	}
 
-	log.Printf("[AUDIT] Manual Tidal account added: %s (User ID: %s)", username, userID)
-	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{fmt.Sprintf("Tidal account %s verified and added successfully!", username)}}
+	log.Printf("[AUDIT] Manual Tidal account added: %s (User ID: %s, Plan: %s, Tier: %d)", username, userID, subType, tier)
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{fmt.Sprintf("Tidal account %s verified and added! (Plan: %s)", username, subType)}}
 }
 
 func (c *Controller) ServeTidalDeleteAccountDo(r *http.Request) *Response {
@@ -1551,8 +1579,14 @@ func (c *Controller) ServeTidalRefreshAccountDo(r *http.Request) *Response {
 		return &Response{redirect: "/admin/tidal_accounts", flashW: []string{fmt.Sprintf("database update failed: %v", err)}}
 	}
 
-	log.Printf("[AUDIT] Tidal account %d (%s) refreshed. Valid until: %s", target.ID, target.Username, expiresAt.Format(time.RFC3339))
-	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{fmt.Sprintf("token refreshed successfully! (valid for %d hours)", tok.ExpiresIn/3600)}}
+	// Also detect and update subscription info
+	subType, highestQuality, tier, subErr := tidal.FetchAccountSubscription(r.Context(), target.UserID, tok.AccessToken)
+	if subErr == nil {
+		_ = c.dbc.UpdateTidalAccountSubscription(target.ID, subType, highestQuality, tier)
+	}
+
+	log.Printf("[AUDIT] Tidal account %d (%s) refreshed. Valid until: %s (Plan: %s, Tier: %d)", target.ID, target.Username, expiresAt.Format(time.RFC3339), subType, tier)
+	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{fmt.Sprintf("token refreshed successfully! (valid for %d hours, Plan: %s)", tok.ExpiresIn/3600, subType)}}
 }
 
 type ProviderViewModel struct {

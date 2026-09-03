@@ -11,18 +11,18 @@ import (
 	"go.senan.xyz/gonic/internal/resolver"
 	"go.senan.xyz/gonic/lastfm"
 	"go.senan.xyz/gonic/recommendations"
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 // Provider implements recommendations.Provider for Last.fm
 type Provider struct {
 	client   *lastfm.Client
 	resolver *resolver.Resolver
-	proxy    tidalproxy.TidalProxy
+	proxy    tidal.TidalProxy
 }
 
 // New creates a new Last.fm recommendation provider
-func New(client *lastfm.Client, proxy tidalproxy.TidalProxy) *Provider {
+func New(client *lastfm.Client, proxy tidal.TidalProxy) *Provider {
 	return &Provider{
 		client:   client,
 		resolver: resolver.New(proxy),
@@ -80,10 +80,10 @@ func (p *Provider) GetSimilarTracks(ctx context.Context, track recommendations.T
 		if err != nil {
 			log.Printf("[LASTFM] Warning: Could not get track info for %d: %v", tidalID, err)
 			// Use basic info from what we have
-			trackInfo = &tidalproxy.TidalTrack{
+			trackInfo = &tidal.TidalTrack{
 				ID:     tidalID,
 				Title:  t.Name,
-				Artist: tidalproxy.TidalArtist{Name: t.Artist.Name},
+				Artist: tidal.TidalArtist{Name: t.Artist.Name},
 			}
 		}
 
@@ -124,7 +124,7 @@ func (p *Provider) GetSimilarArtists(ctx context.Context, artist recommendations
 	var recs []recommendations.ArtistRecommendation
 	for _, a := range similar.Artists {
 		// Search for this artist in Tidal
-		searchCtx := tidalproxy.WithPriority(ctx, tidalproxy.PriorityNormal)
+		searchCtx := tidal.WithPriority(ctx, tidal.PriorityNormal)
 		artists, err := p.proxy.SearchArtists(searchCtx, a.Name, 3, 0)
 		if err != nil || len(artists) == 0 {
 			continue

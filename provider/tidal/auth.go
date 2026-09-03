@@ -205,3 +205,59 @@ func RefreshAccessToken(ctx context.Context, refreshToken string) (*TokenRespons
 
 	return &tokResp, nil
 }
+
+// FetchAccountSubscription checks Tidal's subscription endpoint for an account
+// and returns the subscription type (e.g. HIFI, PREMIUM, FREE), highest sound quality, and quality tier.
+func FetchAccountSubscription(ctx context.Context, userID, accessToken string) (string, string, int, error) {
+	if userID == "" || accessToken == "" {
+		return "PREMIUM", "HIGH", 50, fmt.Errorf("empty userID or accessToken")
+	}
+
+	u := fmt.Sprintf("https://api.tidal.com/v1/users/%s/subscription", userID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "PREMIUM", "HIGH", 50, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", DeviceAuthUserAgent)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "PREMIUM", "HIGH", 50, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "PREMIUM", "HIGH", 50, fmt.Errorf("subscription endpoint returned HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var subResp struct {
+		HighestSoundQuality string `json:"highestSoundQuality"`
+		Status              string `json:"status"`
+		Subscription        struct {
+			Type string `json:"type"`
+		} `json:"subscription"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&subResp); err != nil {
+		return "PREMIUM", "HIGH", 50, err
+	}
+
+	subType := strings.ToUpper(strings.TrimSpace(subResp.Subscription.Type))
+	highestQuality := strings.ToUpper(strings.TrimSpace(subResp.HighestSoundQuality))
+
+	tier := 50 // High (320kbps AAC)
+	if subType == "HIFI" || subType == "TIDAL_HI_FI" || subType == "HI_RES" || (highestQuality == "HI_RES" && subType != "PREMIUM") {
+		tier = 80 // Lossless FLAC
+		if highestQuality == "HI_RES" {
+			tier = 100 // Hi-Res FLAC
+		}
+	} else if subType == "PREMIUM" {
+		tier = 50 // 320kbps AAC
+	} else if subType == "FREE" {
+		tier = 30
+	}
+
+	return subType, highestQuality, tier, nil
+}

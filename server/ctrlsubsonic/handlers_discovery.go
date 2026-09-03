@@ -10,7 +10,7 @@ import (
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/recommendations"
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -260,7 +260,7 @@ func (c *Controller) getSimilarSongsMerged(r *http.Request, trackID, count int) 
 	cancel()
 
 	// 2. Get external recommendations from registered providers (Last.fm, etc.)
-	var externalRecs []tidalproxy.TidalTrack
+	var externalRecs []tidal.TidalTrack
 	if c.recEngine.HasProviders() {
 		if baseTrack, err := c.proxy.GetTrackInfo(r.Context(), trackID); err == nil {
 			extCtx, extCancel := context.WithTimeout(r.Context(), 2500*time.Millisecond)
@@ -372,7 +372,7 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 
 	tracks := make([]*spec.TrackChild, len(topTracks))
 	for i := range topTracks {
-		tracks[i] = spec.NewTrackFromTidal(&topTracks[i])
+		tracks[i] = NewTrackFromTidal(&topTracks[i])
 		c.applyTrackStar(user.ID, tracks[i])
 		c.applyTrackPlayCount(user.ID, tracks[i])
 	}
@@ -383,12 +383,12 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 }
 
 // mergeRecommendations interleaves and deduplicates native and external recommendations
-func mergeRecommendations(native []tidalproxy.TidalTrack, external []tidalproxy.TidalTrack, limit int) []tidalproxy.TidalTrack {
-	var merged []tidalproxy.TidalTrack
+func mergeRecommendations(native []tidal.TidalTrack, external []tidal.TidalTrack, limit int) []tidal.TidalTrack {
+	var merged []tidal.TidalTrack
 	seenIDs := make(map[int]bool)
 	seenISRCs := make(map[string]bool)
 
-	add := func(t tidalproxy.TidalTrack) {
+	add := func(t tidal.TidalTrack) {
 		if len(merged) >= limit {
 			return
 		}

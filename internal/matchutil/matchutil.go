@@ -5,11 +5,11 @@ package matchutil
 import (
 	"strings"
 
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 // MatchScore calculates similarity between search query and result (0.0 to 1.0)
-func MatchScore(queryArtist, queryTitle string, track tidalproxy.TidalTrack) float64 {
+func MatchScore(queryArtist, queryTitle string, track tidal.TidalTrack) float64 {
 	return MatchScoreWithAlbum(queryArtist, queryTitle, "", track)
 }
 
@@ -25,7 +25,7 @@ func Normalize(s string) string {
 }
 
 // MatchScoreWithAlbum includes album name in matching for better precision
-func MatchScoreWithAlbum(queryArtist, queryTitle, queryAlbum string, track tidalproxy.TidalTrack) float64 {
+func MatchScoreWithAlbum(queryArtist, queryTitle, queryAlbum string, track tidal.TidalTrack) float64 {
 	qArtist := Normalize(queryArtist)
 	qTitle := Normalize(queryTitle)
 	tArtist := Normalize(track.Artist.Name)
@@ -75,7 +75,7 @@ func MatchScoreWithAlbum(queryArtist, queryTitle, queryAlbum string, track tidal
 
 // FindBest evalúa una lista de tracks de Tidal y devuelve el ID del mejor match
 // Si ningún track supera el umbral (0.5), devuelve 0
-func FindBest(artist, title, album string, tracks []tidalproxy.TidalTrack) int {
+func FindBest(artist, title, album string, tracks []tidal.TidalTrack) int {
 	bestMatch := 0
 	bestScore := 0.0
 

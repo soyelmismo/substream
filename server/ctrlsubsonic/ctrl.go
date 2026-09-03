@@ -30,7 +30,6 @@ import (
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
-	"go.senan.xyz/gonic/tidalproxy"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -47,7 +46,7 @@ type Controller struct {
 	*http.ServeMux
 
 	dbc              *db.DB
-	proxy            tidalproxy.TidalProxy
+	proxy            tidal.TidalProxy
 	providers        *provider.Registry
 	scrobblers       []scrobble.Scrobbler
 	cachePath        string
@@ -59,7 +58,7 @@ type Controller struct {
 	streamClient     *http.Client                          // Dedicated client for audio streaming with optimized settings
 	streamBufPool    sync.Pool                             // Pool of buffers for streaming (reduces GC pressure)
 	genreCache       *cache.Cache[[]int]                   // Cache for genre tracks with LRU eviction
-	genreAlbumCache  *cache.Cache[[]tidalproxy.TidalAlbum] // Cache for genre albums
+	genreAlbumCache  *cache.Cache[[]tidal.TidalAlbum] // Cache for genre albums
 	genreCountsCache *cache.Cache[map[string]genreCount]   // Cache for genre counts with TTL
 	negCoverCache    *cache.Cache[bool]                    // Negative cache for missing covers
 	settingsCache    *cache.Cache[string]                  // Cache for DB settings (proxy_streams, etc)
@@ -85,7 +84,7 @@ type userPreferences struct {
 	LoadedAt time.Time            // for TTL checking
 }
 
-func New(dbc *db.DB, proxy tidalproxy.TidalProxy, providers *provider.Registry, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
+func New(dbc *db.DB, proxy tidal.TidalProxy, providers *provider.Registry, scrobblers []scrobble.Scrobbler, cachePath string) *Controller {
 	// Load configuration from environment variables
 	initConfig()
 
@@ -134,7 +133,7 @@ func New(dbc *db.DB, proxy tidalproxy.TidalProxy, providers *provider.Registry, 
 			DefaultTTL:      genreCacheTTL,
 			CleanupInterval: 5 * time.Minute,
 		}),
-		genreAlbumCache: cache.New[[]tidalproxy.TidalAlbum](cache.Config{
+		genreAlbumCache: cache.New[[]tidal.TidalAlbum](cache.Config{
 			Name:            "genre-albums",
 			MaxSize:         20,
 			DefaultTTL:      genreAlbumCacheTTL,

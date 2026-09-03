@@ -127,15 +127,18 @@ type ProxyInstance struct {
 }
 
 type TidalAccount struct {
-	ID           int       `gorm:"primary_key"`
-	UserID       string    `gorm:"index"`
-	Username     string    `sql:"default: ''"`
-	RefreshToken string    `gorm:"not null"`
-	AccessToken  string    `sql:"default: ''"`
-	ExpiresAt    time.Time `sql:"DEFAULT:current_timestamp"`
-	IsActive     bool      `sql:"DEFAULT: true"`
-	CreatedAt    time.Time `sql:"DEFAULT:current_timestamp"`
-	UpdatedAt    time.Time `sql:"DEFAULT:current_timestamp"`
+	ID               int       `gorm:"primary_key"`
+	UserID           string    `gorm:"index"`
+	Username         string    `sql:"default: ''"`
+	RefreshToken     string    `gorm:"not null"`
+	AccessToken      string    `sql:"default: ''"`
+	SubscriptionType string    `sql:"default: 'PREMIUM'"` // e.g. "HIFI", "PREMIUM", "FREE"
+	HighestQuality   string    `sql:"default: 'HIGH'"`    // e.g. "HI_RES", "LOSSLESS", "HIGH", "LOW"
+	QualityTier      int       `sql:"default: 50"`        // e.g. 100 (HiRes), 80 (Lossless FLAC), 50 (High 320k)
+	ExpiresAt        time.Time `sql:"DEFAULT:current_timestamp"`
+	IsActive         bool      `sql:"DEFAULT: true"`
+	CreatedAt        time.Time `sql:"DEFAULT:current_timestamp"`
+	UpdatedAt        time.Time `sql:"DEFAULT:current_timestamp"`
 }
 
 // TrackMetadata stores the mapping between tracks and their album/artist.

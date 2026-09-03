@@ -270,7 +270,7 @@ func (c *Controller) ServeGetSongsByGenre(r *http.Request) *spec.Response {
 	trackList := make([]*spec.TrackChild, 0, len(tracks))
 	for _, t := range tracks {
 		if t.ID != 0 {
-			tc := spec.NewTrackFromTidal(&t)
+			tc := NewTrackFromTidal(&t)
 			c.applyTrackStar(user.ID, tc)
 			trackList = append(trackList, tc)
 		}

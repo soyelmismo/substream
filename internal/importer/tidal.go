@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 var tidalPlaylistRegex = regexp.MustCompile(`tidal\.com/playlist/([a-fA-F0-9-]+)|listen\.tidal\.com/playlist/([a-fA-F0-9-]+)`)
@@ -20,12 +20,12 @@ const tidalUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/53
 
 // TidalProvider implements playlist extraction from Tidal using hifi-api with web fallback
 type TidalProvider struct {
-	proxy  tidalproxy.TidalProxy
+	proxy  tidal.TidalProxy
 	client *http.Client
 }
 
 // NewTidalProvider creates a new TidalProvider with the given proxy
-func NewTidalProvider(proxy tidalproxy.TidalProxy) *TidalProvider {
+func NewTidalProvider(proxy tidal.TidalProxy) *TidalProvider {
 	return &TidalProvider{
 		proxy: proxy,
 		client: &http.Client{
@@ -78,8 +78,8 @@ func (t *TidalProvider) Fetch(ctx context.Context, playlistURL string) (*Importe
 	return t.fetchFromWeb(ctx, playlistUUID)
 }
 
-// convertTidalPlaylist converts tidalproxy.TidalPlaylist to ImportedPlaylist
-func (t *TidalProvider) convertTidalPlaylist(playlist *tidalproxy.TidalPlaylist) *ImportedPlaylist {
+// convertTidalPlaylist converts tidal.TidalPlaylist to ImportedPlaylist
+func (t *TidalProvider) convertTidalPlaylist(playlist *tidal.TidalPlaylist) *ImportedPlaylist {
 	result := &ImportedPlaylist{
 		Title:       playlist.Title,
 		Description: playlist.Description,

@@ -1,43 +1,18 @@
-package spec
+package ctrlsubsonic
 
 import (
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"go.senan.xyz/gonic/provider/tidal"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/tidalproxy"
 )
 
-// nonAsciiUnsafe matches any character that is NOT a safe filename char.
-// Allows: Unicode letters (incluye tildes, ñ, ü, etc.), numbers, space, period, hyphen, underscore
-var nonAsciiUnsafe = regexp.MustCompile(`[^\p{L}\p{N} ._-]+`)
-
-// sanitizeFilename sanitizes a string for safe use in filenames.
-// Removes all non-ASCII and unsafe filesystem characters.
-func sanitizeFilename(s string) string {
-	// First replace common unsafe chars with hyphen
-	replacer := strings.NewReplacer(
-		"/", "-",
-		"\\", "-",
-		":", "-",
-		"*", "",
-		"?", "",
-		"\"", "'",
-		"<", "",
-		">", "",
-		"|", "-",
-	)
-	s = replacer.Replace(s)
-	// Then remove all non-ASCII/unsafe unicode characters
-	s = nonAsciiUnsafe.ReplaceAllString(s, "")
-	return strings.TrimSpace(s)
-}
-
 // NewTrackFromTidal converts a Tidal track to Subsonic TrackChild
-func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
+func NewTrackFromTidal(t *tidal.TidalTrack) *spec.TrackChild {
 	artistName := t.Artist.Name
 	if len(t.Artists) > 0 {
 		artistName = t.Artists[0].Name
@@ -55,12 +30,6 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", coverIDValue)}
 
 	// Determine quality and suffix first
-	// [NOTE] For LOSSLESS/HI_RES_LOSSLESS, we report .m4a suffix for maximum
-	// client compatibility. The actual stream will be:
-	//   1. BTS (native FLAC) - prioritized by Shotgun for gapless playback
-	//   2. HLS unwrapped to direct fMP4 URL - extracted via manifest parsing
-	//   3. HLS stitched server-side - only if unwrap fails
-	// The audio quality is always lossless; the container format is transparent to clients.
 	suffix := "m4a"
 	bitrate := 320
 	contentType := "audio/mp4"
@@ -70,12 +39,11 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 		bitrate = 1411
 	}
 
-	// Build user-friendly path: audio/artista/NN. artista - titulo.formato
 	safeArtist := sanitizeFilename(artistName)
 	safeTitle := sanitizeFilename(t.Title)
 	path := fmt.Sprintf("audio/%s/%02d. %s - %s.%s", safeArtist, t.TrackNumber, safeArtist, safeTitle, suffix)
 
-	tc := &TrackChild{
+	tc := &spec.TrackChild{
 		ID:          trackID,
 		Title:       t.Title,
 		Album:       t.Album.Title,
@@ -99,11 +67,11 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 
 	// multi-artist
 	if len(t.Artists) > 0 {
-		tc.Artists = make([]*ArtistRef, len(t.Artists))
+		tc.Artists = make([]*spec.ArtistRef, len(t.Artists))
 		names := make([]string, len(t.Artists))
 		for i, a := range t.Artists {
 			id := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
-			tc.Artists[i] = &ArtistRef{ID: id, Name: a.Name}
+			tc.Artists[i] = &spec.ArtistRef{ID: id, Name: a.Name}
 			names[i] = a.Name
 		}
 		tc.DisplayArtist = strings.Join(names, ", ")
@@ -113,20 +81,20 @@ func NewTrackFromTidal(t *tidalproxy.TidalTrack) *TrackChild {
 }
 
 // NewAlbumFromTidal converts a Tidal album to Subsonic Album
-func NewAlbumFromTidal(a *tidalproxy.TidalAlbum) *Album {
+func NewAlbumFromTidal(a *tidal.TidalAlbum) *spec.Album {
 	albumID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
 
 	artistName := ""
 	var artistID *specid.ID
-	var artistRefs []*ArtistRef
+	var artistRefs []*spec.ArtistRef
 	if len(a.Artists) > 0 {
 		artistName = a.Artists[0].Name
 		artistID = &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.Artists[0].ID)}
-		artistRefs = make([]*ArtistRef, len(a.Artists))
+		artistRefs = make([]*spec.ArtistRef, len(a.Artists))
 		for i, ar := range a.Artists {
 			id := &specid.ID{URI: fmt.Sprintf("td:ar:%d", ar.ID)}
-			artistRefs[i] = &ArtistRef{ID: id, Name: ar.Name}
+			artistRefs[i] = &spec.ArtistRef{ID: id, Name: ar.Name}
 		}
 	}
 
@@ -135,7 +103,7 @@ func NewAlbumFromTidal(a *tidalproxy.TidalAlbum) *Album {
 		names[i] = ar.Name
 	}
 
-	return &Album{
+	return &spec.Album{
 		ID:            albumID,
 		ParentID:      artistID,
 		Name:          a.Title,
@@ -151,11 +119,11 @@ func NewAlbumFromTidal(a *tidalproxy.TidalAlbum) *Album {
 }
 
 // NewArtistFromTidal converts a Tidal artist to Subsonic Artist
-func NewArtistFromTidal(a *tidalproxy.TidalArtist) *Artist {
+func NewArtistFromTidal(a *tidal.TidalArtist) *spec.Artist {
 	id := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("td:ar:%d", a.ID)}
 
-	return &Artist{
+	return &spec.Artist{
 		ID:      id,
 		Name:    a.Name,
 		CoverID: coverID,
@@ -163,17 +131,17 @@ func NewArtistFromTidal(a *tidalproxy.TidalArtist) *Artist {
 }
 
 // ApplyTrackStar decorates a TrackChild with star info
-func ApplyTrackStar(tc *TrackChild, starDate *time.Time) {
+func ApplyTrackStar(tc *spec.TrackChild, starDate *time.Time) {
 	tc.Starred = starDate
 }
 
 // ApplyAlbumStar decorates an Album with star info
-func ApplyAlbumStar(a *Album, starDate *time.Time) {
+func ApplyAlbumStar(a *spec.Album, starDate *time.Time) {
 	a.Starred = starDate
 }
 
 // ApplyArtistStar decorates an Artist with star info
-func ApplyArtistStar(a *Artist, starDate *time.Time) {
+func ApplyArtistStar(a *spec.Artist, starDate *time.Time) {
 	a.Starred = starDate
 }
 

@@ -10,7 +10,7 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 func (c *Controller) ServePing(_ *http.Request) *spec.Response {
@@ -97,7 +97,7 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 
 	log.Printf("[SCROBBLE] track=%s user=%s submission=%s isSubmission=%v", uri, user.Name, submissionStr, isSubmission)
 
-	var track *tidalproxy.TidalTrack
+	var track *tidal.TidalTrack
 	if id.Provider() == "td" || id.Provider() == "" {
 		track, _ = c.proxy.GetTrackInfo(r.Context(), trackID)
 	}

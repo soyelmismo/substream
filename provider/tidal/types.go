@@ -1,4 +1,4 @@
-package tidalproxy
+package tidal
 
 // TidalTrack maps to hifi-api /info/ and /track/ responses
 type TidalTrack struct {
@@ -118,3 +118,13 @@ type TidalPlaylist struct {
 		Item TidalTrack `json:"item"`
 	} `json:"items,omitempty"`
 }
+
+// Type aliases for modern naming
+type (
+	Track    = TidalTrack
+	Album    = TidalAlbum
+	AlbumRef = TidalAlbumRef
+	Artist   = TidalArtist
+	Playlist = TidalPlaylist
+	Proxy    = TidalProxy
+)

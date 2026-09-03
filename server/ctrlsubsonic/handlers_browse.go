@@ -15,7 +15,7 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 func init() {
@@ -515,7 +515,7 @@ func appendUnique(slice []int, val int) []int {
 type hotLockPair struct {
 	mu     sync.Mutex
 	done   chan struct{}
-	albums []tidalproxy.TidalAlbum
+	albums []tidal.TidalAlbum
 	status int // 0=pending, 1=success, 2=error
 }
 
@@ -586,7 +586,7 @@ func (c *Controller) fetchHotFallback(ctx context.Context, albumIDs []int, neede
 }
 
 // appendAlbums appends unique albums from source to dest, up to needed count
-func appendAlbums(dest []int, source []tidalproxy.TidalAlbum, needed int) []int {
+func appendAlbums(dest []int, source []tidal.TidalAlbum, needed int) []int {
 	for _, album := range source {
 		if len(dest) >= needed {
 			break
@@ -601,7 +601,7 @@ func appendAlbums(dest []int, source []tidalproxy.TidalAlbum, needed int) []int 
 // fetchHotAlbumsWithFilter fetches albums from hot.monochrome.tf with a specific filter.
 // It uses the specified genre ID to fetch albums from the API, then batch fetches
 // full album metadata using concurrent goroutines with a semaphore for rate limiting.
-func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, filter string, genreID string) []tidalproxy.TidalAlbum {
+func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, filter string, genreID string) []tidal.TidalAlbum {
 	// Validate and cap limit to prevent excessive requests
 	const maxFetchLimit = 50
 	if limit <= 0 {
@@ -653,7 +653,7 @@ func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, fi
 	}
 
 	// Batch fetch albums with context awareness
-	albumChan := make(chan *tidalproxy.TidalAlbum, len(albumIDs))
+	albumChan := make(chan *tidal.TidalAlbum, len(albumIDs))
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, hotFetchConcurrency)
 
@@ -678,7 +678,7 @@ func (c *Controller) fetchHotAlbumsWithFilter(ctx context.Context, limit int, fi
 	wg.Wait()
 	close(albumChan)
 
-	var albums []tidalproxy.TidalAlbum
+	var albums []tidal.TidalAlbum
 	for album := range albumChan {
 		albums = append(albums, *album)
 	}

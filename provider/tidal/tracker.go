@@ -1,4 +1,4 @@
-package tidalproxy
+package tidal
 
 import (
 	"encoding/json"

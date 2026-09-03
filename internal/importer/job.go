@@ -23,7 +23,7 @@ import (
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/tidalproxy"
+	"go.senan.xyz/gonic/provider/tidal"
 )
 
 const (
@@ -38,7 +38,7 @@ type JobManager struct {
 	semaphore  chan struct{} // Limits concurrent jobs
 	activeJobs sync.Map      // playlistID -> context.CancelFunc
 	db         *db.DB
-	proxy      tidalproxy.TidalProxy
+	proxy      tidal.TidalProxy
 	providers  *provider.Registry
 	cachePath  string // Path for storing generated playlist covers
 }
@@ -50,7 +50,7 @@ type coverInfo struct {
 }
 
 // NewJobManager creates a new import job manager
-func NewJobManager(dbc *db.DB, proxy tidalproxy.TidalProxy, providers *provider.Registry, cachePath string) *JobManager {
+func NewJobManager(dbc *db.DB, proxy tidal.TidalProxy, providers *provider.Registry, cachePath string) *JobManager {
 	return &JobManager{
 		registry:  NewRegistry(proxy),
 		semaphore: make(chan struct{}, maxConcurrentImports),
@@ -368,7 +368,7 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 }
 
 // searchByISRC searches for a track by ISRC code
-func (jm *JobManager) searchByISRC(ctx context.Context, isrc string) *tidalproxy.TidalTrack {
+func (jm *JobManager) searchByISRC(ctx context.Context, isrc string) *tidal.TidalTrack {
 	// ISRC search via query parameter
 	results, err := jm.proxy.SearchTracks(ctx, "isrc:"+isrc, maxSearchResults, 0)
 	if err != nil {
