@@ -37,3 +37,4 @@ func TestDeezerSearchLive(t *testing.T) {
 		t.Errorf("expected provider 'dz', got %s", track.ID.Provider())
 	}
 }
+

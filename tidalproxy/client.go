@@ -31,6 +31,7 @@ type PoolConfig struct {
 	HealthInterval time.Duration
 	Timeout        time.Duration
 	Quality        string // default streaming quality
+	UserToken      string // user bearer token for full playback
 }
 
 type instance struct {
@@ -43,6 +44,7 @@ type Pool struct {
 	instances []*instance
 	client    *http.Client
 	quality   string
+	userToken string
 	mu        sync.RWMutex
 
 	// New mirror manager for intelligent selection
@@ -70,6 +72,7 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 			Timeout: cfg.Timeout,
 		},
 		quality:     cfg.Quality,
+		userToken:   strings.TrimSpace(cfg.UserToken),
 		streamCache: make(map[int]streamCacheEntry),
 	}
 
@@ -313,6 +316,9 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		req.Header.Set("X-Forwarded-For", clientIP)
 		req.Header.Set("X-Real-IP", clientIP)
 	}
+	if p.userToken != "" {
+		req.Header.Set("Authorization", "Bearer "+p.userToken)
+	}
 
 	start := time.Now()
 	resp, err := p.client.Do(req)
@@ -395,6 +401,9 @@ func (p *Pool) doFetchRawWithMirror(ctx context.Context, path string, query url.
 	if clientIP != "" {
 		req.Header.Set("X-Forwarded-For", clientIP)
 		req.Header.Set("X-Real-IP", clientIP)
+	}
+	if p.userToken != "" {
+		req.Header.Set("Authorization", "Bearer "+p.userToken)
 	}
 
 	start := time.Now()
@@ -1272,6 +1281,7 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 				URI               string   `json:"uri"`
 				Formats           []string `json:"formats"`
 				TrackPresentation string   `json:"trackPresentation"`
+				PreviewReason     string   `json:"previewReason"`
 			} `json:"attributes"`
 			Data struct {
 				ID         string `json:"id"`
@@ -1282,6 +1292,7 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 					URI               string   `json:"uri"`
 					Formats           []string `json:"formats"`
 					TrackPresentation string   `json:"trackPresentation"`
+					PreviewReason     string   `json:"previewReason"`
 				} `json:"attributes"`
 			} `json:"data"`
 		} `json:"data"`
@@ -1312,9 +1323,16 @@ func (p *Pool) executeStreamTask(ctx context.Context, task streamTask, trackID i
 	if trackPres == "" {
 		trackPres = v2Response.Data.Attributes.TrackPresentation
 	}
+	previewReason := v2Response.Data.Data.Attributes.PreviewReason
+	if previewReason == "" {
+		previewReason = v2Response.Data.Attributes.PreviewReason
+	}
 
-	if trackPres == "PREVIEW" {
-		log.Printf("[HLS] Track %d is marked as PREVIEW by Tidal, streaming available manifest", trackID)
+	// Rechazar manifiestos de preview (30s) para no engañar al reproductor
+	if trackPres == "PREVIEW" || previewReason != "" {
+		log.Printf("[HLS] Mirror %s returned PREVIEW for track %d (reason: %s), rejecting preview", task.Mirror.URL, trackID, previewReason)
+		res.Err = fmt.Errorf("track requires subscription (preview only: %s)", previewReason)
+		return res
 	}
 
 	// Extraer URL de un JSON Base64 (A veces V2 lo envía)

@@ -55,4 +55,8 @@ func TestQobuzSearchLive(t *testing.T) {
 	if track.ID.Provider() != "qb" {
 		t.Errorf("expected provider 'qb', got %s", track.ID.Provider())
 	}
+
+	streamURL, err := prov.GetStreamURL(context.Background(), track.ID.RawID(), "LOSSLESS", "")
+	t.Logf("Qobuz stream resolution for %s (%s): url=%q, err=%v", track.Title, track.ID.RawID(), streamURL, err)
 }
+

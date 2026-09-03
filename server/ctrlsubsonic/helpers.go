@@ -270,13 +270,26 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	wg.Wait()
 
 	// Cross-Provider ISRC Fallback:
-	// If primary provider stream failed, attempt resolution across other registered providers by ISRC
-	if (urlErr != nil || url == "") && track != nil && track.ISRC != "" && c.providers != nil {
+	// If primary provider stream failed or returned a preview sample for a longer track,
+	// attempt resolution across other registered providers by ISRC
+	isSamplePreview := strings.Contains(url, "range=20-30") || strings.Contains(url, "range=0-30") || strings.Contains(url, "preview")
+	needsFallback := urlErr != nil || url == "" || (isSamplePreview && track != nil && track.Duration > 45)
+
+	if needsFallback && track != nil && track.ISRC != "" && c.providers != nil {
 		if fallbackURL, fallbackProv, err := c.providers.ResolveStreamByISRC(ctx, track.ISRC, quality, clientIP, id.Provider()); err == nil && fallbackURL != "" {
-			log.Printf("[STREAM] ISRC RESOLUTION: Resolved %s (ISRC %s) via %s", id.String(), track.ISRC, fallbackProv.Name())
-			url = fallbackURL
-			urlErr = nil
+			fallbackIsPreview := strings.Contains(fallbackURL, "range=20-30") || strings.Contains(fallbackURL, "range=0-30") || strings.Contains(fallbackURL, "preview")
+			if !fallbackIsPreview {
+				log.Printf("[STREAM] ISRC RESOLUTION: Resolved %s (ISRC %s) via %s", id.String(), track.ISRC, fallbackProv.Name())
+				url = fallbackURL
+				urlErr = nil
+				isSamplePreview = false
+			}
 		}
+	}
+
+	// Strictly reject previews - do not serve 30-second clips for full songs
+	if isSamplePreview && track != nil && track.Duration > 45 {
+		return nil, fmt.Errorf("track requires subscription: 30-second preview rejected")
 	}
 
 	if urlErr != nil {

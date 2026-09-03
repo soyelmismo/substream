@@ -223,12 +223,7 @@ func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality s
 		}
 	}
 
-	// 2. Fallback to track preview if available
-	if track.Preview != "" {
-		return track.Preview, nil
-	}
-
-	return "", fmt.Errorf("no stream URL available for Deezer track %d", track.ID)
+	return "", fmt.Errorf("no full stream available for Deezer track %d (requires active mirror/subscription)", track.ID)
 }
 
 func (c *Client) getCustomStreamURL(ctx context.Context, track *DeezerTrack, format string) (string, error) {

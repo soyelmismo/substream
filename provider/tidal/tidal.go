@@ -75,10 +75,11 @@ func New(proxy tidalproxy.TidalProxy) *Provider {
 
 // Bootstrap creates and initializes a fully autonomous Tidal provider:
 // configuring the mirror pool, auto-seeding SQLite if empty, and launching mirror discovery.
-func Bootstrap(dbc *db.DB, cliURLs []string) *Provider {
+func Bootstrap(dbc *db.DB, cliURLs []string, userToken string) *Provider {
 	pool := tidalproxy.NewPool(cliURLs, tidalproxy.PoolConfig{
 		HealthInterval: 30 * time.Second,
 		Timeout:        10 * time.Second,
+		UserToken:      userToken,
 	})
 	cachedProxy := tidalproxy.NewCachedProxy(pool, dbc, 30*24*time.Hour)
 

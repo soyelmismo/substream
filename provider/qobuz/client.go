@@ -280,6 +280,9 @@ func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality string
 	}
 
 	if res.URL != "" {
+		if strings.Contains(res.URL, "range=20-30") || strings.Contains(res.URL, "range=0-30") {
+			return "", fmt.Errorf("qobuz track requires subscription (preview only)")
+		}
 		return res.URL, nil
 	}
 

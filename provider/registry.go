@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -274,9 +275,12 @@ func (r *Registry) ResolveStreamByISRC(ctx context.Context, isrc string, quality
 		}
 		streamURL, err := p.GetStreamURL(ctx, t.ID.RawID(), quality, clientIP)
 		if err == nil && streamURL != "" {
-			return streamURL, p, nil
+			isPreview := strings.Contains(streamURL, "range=20-30") || strings.Contains(streamURL, "range=0-30") || (t.Duration > 45 && strings.Contains(streamURL, "preview"))
+			if !isPreview {
+				return streamURL, p, nil
+			}
 		}
 	}
 
-	return "", nil, fmt.Errorf("no stream found for ISRC %s across registered providers", isrc)
+	return "", nil, fmt.Errorf("no full stream found for ISRC %s across registered providers", isrc)
 }
