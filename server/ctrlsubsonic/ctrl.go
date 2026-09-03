@@ -315,7 +315,12 @@ func resp(h handlerSubsonic) http.Handler {
 
 func respRaw(h handlerSubsonicRaw) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := writeResp(w, r, h(w, r)); err != nil {
+		resp := h(w, r)
+		// If handler returns nil, it already wrote the response directly (e.g., HLS proxy)
+		if resp == nil {
+			return
+		}
+		if err := writeResp(w, r, resp); err != nil {
 			log.Printf("error writing raw subsonic response: %v\n", err)
 		}
 	})

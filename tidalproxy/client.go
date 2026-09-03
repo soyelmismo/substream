@@ -1426,6 +1426,46 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 		}
 	}
 
+	// [FAST-PATH] Intentar el primer task (mejor mirror + mejor combo) con timeout corto (300ms)
+	// Esto optimiza para clientes HLS nativos (Supersonic) que tienen timeouts cortos.
+	// Si el mejor mirror responde rápido, evitamos el overhead del shotgun hedge completo.
+	if len(tasks) > 0 {
+		bestTask := tasks[0]
+		fastCtx, fastCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer fastCancel()
+
+		start := time.Now()
+		res := p.executeStreamTask(fastCtx, bestTask, trackID, clientIP)
+		latency := time.Since(start)
+
+		if res.Err == nil && res.URL != "" {
+			// Fast-path exitoso! Guardar en caché y retornar inmediatamente
+			p.streamCacheMu.Lock()
+			p.streamCache[trackID] = streamCacheEntry{
+				URL:       res.URL,
+				Timestamp: time.Now(),
+				Quality:   res.Quality,
+			}
+			p.streamCacheMu.Unlock()
+
+			if p.mirrorMgr != nil {
+				p.mirrorMgr.ReportResult(res.Mirror, latency, nil)
+			}
+			if res.ManifestType == "BTS" {
+				res.Mirror.ReportBTS()
+			} else {
+				res.Mirror.ReportHLS()
+			}
+
+			log.Printf("[FAST-PATH] Track %d: %s (%s) desde %s en %v",
+				trackID, res.Quality, res.ManifestType, res.Mirror.URL, latency)
+			return res.URL, nil
+		}
+
+		// Fast-path falló, continuar con shotgun hedge
+		log.Printf("[FAST-PATH] Track %d: fallback a shotgun hedge (%v)", trackID, res.Err)
+	}
+
 	// ¡DISPARAR EL ESCOPETAZO CON BATCHING PROGRESIVO!
 	// Procesar en batches de 3 para no saturar Tidal (mismo patrón que playlists)
 	// [OPTIMIZACIÓN KARMA] Si el mejor mirror tiene alto karma, usamos 2 concurrentes
