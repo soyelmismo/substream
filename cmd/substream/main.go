@@ -19,7 +19,6 @@ import (
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrladmin"
 	"go.senan.xyz/gonic/server/ctrlsubsonic"
-	"go.senan.xyz/gonic/tidalproxy"
 )
 
 // compactLogWriter wraps log output with compact timestamp format
@@ -113,53 +112,13 @@ func main() {
 		}
 	}
 
-	// Tidal Proxy Pool
-	urls := strings.Split(*confProxyURLs, ",")
-	proxyPool := tidalproxy.NewPool(urls, tidalproxy.PoolConfig{
-		HealthInterval: 30 * time.Second,
-		Timeout:        10 * time.Second,
-	})
-	proxy := tidalproxy.NewCachedProxy(proxyPool, dbc, 30*24*time.Hour) // 30 days, matching SQLite TTL
+	// Multi-Provider Registry
+	providers := provider.NewRegistry()
 
-	// Load proxies from DB if any
-	dbProxies, _ := dbc.GetProxies()
-	if len(dbProxies) == 0 {
-		log.Printf("No proxies in database. Seeding with community defaults")
-		seeds := []string{
-			"https://us-west.monochrome.tf",
-			"https://frankfurt-1.monochrome.tf",
-			"https://ohio-1.monochrome.tf",
-			"https://eu-central.monochrome.tf",
-			"https://monochrome-api.samidy.com",
-			"https://singapore-1.monochrome.tf",
-		}
-		for _, u := range seeds {
-			dbc.AddProxy(u, "Community", "auto-seed")
-		}
-		// also add CLI defaults if explicitly provided
-		for _, u := range urls {
-			if u != "" && u != "http://localhost:8000" {
-				dbc.AddProxy(u, "CLI Default", "cli")
-			}
-		}
-
-		dbProxies, _ = dbc.GetProxies()
-	}
-
-	if len(dbProxies) > 0 {
-		var dbURLs []string
-		for _, p := range dbProxies {
-			dbURLs = append(dbURLs, p.URL)
-		}
-		proxyPool.SetInstances(dbURLs)
-	}
-
-	// Background Auto-Discovery (Trackers)
-	trackers := []string{
-		"https://tidal-uptime.jiffy-puffs-1j.workers.dev",
-		"https://tidal-uptime.props-76styles.workers.dev",
-	}
-	proxyPool.StartDiscovery(trackers, 30*time.Minute, dbc)
+	// Tidal Provider (self-contained mirror pool, default seeds, and auto-discovery)
+	cliURLs := strings.Split(*confProxyURLs, ",")
+	tidalProvider := tidal.Bootstrap(dbc, cliURLs)
+	providers.Register(tidalProvider)
 
 	// Scrobblers (Keep empty for Phase 1 MVP, can add ListenBrainz here)
 	var scrobblers []scrobble.Scrobbler
@@ -168,18 +127,15 @@ func main() {
 	sessDB := gormstore.New(dbc.DB, []byte("substream-secret-change-me"))
 	go sessDB.PeriodicCleanup(1*time.Hour, make(chan struct{}))
 
-	// Multi-Provider Registry
-	providers := provider.NewRegistry()
-	providers.Register(tidal.New(proxy))
-
-	ctrlSubsonic := ctrlsubsonic.New(dbc, proxy, providers, scrobblers, *confCachePath)
+	// Controllers
+	ctrlSubsonic := ctrlsubsonic.New(dbc, tidalProvider.Proxy(), providers, scrobblers, *confCachePath)
 	resolveProxyPath := func(in string) string {
 		if *confProxyPrefix == "" {
 			return in
 		}
 		return *confProxyPrefix + in
 	}
-	ctrlAdmin, err := ctrladmin.New(dbc, sessDB, proxy, resolveProxyPath)
+	ctrlAdmin, err := ctrladmin.New(dbc, sessDB, tidalProvider.Proxy(), resolveProxyPath)
 
 	if err != nil {
 		log.Fatalf("Error initializing admin controller: %v", err)

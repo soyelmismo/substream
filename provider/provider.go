@@ -46,3 +46,9 @@ type MusicProvider interface {
 	GetSimilarArtists(ctx context.Context, artistRawID string) ([]*spec.Artist, error)
 	GetRecommendations(ctx context.Context, trackRawID string) ([]*spec.TrackChild, error)
 }
+
+// SeedProvider is an optional interface implemented by providers that manage mirror pools or default seeds.
+type SeedProvider interface {
+	DefaultSeeds() []string
+	DefaultTrackers() []string
+}

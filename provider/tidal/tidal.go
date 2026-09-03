@@ -3,11 +3,14 @@ package tidal
 import (
 	"context"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -16,6 +19,22 @@ import (
 
 var nonAsciiUnsafe = regexp.MustCompile(`[^\p{L}\p{N} ._-]+`)
 var lrcRegex = regexp.MustCompile(`^\[(\d{2}):(\d{2}\.\d{2,3})\]\s*(.*)$`)
+
+// DefaultSeeds contains verified community-operated regional mirrors for Tidal
+var DefaultSeeds = []string{
+	"https://us-west.monochrome.tf",
+	"https://frankfurt-1.monochrome.tf",
+	"https://ohio-1.monochrome.tf",
+	"https://eu-central.monochrome.tf",
+	"https://monochrome-api.samidy.com",
+	"https://singapore-1.monochrome.tf",
+}
+
+// DefaultTrackers contains public status trackers for Tidal mirrors
+var DefaultTrackers = []string{
+	"https://tidal-uptime.jiffy-puffs-1j.workers.dev",
+	"https://tidal-uptime.props-76styles.workers.dev",
+}
 
 func sanitizeFilename(s string) string {
 	replacer := strings.NewReplacer(
@@ -46,7 +65,7 @@ func parseYear(date string) int {
 	return 0
 }
 
-// Provider implements provider.MusicProvider using tidalproxy backend.
+// Provider implements provider.MusicProvider and provider.SeedProvider using tidalproxy backend.
 type Provider struct {
 	proxy tidalproxy.TidalProxy
 }
@@ -56,12 +75,58 @@ func New(proxy tidalproxy.TidalProxy) *Provider {
 	return &Provider{proxy: proxy}
 }
 
+// Bootstrap creates and initializes a fully autonomous Tidal provider:
+// configuring the mirror pool, auto-seeding SQLite if empty, and launching mirror discovery.
+func Bootstrap(dbc *db.DB, cliURLs []string) *Provider {
+	pool := tidalproxy.NewPool(cliURLs, tidalproxy.PoolConfig{
+		HealthInterval: 30 * time.Second,
+		Timeout:        10 * time.Second,
+	})
+	cachedProxy := tidalproxy.NewCachedProxy(pool, dbc, 30*24*time.Hour)
+
+	// Seed mirrors if SQLite table is empty
+	dbProxies, _ := dbc.GetProxies()
+	if len(dbProxies) == 0 {
+		log.Printf("[TIDAL] No mirrors found in database. Auto-seeding default regional mirrors")
+		for _, u := range DefaultSeeds {
+			dbc.AddProxy(u, "Community", "auto-seed")
+		}
+		for _, u := range cliURLs {
+			if u != "" && u != "http://localhost:8000" {
+				dbc.AddProxy(u, "CLI Default", "cli")
+			}
+		}
+		dbProxies, _ = dbc.GetProxies()
+	}
+
+	if len(dbProxies) > 0 {
+		var dbURLs []string
+		for _, p := range dbProxies {
+			dbURLs = append(dbURLs, p.URL)
+		}
+		pool.SetInstances(dbURLs)
+	}
+
+	// Start background auto-discovery from trackers
+	pool.StartDiscovery(DefaultTrackers, 30*time.Minute, dbc)
+
+	return New(cachedProxy)
+}
+
 func (p *Provider) ID() string {
 	return "td"
 }
 
 func (p *Provider) Name() string {
 	return "Tidal"
+}
+
+func (p *Provider) DefaultSeeds() []string {
+	return DefaultSeeds
+}
+
+func (p *Provider) DefaultTrackers() []string {
+	return DefaultTrackers
 }
 
 // Proxy returns the underlying TidalProxy if direct access is needed
