@@ -1648,7 +1648,7 @@ func (c *Controller) ServeProviders(r *http.Request) *Response {
 		AudioEnabled:    isAudio("yt"),
 		AccountsCount:   1,
 		Details: []string{
-			"Engine: yt-dlp 2026.8.19 (Node.js runtime)",
+			"Engine: yt-dlp (Python resident worker in RAM & CLI fallback)",
 			"Catalog: InnerTube API (music.youtube.com official songs)",
 			"Stream URL Caching: 1-hour in-memory TTL",
 		},
