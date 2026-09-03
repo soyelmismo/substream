@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,10 +21,13 @@ const (
 
 // Client interacts with the Deezer API
 type Client struct {
-	httpClient *http.Client
-	baseURL    string
-	customURL  string // Optional custom Deezer proxy/mirror
-	arl        string // Optional Deezer ARL cookie
+	httpClient      *http.Client
+	baseURL         string
+	customURL       string // Optional custom Deezer proxy/mirror
+	arl             string // Optional Deezer ARL cookie
+	mirrorHealthy   bool
+	lastHealthCheck time.Time
+	mu              sync.RWMutex
 }
 
 // ClientOptions configures Deezer client
@@ -45,10 +50,11 @@ func NewClient(opts ClientOptions) *Client {
 	}
 
 	return &Client{
-		httpClient: &http.Client{Timeout: timeout},
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		customURL:  strings.TrimRight(strings.TrimSpace(opts.CustomURL), "/"),
-		arl:        strings.TrimSpace(opts.ARL),
+		httpClient:    &http.Client{Timeout: timeout},
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		customURL:     strings.TrimRight(strings.TrimSpace(opts.CustomURL), "/"),
+		arl:           strings.TrimSpace(opts.ARL),
+		mirrorHealthy: true, // Optimistically true until first check
 	}
 }
 
@@ -205,14 +211,100 @@ func (c *Client) SearchByISRC(ctx context.Context, isrc string) (*DeezerTrack, e
 	return &track, nil
 }
 
+// isMirrorHealthy checks if the custom mirror is alive and has available accounts.
+// Caches results for 5 minutes to avoid polling latency.
+func (c *Client) isMirrorHealthy(ctx context.Context) bool {
+	if c.customURL == "" {
+		return false
+	}
+
+	c.mu.RLock()
+	if time.Since(c.lastHealthCheck) < 5*time.Minute {
+		healthy := c.mirrorHealthy
+		c.mu.RUnlock()
+		return healthy
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Double check after acquiring write lock
+	if time.Since(c.lastHealthCheck) < 5*time.Minute {
+		return c.mirrorHealthy
+	}
+
+	c.lastHealthCheck = time.Now()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.customURL, nil)
+	if err != nil {
+		c.mirrorHealthy = false
+		return false
+	}
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	// Quick check with 3s timeout
+	checkClient := &http.Client{Timeout: 3 * time.Second}
+	resp, err := checkClient.Do(req)
+	if err != nil {
+		log.Printf("[DEEZER] ⚠️ Mirror %s health check failed (unreachable): %v", c.customURL, err)
+		c.mirrorHealthy = false
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[DEEZER] ⚠️ Mirror %s returned HTTP %d on health check", c.customURL, resp.StatusCode)
+		c.mirrorHealthy = false
+		return false
+	}
+
+	var status struct {
+		OK       *bool `json:"ok"`
+		Accounts struct {
+			Available int `json:"available"`
+			Total     int `json:"total"`
+			Dead      int `json:"dead"`
+		} `json:"accounts"`
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.mirrorHealthy = false
+		return false
+	}
+
+	if err := json.Unmarshal(body, &status); err == nil {
+		// If JSON has accounts structure (like dzr / deezflow instances)
+		if status.Accounts.Total > 0 && status.Accounts.Available == 0 {
+			log.Printf("[DEEZER] ⚠️ Mirror %s has 0 available accounts (dead: %d). Circuit breaker open: skipping calls in 0ms.",
+				c.customURL, status.Accounts.Dead)
+			c.mirrorHealthy = false
+			return false
+		}
+		if status.OK != nil && !*status.OK {
+			log.Printf("[DEEZER] ⚠️ Mirror %s reported ok=false. Circuit breaker open: skipping calls in 0ms.", c.customURL)
+			c.mirrorHealthy = false
+			return false
+		}
+	}
+
+	c.mirrorHealthy = true
+	return true
+}
+
 // GetStreamURL returns the audio stream URL for a track
 func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality string) (string, error) {
 	if track == nil {
 		return "", fmt.Errorf("nil track")
 	}
 
-	// 1. If custom mirror is configured, query custom instance (e.g. dzr instance)
+	// 1. If custom mirror is configured and healthy, query custom instance (e.g. dzr instance)
 	if c.customURL != "" {
+		if !c.isMirrorHealthy(ctx) {
+			return "", fmt.Errorf("deezer mirror %s is unhealthy (no active accounts)", c.customURL)
+		}
+
 		format := "FLAC"
 		if strings.ToUpper(quality) == "LOW" || strings.ToUpper(quality) == "HIGH" {
 			format = "MP3_320"
@@ -221,6 +313,12 @@ func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality s
 		if err == nil && customStream != "" {
 			return customStream, nil
 		}
+
+		// Trip breaker if call failed (e.g. 403 Forbidden or no accounts)
+		c.mu.Lock()
+		c.mirrorHealthy = false
+		c.lastHealthCheck = time.Now()
+		c.mu.Unlock()
 	}
 
 	return "", fmt.Errorf("no full stream available for Deezer track %d (requires active mirror/subscription)", track.ID)
