@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"io"
 
+	"go.senan.xyz/gonic/internal/media/tagger"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 )
 
@@ -56,4 +58,19 @@ type SeedProvider interface {
 // ISRCResolver is an optional interface implemented by providers that support resolving tracks by ISRC
 type ISRCResolver interface {
 	GetTrackByISRC(ctx context.Context, isrc string) (*spec.TrackChild, error)
+}
+
+// DownloadRequest contains parameters for streaming or downloading a track
+type DownloadRequest struct {
+	TrackID       string
+	Quality       string
+	ClientIP      string
+	ClientName    string
+	OffsetSeconds float64
+	Metadata      *tagger.Metadata
+}
+
+// MediaDownloader is an optional interface implemented by providers with custom download/stream mechanics
+type MediaDownloader interface {
+	DownloadTrack(ctx context.Context, req DownloadRequest, w io.Writer) error
 }

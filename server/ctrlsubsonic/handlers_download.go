@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/internal/media/streamer"
+	"go.senan.xyz/gonic/internal/media/tagger"
+	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -37,18 +39,19 @@ func (c *Controller) ServeDownload(w http.ResponseWriter, r *http.Request) *spec
 	// Determine what type of entity we're downloading
 	switch id.Type() {
 	case specid.Album:
-		return c.serveAlbumDownload(w, r, id.Value(), user)
+		return c.serveAlbumDownload(w, r, &id, user)
 	case specid.Playlist:
 		return c.servePlaylistDownload(w, r, id.Value(), user)
 	case specid.Track:
 		// For single tracks, download with proper filename
-		return c.serveTrackDownload(w, r, id.Value(), user)
+		return c.serveTrackDownload(w, r, &id, user)
 	default:
 		return spec.NewError(10, "unsupported id type for download")
 	}
 }
 
-func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, albumID int, _ *db.User) *spec.Response {
+func (c *Controller) serveAlbumDownload(w http.ResponseWriter, r *http.Request, id *specid.ID, _ *db.User) *spec.Response {
+	albumID := id.Value()
 	p := r.Context().Value(CtxParams).(params.Params)
 
 	// Get album info from Tidal API
@@ -152,31 +155,98 @@ func (c *Controller) servePlaylistDownload(_ http.ResponseWriter, _ *http.Reques
 	return spec.NewError(0, "playlist download not supported")
 }
 
-func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, trackID int, _ *db.User) *spec.Response {
-	id := &specid.ID{URI: fmt.Sprintf("td:tr:%d", trackID)}
+func (c *Controller) buildTaggerMetadata(ctx context.Context, track *tidal.TidalTrack) *tagger.Metadata {
+	if track == nil {
+		return nil
+	}
+	coverURL := ""
+	if track.Album.Cover != "" {
+		coverURL = c.proxy.GetCoverURL(track.Album.Cover, 1280)
+	} else if track.Album.ID > 0 {
+		covUUID := c.proxy.GetCoverUUIDForAlbum(ctx, track.Album.ID)
+		if covUUID != "" {
+			coverURL = c.proxy.GetCoverURL(covUUID, 1280)
+		}
+	}
+	artistName := track.Artist.Name
+	albumArtist := artistName
+	if len(track.Artists) > 0 {
+		albumArtist = track.Artists[0].Name
+	}
+
+	return &tagger.Metadata{
+		Title:       track.Title,
+		Artist:      artistName,
+		Album:       track.Album.Title,
+		AlbumArtist: albumArtist,
+		TrackNumber: track.TrackNumber,
+		DiscNumber:  track.VolumeNumber,
+		Date:        track.Album.ReleaseDate,
+		ISRC:        track.ISRC,
+		CoverURL:    coverURL,
+	}
+}
+
+func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, id *specid.ID, _ *db.User) *spec.Response {
 	prep, err := c.prepareStream(r.Context(), r, id)
 	if err != nil {
 		return spec.NewError(0, "error preparing download: %v", err)
 	}
 
-	// Create filename
-	filename := fmt.Sprintf("%s - %s.%s", prep.Track.Artist.Name, prep.Track.Title, prep.Ext)
+	cleanArtist := "Unknown Artist"
+	cleanTitle := "Unknown Title"
+	ext := prep.Ext
+	if ext == "" {
+		ext = "flac"
+	}
+	if prep.Track != nil {
+		if prep.Track.Artist.Name != "" {
+			cleanArtist = prep.Track.Artist.Name
+		}
+		if prep.Track.Title != "" {
+			cleanTitle = prep.Track.Title
+		}
+	}
+
+	filename := fmt.Sprintf("%s - %s.%s", cleanArtist, cleanTitle, ext)
 	filename = sanitizeFilename(filename)
 
-	// Set headers for download
-	w.Header().Set("Content-Type", "audio/"+prep.Ext)
+	w.Header().Set("Content-Type", "audio/"+ext)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	w.Header().Set("Cache-Control", "no-cache")
 
-	log.Printf("[DOWNLOAD] Starting single track download: track=%d artist=%q title=%q quality=%s", trackID, prep.Track.Artist.Name, prep.Track.Title, prep.Quality)
+	log.Printf("[DOWNLOAD] Starting single track download: id=%s artist=%q title=%q quality=%s", id.String(), cleanArtist, cleanTitle, prep.Quality)
 
-	// Download and stream the track
+	meta := c.buildTaggerMetadata(r.Context(), prep.Track)
+
+	// Delegate to provider if it implements MediaDownloader (e.g. Tidal, YouTube Music)
+	prov := c.getProvider(id.Provider())
+	if prov != nil {
+		if dl, ok := prov.(provider.MediaDownloader); ok {
+			req := provider.DownloadRequest{
+				TrackID:       id.RawID(),
+				Quality:       prep.Quality,
+				ClientIP:      prep.ClientIP,
+				ClientName:    prep.ClientName,
+				OffsetSeconds: 0,
+				Metadata:      meta,
+			}
+			if err := dl.DownloadTrack(r.Context(), req, w); err != nil {
+				log.Printf("[DOWNLOAD] Provider %s download failed: %v", id.Provider(), err)
+				return spec.NewError(0, "download failed: %v", err)
+			}
+			log.Printf("[DOWNLOAD] Single track download complete via %s: id=%s", id.Provider(), id.String())
+			return nil
+		}
+	}
+
+	// Fallback to universal downloader
 	if err := c.downloadAndAddToZip(r.Context(), prep.StreamURL, w, prep.ClientIP, prep.Track); err != nil {
-		log.Printf("[DOWNLOAD] Error downloading track %d: %v", trackID, err)
+		log.Printf("[DOWNLOAD] Error downloading track %s: %v", id.String(), err)
 		return spec.NewError(0, "download failed: %v", err)
 	}
 
-	log.Printf("[DOWNLOAD] Single track download complete: track=%d", trackID)
+	log.Printf("[DOWNLOAD] Single track download complete: id=%s", id.String())
 	return nil
 }
 
@@ -186,49 +256,14 @@ func (c *Controller) downloadAndAddToZip(ctx context.Context, streamURL string, 
 	isDASH := strings.Contains(streamURL, ".mpd") || strings.Contains(streamURL, "manifestType=MPEG_DASH")
 
 	if isHLS {
-		// Use HLS stitcher - download and concatenate all segments (no seeking for downloads)
 		return c.downloadAndStitchHLS(ctx, streamURL, w, clientIP, track, 0, 0, 0, "download")
 	}
 	if isDASH {
-		// Use DASH stitcher (no seeking for downloads, offset=0)
 		return c.downloadAndStitchDASH(ctx, streamURL, w, clientIP, track, 0)
 	}
 
-	// Direct download for non-manifest URLs
-	// Use shared client with keep-alive for better performance
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  true, // Audio is already compressed
-		},
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", streamURL, nil)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	if clientIP != "" {
-		req.Header.Set("X-Forwarded-For", clientIP)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("download stream: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("stream returned %d", resp.StatusCode)
-	}
-
-	// Use larger buffer for faster copying
-	buf := make([]byte, 32*1024) // 32KB buffer
-	_, err = io.CopyBuffer(w, resp.Body, buf)
-	return err
+	meta := c.buildTaggerMetadata(ctx, track)
+	return streamer.Download(ctx, streamURL, w, meta, clientIP, c.streamClient)
 }
 
 // sanitizeFilename sanitizes a string for safe use in filenames.
