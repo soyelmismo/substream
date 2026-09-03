@@ -124,20 +124,21 @@ func main() {
 	if len(dbProxies) == 0 {
 		log.Printf("No proxies in database. Seeding with community defaults")
 		seeds := []string{
+			"https://us-west.monochrome.tf",
+			"https://frankfurt-1.monochrome.tf",
+			"https://ohio-1.monochrome.tf",
+			"https://eu-central.monochrome.tf",
 			"https://monochrome-api.samidy.com",
-			"https://api.monochrome.tf",
-			"https://hifi.geeked.wtf",
-			"https://wolf.qqdl.site",
-			"https://maus.qqdl.site",
-			"https://vogel.qqdl.site",
-			"https://katze.qqdl.site",
+			"https://singapore-1.monochrome.tf",
 		}
 		for _, u := range seeds {
 			dbc.AddProxy(u, "Community", "auto-seed")
 		}
-		// also add CLI defaults if not already present
+		// also add CLI defaults if explicitly provided
 		for _, u := range urls {
-			dbc.AddProxy(u, "CLI Default", "cli")
+			if u != "" && u != "http://localhost:8000" {
+				dbc.AddProxy(u, "CLI Default", "cli")
+			}
 		}
 
 		dbProxies, _ = dbc.GetProxies()

@@ -1104,6 +1104,11 @@ func filterMirrorError(err error) error {
 // Returns the working URL (proxied or direct) and true if successful
 // Replicates verification headers to match the original request
 func tryProxyURL(proxiedURL string, client *http.Client, clientIP string) (string, bool) {
+	// If it's already a direct URL (not rewritten to a proxy endpoint), it's immediately valid
+	if !strings.Contains(proxiedURL, "proxy-audio") {
+		return proxiedURL, true
+	}
+
 	// Quick HEAD check to proxy-audio (500ms timeout)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -1858,21 +1863,9 @@ func (p *Pool) GetLyrics(ctx context.Context, trackID int) (*TidalLyrics, error)
 	return &resp.Lyrics, nil
 }
 
-// Manifest Parsing
-const monochromeAudioProxy = "https://monochrome.tf/proxy-audio"
-
-// rewriteAudioURL rewrites Tidal audio URLs to use monochrome proxy-audio
+// rewriteAudioURL returns direct Tidal audio URLs (monochrome proxy-audio is defunct)
 func rewriteAudioURL(originalURL string) string {
-	// Only rewrite URLs from Tidal's audio CDN
-	if !strings.Contains(originalURL, "tidal.com") && !strings.Contains(originalURL, "tidalhifi.com") {
-		return originalURL
-	}
-	// Skip HLS manifests (.m3u8) - those are handled differently
-	if strings.Contains(originalURL, ".m3u8") || strings.Contains(originalURL, "manifest") {
-		return originalURL
-	}
-	// Rewrite through proxy-audio
-	return fmt.Sprintf("%s?url=%s", monochromeAudioProxy, url.QueryEscape(originalURL))
+	return originalURL
 }
 
 func parseManifestURL(trackID int, version, mimeType, manifest string) (string, error) {
