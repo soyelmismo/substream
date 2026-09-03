@@ -276,6 +276,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	needsFallback := urlErr != nil || url == "" || (isSamplePreview && track != nil && track.Duration > 45)
 
 	if needsFallback && track != nil && track.ISRC != "" && c.providers != nil {
+		log.Printf("[STREAM] Triggering cross-provider ISRC fallback for %s (ISRC: %s)", id.String(), track.ISRC)
 		if fallbackURL, fallbackProv, err := c.providers.ResolveStreamByISRC(ctx, track.ISRC, quality, clientIP, id.Provider()); err == nil && fallbackURL != "" {
 			fallbackIsPreview := strings.Contains(fallbackURL, "range=20-30") || strings.Contains(fallbackURL, "range=0-30") || strings.Contains(fallbackURL, "preview")
 			if !fallbackIsPreview {
@@ -284,6 +285,8 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 				urlErr = nil
 				isSamplePreview = false
 			}
+		} else {
+			log.Printf("[STREAM] Cross-provider ISRC fallback failed for %s (ISRC: %s): %v", id.String(), track.ISRC, err)
 		}
 	}
 
