@@ -20,19 +20,17 @@ import (
 var nonAsciiUnsafe = regexp.MustCompile(`[^\p{L}\p{N} ._-]+`)
 var lrcRegex = regexp.MustCompile(`^\[(\d{2}):(\d{2}\.\d{2,3})\]\s*(.*)$`)
 
-// DefaultSeeds contains verified community-operated regional mirrors for Tidal
+// DefaultSeeds contains verified active regional mirrors for Tidal
 var DefaultSeeds = []string{
-	"https://us-west.monochrome.tf",
-	"https://frankfurt-1.monochrome.tf",
 	"https://ohio-1.monochrome.tf",
+	"https://frankfurt-1.monochrome.tf",
 	"https://eu-central.monochrome.tf",
-	"https://monochrome-api.samidy.com",
+	"https://us-west.monochrome.tf",
 	"https://singapore-1.monochrome.tf",
 }
 
 // DefaultTrackers contains public status trackers for Tidal mirrors
 var DefaultTrackers = []string{
-	"https://tidal-uptime.jiffy-puffs-1j.workers.dev",
 	"https://tidal-uptime.props-76styles.workers.dev",
 }
 
