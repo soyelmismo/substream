@@ -170,7 +170,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					tracksCh <- nil
 				}
 			}()
-			if songCount <= 0 || prov == nil {
+			if songCount <= 0 || prov == nil || !c.providers.IsMetadataEnabled(prov.ID()) {
 				tracksCh <- nil
 				return
 			}
@@ -199,7 +199,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					artistsCh <- nil
 				}
 			}()
-			if artistCount <= 0 || prov == nil {
+			if artistCount <= 0 || prov == nil || !c.providers.IsMetadataEnabled(prov.ID()) {
 				artistsCh <- nil
 				return
 			}
@@ -228,7 +228,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					albumsCh <- nil
 				}
 			}()
-			if albumCount <= 0 || prov == nil {
+			if albumCount <= 0 || prov == nil || !c.providers.IsMetadataEnabled(prov.ID()) {
 				albumsCh <- nil
 				return
 			}

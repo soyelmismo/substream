@@ -219,7 +219,33 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 			<-lp.done
 			url, urlErr = lp.url, lp.err
 		} else {
-			url, urlErr = prov.GetStreamURL(ctx, id.RawID(), quality, clientIP)
+			if !c.providers.IsAudioEnabled(prov.ID()) {
+				log.Printf("[STREAM] Audio disabled for provider %s, attempting automatic fallback...", prov.ID())
+				fallbackProvID := prov.ID()
+				if t, err := prov.GetTrack(ctx, id.RawID()); err == nil && t != nil {
+					if len(t.ISRC) > 0 && t.ISRC[0] != "" {
+						if fbURL, _, fbErr := c.providers.ResolveStreamByISRC(ctx, t.ISRC[0], quality, clientIP, fallbackProvID); fbErr == nil && fbURL != "" {
+							url = fbURL
+						}
+					}
+					if url == "" && c.providers.IsAudioEnabled("yt") {
+						if ytProv, err := c.providers.Get("yt"); err == nil && ytProv != nil {
+							if matcher, ok := ytProv.(interface {
+								MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+							}); ok {
+								if matched, mErr := matcher.MatchTrackByMetadata(ctx, t.Artist, t.Title, t.Duration); mErr == nil && matched != nil && matched.ID != nil {
+									url, urlErr = ytProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP)
+								}
+							}
+						}
+					}
+				}
+				if url == "" && urlErr == nil {
+					urlErr = fmt.Errorf("provider %s audio streaming is disabled by administrator and no fallback succeeded", prov.Name())
+				}
+			} else {
+				url, urlErr = prov.GetStreamURL(ctx, id.RawID(), quality, clientIP)
+			}
 			lp.url, lp.err = url, urlErr
 			close(lp.done)
 			if urlErr == nil && url != "" {

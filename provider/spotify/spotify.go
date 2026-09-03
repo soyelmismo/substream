@@ -251,7 +251,7 @@ func (p *Provider) GetStreamURL(ctx context.Context, rawID string, quality strin
 		}
 
 		// Fallback to YouTube Music matching by Title + Artist
-		if ytProv, err := p.registry.Get("yt"); err == nil && ytProv != nil {
+		if ytProv, err := p.registry.Get("yt"); err == nil && ytProv != nil && p.registry.IsAudioEnabled("yt") {
 			artistName := ""
 			if len(track.Artists) > 0 {
 				artistName = track.Artists[0].Name

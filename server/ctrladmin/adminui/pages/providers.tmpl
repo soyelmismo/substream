@@ -1,0 +1,92 @@
+{{ template "head" . }}
+{{ template "nav" . }}
+
+<div style="max-width: 960px; margin: 0 auto; padding-bottom: 40px;">
+    <!-- Page Header -->
+    <div style="margin-bottom: 24px; text-align: right;">
+        <h1 style="font-size: 28px; font-weight: 700; color: #111827; margin: 0 0 6px 0;">gestor de proveedores</h1>
+        <p style="font-size: 14px; color: #6b7280; margin: 0;">administra el catálogo y el streaming de audio con interruptores independientes por sector</p>
+    </div>
+
+    <!-- Explanation Box -->
+    <div style="background-color: #f0f9ff; border-left: 4px solid #0284c7; padding: 14px 18px; border-radius: 6px; margin-bottom: 28px; font-size: 13px; color: #1e3a5f;">
+        <div style="font-weight: 700; margin-bottom: 4px; color: #0369a1;">Control granular por sector:</div>
+        <div style="margin-bottom: 4px;">• <strong>Metadatos & Catálogo:</strong> Si lo apagas, las búsquedas y visualización de álbumes omitirán este proveedor.</div>
+        <div>• <strong>Streaming de Audio:</strong> Si lo apagas (por ejemplo en Tidal), el catálogo sigue visible, pero al pulsar Reproducir se fuerza el <strong>fallback automático</strong> a YouTube Music o Deezer sin interrumpir la música.</div>
+    </div>
+
+    <!-- Providers List -->
+    <div style="display: flex; flex-direction: column; gap: 20px;">
+        {{ range .Providers }}
+        <div style="background: #ffffff; border: 1px solid #d1d5db; border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.04);">
+            <!-- Card Header -->
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; border-bottom: 1px solid #e5e7eb; padding-bottom: 12px; margin-bottom: 14px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="font-family: monospace; font-size: 13px; font-weight: 700; background: #e5e7eb; color: #1f2937; padding: 2px 8px; border-radius: 4px; text-transform: uppercase;">{{ .ID }}</span>
+                    <span style="font-size: 20px; font-weight: 700; color: #111827;">{{ .Name }}</span>
+                    <span style="font-size: 11px; font-weight: 600; background: #e0e7ff; color: #3730a3; padding: 3px 8px; border-radius: 9999px;">{{ .Badge }}</span>
+                </div>
+                <div style="font-size: 12px; color: #6b7280; font-style: italic;">
+                    {{ .TypeDescription }}
+                </div>
+            </div>
+
+            <!-- Card Body: 2 Columns -->
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 20px;">
+                <!-- Left: Details & Accounts -->
+                <div style="flex: 1 1 400px; min-width: 280px;">
+                    <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #9ca3af; margin-bottom: 6px; letter-spacing: 0.5px;">Detalles y Cuentas Vinculadas</div>
+                    <div style="background: #f9fafb; border: 1px solid #f3f4f6; border-radius: 6px; padding: 10px 12px;">
+                        {{ range .Details }}
+                        <div style="font-family: monospace; font-size: 12px; color: #4b5563; padding: 2px 0; line-height: 1.5;">
+                            <span style="color: #9ca3af;">•</span> {{ . }}
+                        </div>
+                        {{ end }}
+                    </div>
+                </div>
+
+                <!-- Right: Dual Toggle Controls -->
+                <div style="display: flex; gap: 14px; align-items: center; flex-wrap: wrap;">
+                    <!-- Metadata Switch Box -->
+                    <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; text-align: center; min-width: 140px;">
+                        <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #6b7280; margin-bottom: 8px;">Metadatos</div>
+                        <form action="{{ path "/admin/providers_toggle_do" }}" method="POST" style="margin: 0;">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="provider_id" value="{{ .ID }}">
+                            <input type="hidden" name="sector" value="metadata">
+                            <input type="hidden" name="enabled" value="{{ if .MetadataEnabled }}false{{ else }}true{{ end }}">
+                            <button type="submit" style="cursor: pointer; width: 100%; font-size: 12px; font-weight: 700; padding: 6px 12px; border-radius: 6px; border: 1px solid {{ if .MetadataEnabled }}#059669{{ else }}#d1d5db{{ end }}; background: {{ if .MetadataEnabled }}#059669{{ else }}#ffffff{{ end }}; color: {{ if .MetadataEnabled }}#ffffff{{ else }}#6b7280{{ end }}; transition: all 0.15s ease;">
+                                {{ if .MetadataEnabled }}
+                                    ✓ ACTIVO
+                                {{ else }}
+                                    ✕ INACTIVO
+                                {{ end }}
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Audio Switch Box -->
+                    <div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; text-align: center; min-width: 140px;">
+                        <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #6b7280; margin-bottom: 8px;">Streaming Audio</div>
+                        <form action="{{ path "/admin/providers_toggle_do" }}" method="POST" style="margin: 0;">
+                            <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+                            <input type="hidden" name="provider_id" value="{{ .ID }}">
+                            <input type="hidden" name="sector" value="audio">
+                            <input type="hidden" name="enabled" value="{{ if .AudioEnabled }}false{{ else }}true{{ end }}">
+                            <button type="submit" style="cursor: pointer; width: 100%; font-size: 12px; font-weight: 700; padding: 6px 12px; border-radius: 6px; border: 1px solid {{ if .AudioEnabled }}#059669{{ else }}#f87171{{ end }}; background: {{ if .AudioEnabled }}#059669{{ else }}#fee2e2{{ end }}; color: {{ if .AudioEnabled }}#ffffff{{ else }}#b91c1c{{ end }}; transition: all 0.15s ease;">
+                                {{ if .AudioEnabled }}
+                                    ✓ ACTIVO
+                                {{ else }}
+                                    ✕ DESACTIVADO
+                                {{ end }}
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {{ end }}
+    </div>
+</div>
+
+{{ template "foot" . }}

@@ -28,6 +28,7 @@ import (
 	"go.senan.xyz/gonic"
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
+	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/server/ctrladmin/adminui"
 	"go.senan.xyz/gonic/tidalproxy"
@@ -48,9 +49,14 @@ type Controller struct {
 	proxy            tidalproxy.TidalProxy
 	resolveProxyPath ProxyPathResolver
 	rateLimiter      *RateLimiter
+	providers        *provider.Registry
 
 	pendingOAuthMu   sync.Mutex
 	pendingOAuth     *tidal.DeviceCodeResponse
+}
+
+func (c *Controller) SetProviders(p *provider.Registry) {
+	c.providers = p
 }
 
 // RateLimiter provides simple IP-based rate limiting for login attempts
@@ -243,6 +249,10 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidalproxy.TidalProxy, resol
 	c.Handle("/tidal_delete_account_do", adminChain(resp(c.ServeTidalDeleteAccountDo)))
 	c.Handle("/tidal_toggle_account_do", adminChain(resp(c.ServeTidalToggleAccountDo)))
 	c.Handle("/tidal_refresh_account_do", adminChain(resp(c.ServeTidalRefreshAccountDo)))
+
+	// admin providers manager
+	c.Handle("/providers", adminChain(resp(c.ServeProviders)))
+	c.Handle("/providers_toggle_do", adminChain(resp(c.ServeToggleProviderDo)))
 
 	// admin cache
 	c.Handle("/clear_cache_do", adminChain(resp(c.ServeClearCacheDo)))
@@ -577,6 +587,9 @@ type templateData struct {
 	// tidal accounts
 	TidalAccounts []*db.TidalAccount
 	PendingOAuth  *tidal.DeviceCodeResponse
+
+	// providers
+	Providers []ProviderViewModel
 
 	// settings
 	AutoRegister bool

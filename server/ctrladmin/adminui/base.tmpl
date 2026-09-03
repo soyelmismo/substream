@@ -59,9 +59,11 @@
                 {{ if .User.IsAdmin }}
                 <a class="text-blue-500" href="{{ path "/admin/home" }}">home&#8230;</a>
                 &#124;
-                <a class="text-blue-500" href="{{ path "/admin/proxies" }}">proxies&#8230;</a>
+                <a class="text-blue-500" href="{{ path "/admin/providers" }}">providers&#8230;</a>
                 &#124;
                 <a class="text-blue-500" href="{{ path "/admin/tidal_accounts" }}">tidal accounts&#8230;</a>
+                &#124;
+                <a class="text-blue-500" href="{{ path "/admin/proxies" }}">proxies&#8230;</a>
                 &#124;
                 {{ end }}
                 <a class="text-blue-500" href="{{ path "/admin/logout" }}">logout&#8230;</a>

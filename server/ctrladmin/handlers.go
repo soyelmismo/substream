@@ -1554,3 +1554,186 @@ func (c *Controller) ServeTidalRefreshAccountDo(r *http.Request) *Response {
 	log.Printf("[AUDIT] Tidal account %d (%s) refreshed. Valid until: %s", target.ID, target.Username, expiresAt.Format(time.RFC3339))
 	return &Response{redirect: "/admin/tidal_accounts", flashN: []string{fmt.Sprintf("token refreshed successfully! (valid for %d hours)", tok.ExpiresIn/3600)}}
 }
+
+type ProviderViewModel struct {
+	ID              string
+	Name            string
+	Badge           string
+	TypeDescription string
+	MetadataEnabled bool
+	AudioEnabled    bool
+	AccountsCount   int
+	Details         []string
+}
+
+func (c *Controller) ServeProviders(r *http.Request) *Response {
+	tidalAccounts, _ := c.dbc.GetTidalAccounts()
+	activeTidal := 0
+	tidalDetails := []string{}
+	for _, acc := range tidalAccounts {
+		status := "inactive"
+		if acc.IsActive {
+			status = "active"
+			activeTidal++
+		}
+		tidalDetails = append(tidalDetails, fmt.Sprintf("Account #%d: %s (%s)", acc.ID, acc.Username, status))
+	}
+	if len(tidalDetails) == 0 {
+		tidalDetails = append(tidalDetails, "No accounts linked. Add one in 'Tidal Accounts'.")
+	}
+
+	var providerList []ProviderViewModel
+
+	// Helper to check registry
+	isMeta := func(id string) bool {
+		if c.providers != nil {
+			return c.providers.IsMetadataEnabled(id)
+		}
+		return true
+	}
+	isAudio := func(id string) bool {
+		if c.providers != nil {
+			return c.providers.IsAudioEnabled(id)
+		}
+		return true
+	}
+
+	// 1. Tidal
+	providerList = append(providerList, ProviderViewModel{
+		ID:              "td",
+		Name:            "Tidal",
+		Badge:           "HiFi / Master Lossless FLAC",
+		TypeDescription: "Primary lossless provider with round-robin OAuth2 rotation",
+		MetadataEnabled: isMeta("td"),
+		AudioEnabled:    isAudio("td"),
+		AccountsCount:   activeTidal,
+		Details:         tidalDetails,
+	})
+
+	// 2. YouTube Music
+	providerList = append(providerList, ProviderViewModel{
+		ID:              "yt",
+		Name:            "YouTube Music",
+		Badge:           "Opus 160 kbps (No DRM)",
+		TypeDescription: "Universal fallback provider & official Topic studio catalog",
+		MetadataEnabled: isMeta("yt"),
+		AudioEnabled:    isAudio("yt"),
+		AccountsCount:   1,
+		Details: []string{
+			"Engine: yt-dlp 2026.8.19 (Node.js runtime)",
+			"Catalog: InnerTube API (music.youtube.com official songs)",
+			"Stream URL Caching: 1-hour in-memory TTL",
+		},
+	})
+
+	// 3. Spotify
+	providerList = append(providerList, ProviderViewModel{
+		ID:              "sp",
+		Name:            "Spotify",
+		Badge:           "Metadata & ISRC Resolver",
+		TypeDescription: "Global metadata bridge with multi-provider fallback",
+		MetadataEnabled: isMeta("sp"),
+		AudioEnabled:    isAudio("sp"),
+		AccountsCount:   1,
+		Details: []string{
+			"Web Player API: Anonymous TOTP Client",
+			"Fallback: Tidal FLAC -> YouTube Music Opus",
+		},
+	})
+
+	// 4. Qobuz
+	providerList = append(providerList, ProviderViewModel{
+		ID:              "qb",
+		Name:            "Qobuz",
+		Badge:           "Hi-Res 24-bit FLAC",
+		TypeDescription: "Studio master lossless audio resolver",
+		MetadataEnabled: isMeta("qb"),
+		AudioEnabled:    isAudio("qb"),
+		AccountsCount:   1,
+		Details: []string{
+			"Direct Hi-Res FLAC Stream Resolver",
+		},
+	})
+
+	// 5. Deezer
+	providerList = append(providerList, ProviderViewModel{
+		ID:              "dz",
+		Name:            "Deezer",
+		Badge:           "16-bit 44.1kHz FLAC",
+		TypeDescription: "CD quality lossless stream mirror",
+		MetadataEnabled: isMeta("dz"),
+		AudioEnabled:    isAudio("dz"),
+		AccountsCount:   1,
+		Details: []string{
+			"Mirror: https://dzr.tabs-vs-spaces.wtf",
+		},
+	})
+
+	// 6. Amazon Music
+	providerList = append(providerList, ProviderViewModel{
+		ID:              "am",
+		Name:            "Amazon Music",
+		Badge:           "Ultra HD FLAC",
+		TypeDescription: "High-definition audio mirror provider",
+		MetadataEnabled: isMeta("am"),
+		AudioEnabled:    isAudio("am"),
+		AccountsCount:   1,
+		Details: []string{
+			"Mirror: https://amz.geeked.wtf",
+		},
+	})
+
+	data := &templateData{
+		Providers: providerList,
+	}
+
+	return &Response{
+		template: "providers.tmpl",
+		data:     data,
+	}
+}
+
+func (c *Controller) ServeToggleProviderDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/providers", flashW: []string{"invalid security token"}}
+	}
+
+	providerID := strings.TrimSpace(r.FormValue("provider_id"))
+	sector := strings.TrimSpace(r.FormValue("sector")) // "metadata" or "audio"
+	enabledStr := strings.TrimSpace(r.FormValue("enabled"))
+
+	if providerID == "" || (sector != "metadata" && sector != "audio") {
+		return &Response{redirect: "/admin/providers", flashW: []string{"invalid provider or sector"}}
+	}
+
+	enabled := enabledStr == "true" || enabledStr == "1"
+
+	key := fmt.Sprintf("provider.%s.%s", providerID, sector)
+	val := "false"
+	if enabled {
+		val = "true"
+	}
+
+	if err := c.dbc.SetSetting(key, val); err != nil {
+		return &Response{redirect: "/admin/providers", flashW: []string{fmt.Sprintf("save error: %v", err)}}
+	}
+
+	if c.providers != nil {
+		if sector == "metadata" {
+			c.providers.SetMetadataEnabled(providerID, enabled)
+		} else {
+			c.providers.SetAudioEnabled(providerID, enabled)
+		}
+	}
+
+	actionStr := "disabled"
+	if enabled {
+		actionStr = "enabled"
+	}
+
+	log.Printf("[AUDIT] Provider %s %s toggled to %s", providerID, sector, actionStr)
+	return &Response{
+		redirect: "/admin/providers",
+		flashN:   []string{fmt.Sprintf("Provider %s: %s successfully %s!", strings.ToUpper(providerID), sector, actionStr)},
+	}
+}

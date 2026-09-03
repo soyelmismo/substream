@@ -166,6 +166,9 @@ func main() {
 	providers.Register(spotifyProvider)
 	log.Printf("[PROVIDER] Registered Spotify provider (sp)")
 
+	// Load persistent provider toggle settings (metadata & audio)
+	providers.LoadDBSettings(dbc.GetSetting)
+
 	// Scrobblers (Keep empty for Phase 1 MVP, can add ListenBrainz here)
 	var scrobblers []scrobble.Scrobbler
 
@@ -182,10 +185,10 @@ func main() {
 		return *confProxyPrefix + in
 	}
 	ctrlAdmin, err := ctrladmin.New(dbc, sessDB, tidalProvider.Proxy(), resolveProxyPath)
-
 	if err != nil {
 		log.Fatalf("Error initializing admin controller: %v", err)
 	}
+	ctrlAdmin.SetProviders(providers)
 
 	// Routes
 	mux := http.NewServeMux()

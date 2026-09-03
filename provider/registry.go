@@ -12,16 +12,121 @@ import (
 
 // Registry manages registered music providers and routes requests by provider ID/URI.
 type Registry struct {
-	mu        sync.RWMutex
-	providers map[string]MusicProvider
-	defaultID string
+	mu              sync.RWMutex
+	providers       map[string]MusicProvider
+	defaultID       string
+	metadataEnabled map[string]bool
+	audioEnabled    map[string]bool
+}
+
+// ProviderStatusInfo represents the current runtime state of a provider
+type ProviderStatusInfo struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	MetadataEnabled bool   `json:"metadata_enabled"`
+	AudioEnabled    bool   `json:"audio_enabled"`
 }
 
 // NewRegistry creates an empty provider registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		providers: make(map[string]MusicProvider),
+		providers:       make(map[string]MusicProvider),
+		metadataEnabled: make(map[string]bool),
+		audioEnabled:    make(map[string]bool),
 	}
+}
+
+func (r *Registry) IsMetadataEnabled(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if v, ok := r.metadataEnabled[id]; ok {
+		return v
+	}
+	return true
+}
+
+func (r *Registry) IsAudioEnabled(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if v, ok := r.audioEnabled[id]; ok {
+		return v
+	}
+	return true
+}
+
+func (r *Registry) SetMetadataEnabled(id string, enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.metadataEnabled[id] = enabled
+}
+
+func (r *Registry) SetAudioEnabled(id string, enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.audioEnabled[id] = enabled
+}
+
+// LoadDBSettings loads provider enabled/disabled settings from persistent DB
+func (r *Registry) LoadDBSettings(getter func(key, defaultVal string) string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for id := range r.providers {
+		metaKey := fmt.Sprintf("provider.%s.metadata", id)
+		audioKey := fmt.Sprintf("provider.%s.audio", id)
+		metaVal := getter(metaKey, "true")
+		audioVal := getter(audioKey, "true")
+		r.metadataEnabled[id] = metaVal == "true" || metaVal == "1"
+		r.audioEnabled[id] = audioVal == "true" || audioVal == "1"
+	}
+}
+
+func (r *Registry) ListStatus() []ProviderStatusInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	order := []string{"td", "yt", "sp", "qb", "dz", "am"}
+	seen := make(map[string]bool)
+	var res []ProviderStatusInfo
+
+	for _, id := range order {
+		if p, ok := r.providers[id]; ok {
+			seen[id] = true
+			mEnabled := true
+			if v, exists := r.metadataEnabled[id]; exists {
+				mEnabled = v
+			}
+			aEnabled := true
+			if v, exists := r.audioEnabled[id]; exists {
+				aEnabled = v
+			}
+			res = append(res, ProviderStatusInfo{
+				ID:              id,
+				Name:            p.Name(),
+				MetadataEnabled: mEnabled,
+				AudioEnabled:    aEnabled,
+			})
+		}
+	}
+	for id, p := range r.providers {
+		if !seen[id] {
+			mEnabled := true
+			if v, exists := r.metadataEnabled[id]; exists {
+				mEnabled = v
+			}
+			aEnabled := true
+			if v, exists := r.audioEnabled[id]; exists {
+				aEnabled = v
+			}
+			res = append(res, ProviderStatusInfo{
+				ID:              id,
+				Name:            p.Name(),
+				MetadataEnabled: mEnabled,
+				AudioEnabled:    aEnabled,
+			})
+		}
+	}
+	return res
 }
 
 // Register adds or updates a provider. If no default is set, the first registered provider becomes default.
@@ -244,12 +349,15 @@ func (r *Registry) ResolveStreamByISRC(ctx context.Context, isrc string, quality
 	providers := make([]MusicProvider, 0, len(r.providers))
 	priorityOrder := []string{"qb", "dz", "am", "td", "yt"}
 	for _, id := range priorityOrder {
+		if !r.IsAudioEnabled(id) {
+			continue
+		}
 		if p, ok := r.providers[id]; ok && id != excludeProviderID {
 			providers = append(providers, p)
 		}
 	}
 	for id, p := range r.providers {
-		if id != excludeProviderID {
+		if id != excludeProviderID && r.IsAudioEnabled(id) {
 			found := false
 			for _, pid := range priorityOrder {
 				if id == pid {
