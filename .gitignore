@@ -24,3 +24,4 @@ substream_linux
 .env
 config
 genre-tree
+substream_linux.*
