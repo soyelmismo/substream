@@ -77,3 +77,41 @@ type SpotifySearchResponse struct {
 		Total int             `json:"total"`
 	} `json:"artists"`
 }
+
+// SpotifyArtistAlbumsResponse represents the paginated albums for an artist
+type SpotifyArtistAlbumsResponse struct {
+	Items []SpotifyAlbum `json:"items"`
+	Total int            `json:"total"`
+	Limit int            `json:"limit"`
+}
+
+// SpotifyTopTracksResponse represents the top tracks for an artist
+type SpotifyTopTracksResponse struct {
+	Tracks []SpotifyTrack `json:"tracks"`
+}
+
+// SpotifyRelatedArtistsResponse represents related/similar artists
+type SpotifyRelatedArtistsResponse struct {
+	Artists []SpotifyArtist `json:"artists"`
+}
+
+// SpotifyRecommendationsResponse represents tracks returned by recommendations endpoint
+type SpotifyRecommendationsResponse struct {
+	Tracks []SpotifyTrack `json:"tracks"`
+}
+
+// SpotifyLyricsLine represents a single line of lyrics
+type SpotifyLyricsLine struct {
+	StartTimeMs string `json:"startTimeMs"`
+	Words       string `json:"words"`
+	EndTimeMs   string `json:"endTimeMs"`
+}
+
+// SpotifyLyricsResponse represents color-lyrics from spclient
+type SpotifyLyricsResponse struct {
+	Lyrics struct {
+		SyncType string              `json:"syncType"`
+		Lines    []SpotifyLyricsLine `json:"lines"`
+		Language string              `json:"language"`
+	} `json:"lyrics"`
+}

@@ -6,6 +6,8 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -14,8 +16,10 @@ import (
 
 // Provider implements provider.MusicProvider and provider.ISRCResolver for Spotify
 type Provider struct {
-	client   *Client
-	registry *provider.Registry
+	client       *Client
+	registry     *provider.Registry
+	albumCovers  sync.Map // albumID -> imageURL
+	artistCovers sync.Map // artistID -> imageURL
 }
 
 // Ensure Provider implements provider.MusicProvider and provider.ISRCResolver
@@ -82,31 +86,74 @@ func (p *Provider) trackToSpec(t *SpotifyTrack) *spec.TrackChild {
 	artistID := &specid.ID{URI: fmt.Sprintf("sp:ar:%s", artistRawID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("sp:al:%s", t.Album.ID)}
 
+	// Cache album cover if available
+	if len(t.Album.Images) > 0 && t.Album.Images[0].URL != "" {
+		p.albumCovers.Store(t.Album.ID, t.Album.Images[0].URL)
+	}
+
+	// Build artist refs & display string
+	var artistRefs []*spec.ArtistRef
+	var artistNames []string
+	for _, a := range t.Artists {
+		if a.ID != "" && a.Name != "" {
+			artistRefs = append(artistRefs, &spec.ArtistRef{
+				ID:   &specid.ID{URI: fmt.Sprintf("sp:ar:%s", a.ID)},
+				Name: a.Name,
+			})
+			artistNames = append(artistNames, a.Name)
+		}
+	}
+	displayArtist := artistName
+	if len(artistNames) > 0 {
+		displayArtist = strings.Join(artistNames, ", ")
+	}
+
+	// Build album artists
+	var albumArtists []*spec.ArtistRef
+	for _, a := range t.Album.Artists {
+		if a.ID != "" && a.Name != "" {
+			albumArtists = append(albumArtists, &spec.ArtistRef{
+				ID:   &specid.ID{URI: fmt.Sprintf("sp:ar:%s", a.ID)},
+				Name: a.Name,
+			})
+		}
+	}
+
 	duration := t.DurationMs / 1000
 	safeArtist := sanitizeFilename(artistName)
 	safeTitle := sanitizeFilename(t.Name)
 	path := fmt.Sprintf("audio/%s/%02d. %s - %s.flac", safeArtist, t.TrackNumber, safeArtist, safeTitle)
 
+	var isrcs []string
+	if isrc := strings.TrimSpace(t.ExternalIDs.ISRC); isrc != "" {
+		isrcs = []string{isrc}
+	}
+
 	return &spec.TrackChild{
-		ID:          trackID,
-		Title:       t.Name,
-		Album:       t.Album.Name,
-		AlbumID:     albumID,
-		Artist:      artistName,
-		ArtistID:    artistID,
-		ParentID:    albumID,
-		CoverID:     coverID,
-		TrackNumber: t.TrackNumber,
-		DiscNumber:  t.DiscNumber,
-		Duration:    duration,
-		Bitrate:     1411,
-		ContentType: "audio/flac",
-		Suffix:      "flac",
-		Size:        duration * 176400,
-		IsDir:       false,
-		Type:        "music",
-		Path:        path,
-		Year:        parseYear(t.Album.ReleaseDate),
+		ID:            trackID,
+		Title:         t.Name,
+		Album:         t.Album.Name,
+		AlbumID:       albumID,
+		Artist:        artistName,
+		ArtistID:      artistID,
+		Artists:       artistRefs,
+		DisplayArtist: displayArtist,
+		AlbumArtists:  albumArtists,
+		ParentID:      albumID,
+		CoverID:       coverID,
+		TrackNumber:   t.TrackNumber,
+		DiscNumber:    t.DiscNumber,
+		Duration:      duration,
+		Bitrate:       1411,
+		ContentType:   "audio/flac",
+		Suffix:        "flac",
+		Size:          duration * 176400,
+		IsDir:         false,
+		Type:          "music",
+		MediaType:     "song",
+		Path:          path,
+		Year:          parseYear(t.Album.ReleaseDate),
+		ISRC:          isrcs,
 	}
 }
 
@@ -124,15 +171,67 @@ func (p *Provider) albumToSpec(a *SpotifyAlbum) *spec.Album {
 	artistID := &specid.ID{URI: fmt.Sprintf("sp:ar:%s", artistRawID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("sp:al:%s", a.ID)}
 
+	if len(a.Images) > 0 && a.Images[0].URL != "" {
+		p.albumCovers.Store(a.ID, a.Images[0].URL)
+	}
+
+	var artistRefs []*spec.ArtistRef
+	var artistNames []string
+	for _, art := range a.Artists {
+		if art.ID != "" && art.Name != "" {
+			artistRefs = append(artistRefs, &spec.ArtistRef{
+				ID:   &specid.ID{URI: fmt.Sprintf("sp:ar:%s", art.ID)},
+				Name: art.Name,
+			})
+			artistNames = append(artistNames, art.Name)
+		}
+	}
+	displayArtist := artistName
+	if len(artistNames) > 0 {
+		displayArtist = strings.Join(artistNames, ", ")
+	}
+
+	totalDuration := 0
+	var tracks []*spec.TrackChild
+	if len(a.Tracks.Items) > 0 {
+		tracks = make([]*spec.TrackChild, 0, len(a.Tracks.Items))
+		for _, tr := range a.Tracks.Items {
+			// Ensure album reference is attached so track has album metadata
+			if tr.Album.ID == "" {
+				tr.Album = SpotifyAlbumRef{
+					ID:          a.ID,
+					Name:        a.Name,
+					ReleaseDate: a.ReleaseDate,
+					Images:      a.Images,
+					Artists:     a.Artists,
+				}
+			}
+			tc := p.trackToSpec(&tr)
+			if tc != nil {
+				tracks = append(tracks, tc)
+				totalDuration += tc.Duration
+			}
+		}
+	}
+
+	trackCount := a.TotalTracks
+	if len(tracks) > trackCount {
+		trackCount = len(tracks)
+	}
+
 	return &spec.Album{
-		ID:         albumID,
-		ParentID:   artistID,
-		Name:       a.Name,
-		Artist:     artistName,
-		ArtistID:   artistID,
-		CoverID:    coverID,
-		TrackCount: a.TotalTracks,
-		Year:       parseYear(a.ReleaseDate),
+		ID:            albumID,
+		ParentID:      artistID,
+		Name:          a.Name,
+		Artist:        artistName,
+		ArtistID:      artistID,
+		Artists:       artistRefs,
+		DisplayArtist: displayArtist,
+		CoverID:       coverID,
+		TrackCount:    trackCount,
+		Duration:      totalDuration,
+		Year:          parseYear(a.ReleaseDate),
+		Tracks:        tracks,
 	}
 }
 
@@ -142,6 +241,9 @@ func (p *Provider) artistToSpec(a *SpotifyArtist) *spec.Artist {
 	}
 	id := &specid.ID{URI: fmt.Sprintf("sp:ar:%s", a.ID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("sp:ar:%s", a.ID)}
+	if len(a.Images) > 0 && a.Images[0].URL != "" {
+		p.artistCovers.Store(a.ID, a.Images[0].URL)
+	}
 	return &spec.Artist{
 		ID:      id,
 		Name:    a.Name,
@@ -185,7 +287,47 @@ func (p *Provider) GetArtist(ctx context.Context, rawID string) (*spec.Artist, e
 }
 
 func (p *Provider) GetArtistAlbums(ctx context.Context, rawID string, skipTracks bool) ([]*spec.Album, []*spec.TrackChild, error) {
-	return nil, nil, nil
+	albums, err := p.client.GetArtistAlbums(ctx, rawID, 50, 0)
+	if err != nil || len(albums) == 0 {
+		// Resilient fallback: lookup artist name, then search albums by artist
+		if art, aerr := p.client.GetArtist(ctx, rawID); aerr == nil && art != nil && art.Name != "" {
+			if sres, serr := p.client.Search(ctx, fmt.Sprintf("artist:\"%s\"", art.Name), 50, 0); serr == nil && sres != nil && len(sres.Albums.Items) > 0 {
+				albums = sres.Albums.Items
+				err = nil
+			}
+		}
+	}
+	if err != nil && len(albums) == 0 {
+		return nil, nil, err
+	}
+
+	resAlbums := make([]*spec.Album, 0, len(albums))
+	for i := range albums {
+		resAlbums = append(resAlbums, p.albumToSpec(&albums[i]))
+	}
+
+	var tracks []*spec.TrackChild
+	if !skipTracks {
+		top, terr := p.client.GetArtistTopTracks(ctx, rawID)
+		if terr != nil || len(top) == 0 {
+			// Fallback: search top tracks for artist
+			if art, aerr := p.client.GetArtist(ctx, rawID); aerr == nil && art != nil && art.Name != "" {
+				if sres, serr := p.client.Search(ctx, art.Name, 10, 0); serr == nil && sres != nil {
+					top = sres.Tracks.Items
+				}
+			}
+		}
+		if len(top) > 0 {
+			tracks = make([]*spec.TrackChild, 0, len(top))
+			for i := range top {
+				tc := p.trackToSpec(&top[i])
+				if tc != nil {
+					tracks = append(tracks, tc)
+				}
+			}
+		}
+	}
+	return resAlbums, tracks, nil
 }
 
 func (p *Provider) SearchTracks(ctx context.Context, query string, limit, offset int) ([]*spec.TrackChild, error) {
@@ -304,14 +446,79 @@ func (p *Provider) GetStreamURL(ctx context.Context, rawID string, quality strin
 }
 
 func (p *Provider) GetCoverURL(coverID string, size int) string {
-	if strings.HasPrefix(coverID, "http") {
+	if strings.HasPrefix(coverID, "http://") || strings.HasPrefix(coverID, "https://") {
 		return coverID
 	}
-	return coverID
+	if strings.HasPrefix(coverID, "ab67") {
+		return fmt.Sprintf("https://i.scdn.co/image/%s", coverID)
+	}
+
+	// 1. Check in-memory album cover cache
+	if img, ok := p.albumCovers.Load(coverID); ok {
+		if urlStr, ok := img.(string); ok && urlStr != "" {
+			return urlStr
+		}
+	}
+
+	// 2. Check in-memory artist cover cache
+	if img, ok := p.artistCovers.Load(coverID); ok {
+		if urlStr, ok := img.(string); ok && urlStr != "" {
+			return urlStr
+		}
+	}
+
+	// 3. Lazy load on-demand if not cached yet
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	if album, err := p.client.GetAlbum(ctx, coverID); err == nil && album != nil && len(album.Images) > 0 {
+		p.albumCovers.Store(coverID, album.Images[0].URL)
+		return album.Images[0].URL
+	}
+	if artist, err := p.client.GetArtist(ctx, coverID); err == nil && artist != nil && len(artist.Images) > 0 {
+		p.artistCovers.Store(coverID, artist.Images[0].URL)
+		return artist.Images[0].URL
+	}
+	if track, err := p.client.GetTrack(ctx, coverID); err == nil && track != nil && len(track.Album.Images) > 0 {
+		p.albumCovers.Store(coverID, track.Album.Images[0].URL)
+		return track.Album.Images[0].URL
+	}
+
+	return ""
 }
 
 func (p *Provider) GetLyrics(ctx context.Context, rawID string) (*spec.StructuredLyrics, error) {
-	return nil, fmt.Errorf("lyrics not supported")
+	resp, err := p.client.GetLyrics(ctx, rawID)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Lyrics.Lines) == 0 {
+		return nil, fmt.Errorf("no lyrics available")
+	}
+
+	synced := resp.Lyrics.SyncType == "LINE_SYNCED"
+	lines := make([]spec.Lyric, 0, len(resp.Lyrics.Lines))
+	for _, l := range resp.Lyrics.Lines {
+		var startMsPtr *int64
+		if ms, err := strconv.ParseInt(l.StartTimeMs, 10, 64); err == nil {
+			startMsPtr = &ms
+		}
+		lines = append(lines, spec.Lyric{
+			Start: startMsPtr,
+			Value: l.Words,
+		})
+	}
+
+	lang := resp.Lyrics.Language
+	if lang == "" {
+		lang = "und"
+	}
+
+	return &spec.StructuredLyrics{
+		Lang:   lang,
+		Synced: synced,
+		Lines:  lines,
+	}, nil
 }
 
 func (p *Provider) GetTopTracks(ctx context.Context, limit int) ([]*spec.TrackChild, error) {
@@ -319,15 +526,56 @@ func (p *Provider) GetTopTracks(ctx context.Context, limit int) ([]*spec.TrackCh
 }
 
 func (p *Provider) GetArtistTopTracks(ctx context.Context, artistRawID string, limit int) ([]*spec.TrackChild, error) {
-	return nil, nil
+	tracks, err := p.client.GetArtistTopTracks(ctx, artistRawID)
+	if err != nil || len(tracks) == 0 {
+		if art, aerr := p.client.GetArtist(ctx, artistRawID); aerr == nil && art != nil && art.Name != "" {
+			if sres, serr := p.client.Search(ctx, art.Name, limit, 0); serr == nil && sres != nil {
+				tracks = sres.Tracks.Items
+				err = nil
+			}
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && len(tracks) > limit {
+		tracks = tracks[:limit]
+	}
+	out := make([]*spec.TrackChild, 0, len(tracks))
+	for i := range tracks {
+		tc := p.trackToSpec(&tracks[i])
+		if tc != nil {
+			out = append(out, tc)
+		}
+	}
+	return out, nil
 }
 
 func (p *Provider) GetSimilarArtists(ctx context.Context, artistRawID string) ([]*spec.Artist, error) {
-	return nil, nil
+	artists, err := p.client.GetSimilarArtists(ctx, artistRawID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*spec.Artist, 0, len(artists))
+	for i := range artists {
+		out = append(out, p.artistToSpec(&artists[i]))
+	}
+	return out, nil
 }
 
 func (p *Provider) GetRecommendations(ctx context.Context, trackRawID string) ([]*spec.TrackChild, error) {
-	return nil, nil
+	tracks, err := p.client.GetRecommendations(ctx, trackRawID, 20)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*spec.TrackChild, 0, len(tracks))
+	for i := range tracks {
+		tc := p.trackToSpec(&tracks[i])
+		if tc != nil {
+			out = append(out, tc)
+		}
+	}
+	return out, nil
 }
 
 // GetTrackByISRC implements provider.ISRCResolver

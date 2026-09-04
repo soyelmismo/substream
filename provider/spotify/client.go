@@ -254,8 +254,19 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, query url.Value
 	if clientToken != "" {
 		req.Header.Set("Client-Token", clientToken)
 	}
+	req.Header.Set("App-Platform", "WebPlayer")
+	if c.clientVersion != "" {
+		req.Header.Set("Spotify-App-Version", c.clientVersion)
+	}
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Accept", "application/json")
+
+	if c.spDC != "" {
+		req.AddCookie(&http.Cookie{Name: "sp_dc", Value: c.spDC})
+	}
+	for name, val := range c.cookies {
+		req.AddCookie(&http.Cookie{Name: name, Value: val})
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -335,6 +346,112 @@ func (c *Client) SearchByISRC(ctx context.Context, isrc string) (*SpotifyTrack, 
 		return nil, fmt.Errorf("no spotify track for isrc %s", isrc)
 	}
 	return &res.Tracks.Items[0], nil
+}
+
+// GetArtistAlbums retrieves albums for an artist
+func (c *Client) GetArtistAlbums(ctx context.Context, artistID string, limit, offset int) ([]SpotifyAlbum, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	params := url.Values{
+		"include_groups": {"album,single"},
+		"limit":          {strconv.Itoa(limit)},
+		"offset":         {strconv.Itoa(offset)},
+	}
+	var res SpotifyArtistAlbumsResponse
+	if err := c.doRequest(ctx, fmt.Sprintf("artists/%s/albums", artistID), params, &res); err != nil {
+		return nil, err
+	}
+	return res.Items, nil
+}
+
+// GetArtistTopTracks retrieves top tracks for an artist
+func (c *Client) GetArtistTopTracks(ctx context.Context, artistID string) ([]SpotifyTrack, error) {
+	market := "from_token"
+	if c.spDC == "" {
+		market = "US"
+	}
+	params := url.Values{
+		"market": {market},
+	}
+	var res SpotifyTopTracksResponse
+	if err := c.doRequest(ctx, fmt.Sprintf("artists/%s/top-tracks", artistID), params, &res); err != nil {
+		// Fallback to market=US if from_token is rejected
+		params.Set("market", "US")
+		if err2 := c.doRequest(ctx, fmt.Sprintf("artists/%s/top-tracks", artistID), params, &res); err2 != nil {
+			return nil, err
+		}
+	}
+	return res.Tracks, nil
+}
+
+// GetSimilarArtists retrieves related/similar artists
+func (c *Client) GetSimilarArtists(ctx context.Context, artistID string) ([]SpotifyArtist, error) {
+	var res SpotifyRelatedArtistsResponse
+	if err := c.doRequest(ctx, fmt.Sprintf("artists/%s/related-artists", artistID), nil, &res); err != nil {
+		return nil, err
+	}
+	return res.Artists, nil
+}
+
+// GetRecommendations retrieves recommended tracks based on a seed track
+func (c *Client) GetRecommendations(ctx context.Context, trackID string, limit int) ([]SpotifyTrack, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	params := url.Values{
+		"seed_tracks": {trackID},
+		"limit":       {strconv.Itoa(limit)},
+	}
+	var res SpotifyRecommendationsResponse
+	if err := c.doRequest(ctx, "recommendations", params, &res); err != nil {
+		return nil, err
+	}
+	return res.Tracks, nil
+}
+
+// GetLyrics retrieves synchronized lyrics from Spotify spclient
+func (c *Client) GetLyrics(ctx context.Context, trackID string) (*SpotifyLyricsResponse, error) {
+	token, clientToken, err := c.ensureToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	market := "from_token"
+	if c.spDC == "" {
+		market = "US"
+	}
+	lyricsURL := fmt.Sprintf("https://spclient.wg.spotify.com/color-lyrics/v2/track/%s?format=json&market=%s", trackID, market)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, lyricsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if clientToken != "" {
+		req.Header.Set("Client-Token", clientToken)
+	}
+	if c.spDC != "" {
+		req.AddCookie(&http.Cookie{Name: "sp_dc", Value: c.spDC})
+	}
+	req.Header.Set("App-Platform", "WebPlayer")
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lyrics status %d", resp.StatusCode)
+	}
+
+	var res SpotifyLyricsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+	return &res, nil
 }
 
 // HasWidevine returns true if the Widevine worker is active and configured
