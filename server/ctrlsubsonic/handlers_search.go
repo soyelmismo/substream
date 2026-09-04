@@ -167,12 +167,30 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			}
 		}
 
-		var extraProv provider.MusicProvider
-		if !hasPrefix && c.providers.IsMetadataEnabled("yt") && (prov == nil || prov.ID() != "yt") {
-			if yt, err := c.providers.Get("yt"); err == nil && yt != nil {
-				extraProv = yt
+		var additionalProvs []provider.MusicProvider
+		if !hasPrefix && c.providers != nil {
+			for _, extraID := range []string{"yt", "sc"} {
+				if c.providers.IsMetadataEnabled(extraID) && (prov == nil || prov.ID() != extraID) {
+					if p, err := c.providers.Get(extraID); err == nil && p != nil {
+						additionalProvs = append(additionalProvs, p)
+					}
+				}
 			}
 		}
+
+		normalizeText := func(s string) string {
+			var b strings.Builder
+			for _, r := range strings.ToLower(s) {
+				if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+					b.WriteRune(r)
+				} else {
+					b.WriteByte(' ')
+				}
+			}
+			return strings.Join(strings.Fields(b.String()), " ")
+		}
+		normQuery := normalizeText(searchQuery)
+		normQueryTerms := strings.Fields(normQuery)
 
 		go func() {
 			defer func() {
@@ -181,13 +199,17 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					tracksCh <- nil
 				}
 			}()
-			if songCount <= 0 || (prov == nil && extraProv == nil) {
+			if songCount <= 0 || (prov == nil && len(additionalProvs) == 0) {
 				tracksCh <- nil
 				return
 			}
 
-			var primaryTracks []*spec.TrackChild
-			var secondaryTracks []*spec.TrackChild
+			type fetchedList struct {
+				tracks    []*spec.TrackChild
+				isPrimary bool
+			}
+			var listsMu sync.Mutex
+			var fetched []fetchedList
 			var wg sync.WaitGroup
 
 			if prov != nil && c.providers.IsMetadataEnabled(prov.ID()) {
@@ -200,28 +222,29 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 						}
 					}()
 					tData, err := prov.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
-					if err == nil {
-						primaryTracks = tData
-					} else {
-						log.Printf("[SUBS] Primary SearchTracks error: %v", err)
+					if err == nil && len(tData) > 0 {
+						listsMu.Lock()
+						fetched = append(fetched, fetchedList{tracks: tData, isPrimary: true})
+						listsMu.Unlock()
 					}
 				}()
 			}
 
-			if extraProv != nil {
+			for _, extraP := range additionalProvs {
+				p := extraP
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("[SUBS] Secondary SearchTracks panic: %v", r)
+							log.Printf("[SUBS] Additional SearchTracks (%s) panic: %v", p.ID(), r)
 						}
 					}()
-					tData, err := extraProv.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
-					if err == nil {
-						secondaryTracks = tData
-					} else {
-						log.Printf("[SUBS] Secondary SearchTracks error: %v", err)
+					tData, err := p.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
+					if err == nil && len(tData) > 0 {
+						listsMu.Lock()
+						fetched = append(fetched, fetchedList{tracks: tData, isPrimary: false})
+						listsMu.Unlock()
 					}
 				}()
 			}
@@ -233,22 +256,43 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					return 0
 				}
 				score := 0
-				text := strings.ToLower(t.Title + " " + t.Artist + " " + t.Album)
-				terms := strings.Fields(strings.ToLower(searchQuery))
-				allMatch := true
-				for _, term := range terms {
-					if strings.Contains(text, term) {
-						score += 10
-					} else {
-						allMatch = false
-					}
-				}
-				if allMatch && len(terms) > 0 {
-					score += 50
-				}
-				if strings.EqualFold(t.Title, searchQuery) {
+				rawText := strings.ToLower(t.Title + " " + t.Artist + " " + t.Album)
+				normText := normalizeText(t.Title + " " + t.Artist + " " + t.Album)
+				normTitle := normalizeText(t.Title)
+
+				// Exact match checks
+				if strings.EqualFold(t.Title, searchQuery) || (normTitle != "" && normTitle == normQuery) {
+					score += 200
+				} else if strings.EqualFold(t.Artist, searchQuery) || (normalizeText(t.Artist) != "" && normalizeText(t.Artist) == normQuery) {
 					score += 100
 				}
+
+				// Term matches
+				terms := strings.Fields(strings.ToLower(searchQuery))
+				allRawMatch := true
+				for _, term := range terms {
+					if strings.Contains(rawText, term) {
+						score += 10
+					} else {
+						allRawMatch = false
+					}
+				}
+				if allRawMatch && len(terms) > 0 {
+					score += 50
+				}
+
+				allNormMatch := true
+				for _, term := range normQueryTerms {
+					if strings.Contains(normText, term) {
+						score += 15
+					} else {
+						allNormMatch = false
+					}
+				}
+				if allNormMatch && len(normQueryTerms) > 0 {
+					score += 60
+				}
+
 				return score
 			}
 
@@ -267,22 +311,14 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				return t + "|||" + a
 			}
 
-			for _, t := range primaryTracks {
-				if t != nil {
-					k := cleanKey(t.Title, t.Artist)
-					if !seenKeys[k] {
-						seenKeys[k] = true
-						allScored = append(allScored, scoredTrack{track: t, score: scoreTrack(t), isPrimary: true})
-					}
-				}
-			}
-
-			for _, t := range secondaryTracks {
-				if t != nil {
-					k := cleanKey(t.Title, t.Artist)
-					if !seenKeys[k] {
-						seenKeys[k] = true
-						allScored = append(allScored, scoredTrack{track: t, score: scoreTrack(t), isPrimary: false})
+			for _, fl := range fetched {
+				for _, t := range fl.tracks {
+					if t != nil {
+						k := cleanKey(t.Title, t.Artist)
+						if !seenKeys[k] {
+							seenKeys[k] = true
+							allScored = append(allScored, scoredTrack{track: t, score: scoreTrack(t), isPrimary: fl.isPrimary})
+						}
 					}
 				}
 			}
@@ -293,7 +329,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					return allScored[i].score > allScored[j].score
 				}
 				if allScored[i].isPrimary != allScored[j].isPrimary {
-					return allScored[i].isPrimary // primary first when tied
+					return allScored[i].isPrimary
 				}
 				return false
 			})
@@ -316,23 +352,53 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					artistsCh <- nil
 				}
 			}()
-			if artistCount <= 0 || prov == nil || !c.providers.IsMetadataEnabled(prov.ID()) {
+			if artistCount <= 0 || (prov == nil && len(additionalProvs) == 0) {
 				artistsCh <- nil
 				return
 			}
-			aData, err := prov.SearchArtists(r.Context(), searchQuery, artistCount, artistOffset)
-			if err != nil {
-				log.Printf("[SUBS] SearchArtists error: %v", err)
-				artistsCh <- nil
-				return
+			var allArtists []*spec.Artist
+			var aMu sync.Mutex
+			var aWg sync.WaitGroup
+
+			if prov != nil && c.providers.IsMetadataEnabled(prov.ID()) {
+				aWg.Add(1)
+				go func() {
+					defer aWg.Done()
+					if aData, err := prov.SearchArtists(r.Context(), searchQuery, artistCount, artistOffset); err == nil {
+						aMu.Lock()
+						allArtists = append(allArtists, aData...)
+						aMu.Unlock()
+					}
+				}()
 			}
-			if len(aData) > artistCount {
-				aData = aData[:artistCount]
+
+			for _, extraP := range additionalProvs {
+				p := extraP
+				aWg.Add(1)
+				go func() {
+					defer aWg.Done()
+					if aData, err := p.SearchArtists(r.Context(), searchQuery, artistCount, artistOffset); err == nil {
+						aMu.Lock()
+						allArtists = append(allArtists, aData...)
+						aMu.Unlock()
+					}
+				}()
 			}
-			out := make([]spec.Artist, len(aData))
-			for i, a := range aData {
+
+			aWg.Wait()
+
+			seenArtists := make(map[string]bool)
+			var out []spec.Artist
+			for _, a := range allArtists {
 				if a != nil {
-					out[i] = *a
+					normName := strings.ToLower(strings.TrimSpace(a.Name))
+					if !seenArtists[normName] {
+						seenArtists[normName] = true
+						out = append(out, *a)
+						if len(out) >= artistCount {
+							break
+						}
+					}
 				}
 			}
 			artistsCh <- out
@@ -345,23 +411,53 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					albumsCh <- nil
 				}
 			}()
-			if albumCount <= 0 || prov == nil || !c.providers.IsMetadataEnabled(prov.ID()) {
+			if albumCount <= 0 || (prov == nil && len(additionalProvs) == 0) {
 				albumsCh <- nil
 				return
 			}
-			alData, err := prov.SearchAlbums(r.Context(), searchQuery, albumCount, albumOffset)
-			if err != nil {
-				log.Printf("[SUBS] SearchAlbums error: %v", err)
-				albumsCh <- nil
-				return
+			var allAlbums []*spec.Album
+			var alMu sync.Mutex
+			var alWg sync.WaitGroup
+
+			if prov != nil && c.providers.IsMetadataEnabled(prov.ID()) {
+				alWg.Add(1)
+				go func() {
+					defer alWg.Done()
+					if alData, err := prov.SearchAlbums(r.Context(), searchQuery, albumCount, albumOffset); err == nil {
+						alMu.Lock()
+						allAlbums = append(allAlbums, alData...)
+						alMu.Unlock()
+					}
+				}()
 			}
-			if len(alData) > albumCount {
-				alData = alData[:albumCount]
+
+			for _, extraP := range additionalProvs {
+				p := extraP
+				alWg.Add(1)
+				go func() {
+					defer alWg.Done()
+					if alData, err := p.SearchAlbums(r.Context(), searchQuery, albumCount, albumOffset); err == nil {
+						alMu.Lock()
+						allAlbums = append(allAlbums, alData...)
+						alMu.Unlock()
+					}
+				}()
 			}
-			out := make([]spec.Album, len(alData))
-			for i, al := range alData {
+
+			alWg.Wait()
+
+			seenAlbums := make(map[string]bool)
+			var out []spec.Album
+			for _, al := range allAlbums {
 				if al != nil {
-					out[i] = *al
+					normKey := strings.ToLower(strings.TrimSpace(al.Name)) + "|||" + strings.ToLower(strings.TrimSpace(al.Artist))
+					if !seenAlbums[normKey] {
+						seenAlbums[normKey] = true
+						out = append(out, *al)
+						if len(out) >= albumCount {
+							break
+						}
+					}
 				}
 			}
 			albumsCh <- out
