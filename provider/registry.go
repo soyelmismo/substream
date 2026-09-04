@@ -85,7 +85,7 @@ func (r *Registry) ListStatus() []ProviderStatusInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	order := []string{"td", "yt", "sp", "qb", "dz", "am"}
+	order := []string{"td", "yt", "sp", "qb", "dz", "am", "sc"}
 	seen := make(map[string]bool)
 	var res []ProviderStatusInfo
 

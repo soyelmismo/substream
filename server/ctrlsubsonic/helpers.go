@@ -399,6 +399,34 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		}
 	}
 
+	// 4. Universal Fallback to SoundCloud if stream still failed or missing
+	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("sc") && track != nil {
+		if scProv, err := c.providers.Get("sc"); err == nil && scProv != nil {
+			if matcher, ok := scProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if matched, mErr := matcher.MatchTrackByMetadata(ctx, track.Artist.Name, track.Title, track.Duration); mErr == nil && matched != nil && matched.ID != nil {
+					log.Printf("[STREAM] 🚀 Universal fallback to SoundCloud for %s (%s - %s) -> %s", id.String(), track.Artist.Name, track.Title, matched.ID.RawID())
+					if scURL, scErr := scProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP); scErr == nil && scURL != "" {
+						url = scURL
+						urlErr = nil
+						isSamplePreview = false
+
+						// Memorize cross-provider link in track_sources
+						if c.dbc != nil && track != nil {
+							clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+							scURI := fmt.Sprintf("sc:tr:%s", matched.ID.RawID())
+							_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+								db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+								db.TrackSource{ClusterKey: clusterKey, Provider: "sc", URI: scURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+							)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Strictly reject previews - do not serve 30-second clips for full songs
 	if isSamplePreview && track != nil && track.Duration > 45 {
 		return nil, fmt.Errorf("track requires subscription: 30-second preview rejected")

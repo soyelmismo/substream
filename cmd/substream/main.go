@@ -20,6 +20,7 @@ import (
 	"go.senan.xyz/gonic/provider/amazon"
 	"go.senan.xyz/gonic/provider/deezer"
 	"go.senan.xyz/gonic/provider/qobuz"
+	"go.senan.xyz/gonic/provider/soundcloud"
 	"go.senan.xyz/gonic/provider/spotify"
 	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/provider/ytmusic"
@@ -170,6 +171,11 @@ func main() {
 	spotifyProvider := spotify.New(providers)
 	providers.Register(spotifyProvider)
 	log.Printf("[PROVIDER] Registered Spotify provider (sp)")
+
+	// 7. SoundCloud Provider (Independent tracks, sets, remixes & progressive MP3)
+	scProvider := soundcloud.New()
+	providers.Register(scProvider)
+	log.Printf("[PROVIDER] Registered SoundCloud provider (sc)")
 
 	// Load persistent provider toggle settings (metadata & audio)
 	providers.LoadDBSettings(dbc.GetSetting)

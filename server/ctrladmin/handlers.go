@@ -1712,6 +1712,22 @@ func (c *Controller) ServeProviders(r *http.Request) *Response {
 		},
 	})
 
+	// 7. SoundCloud
+	providerList = append(providerList, ProviderViewModel{
+		ID:              "sc",
+		Name:            "SoundCloud",
+		Badge:           "HQ Audio / MP3 & Opus",
+		TypeDescription: "Independent artist platform, DJ sets, unreleased tracks & remixes",
+		MetadataEnabled: isMeta("sc"),
+		AudioEnabled:    isAudio("sc"),
+		AccountsCount:   1,
+		Details: []string{
+			"API: v2 Web Client with automatic client_id rotation",
+			"Catalog: Millions of exclusive tracks, remixes, podcasts & sets",
+			"Formats: Progressive MP3 (128 kbps) & HLS Opus",
+		},
+	})
+
 	data := &templateData{
 		Providers: providerList,
 	}
