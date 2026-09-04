@@ -237,7 +237,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 				fallbackProvID := prov.ID()
 				if t, err := prov.GetTrack(ctx, id.RawID()); err == nil && t != nil {
 					if len(t.ISRC) > 0 && t.ISRC[0] != "" {
-						if fbURL, _, fbErr := c.providers.ResolveStreamByISRC(ctx, t.ISRC[0], quality, clientIP, fallbackProvID); fbErr == nil && fbURL != "" {
+						if fbURL, _, _, fbErr := c.providers.ResolveStreamByISRC(ctx, t.ISRC[0], quality, clientIP, fallbackProvID); fbErr == nil && fbURL != "" {
 							url = fbURL
 						}
 					}
@@ -326,6 +326,11 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 					continue
 				}
 				if altID, err := specid.New(alt.URI); err == nil {
+					// Guard against malformed/corrupted track sources (e.g. ISRC saved as YouTube videoID)
+					if altID.Provider() == "yt" && len(altID.RawID()) != 11 {
+						log.Printf("[STREAM] ⚠️ Skipping malformed YouTube track_source %s", alt.URI)
+						continue
+					}
 					if altProv := c.getProvider(altID.Provider()); altProv != nil {
 						log.Printf("[STREAM] 🔄 Rescuing stream via mapped track_source %s (Quality: %d)", alt.URI, alt.QualityTier)
 						if altURL, altErr := altProv.GetStreamURL(ctx, altID.RawID(), quality, clientIP); altErr == nil && altURL != "" {
@@ -347,7 +352,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	// 2. Cross-Provider ISRC Fallback across registered providers
 	if needsFallback && track != nil && track.ISRC != "" && c.providers != nil {
 		log.Printf("[STREAM] Triggering cross-provider ISRC fallback for %s (ISRC: %s)", id.String(), track.ISRC)
-		if fallbackURL, fallbackProv, err := c.providers.ResolveStreamByISRC(ctx, track.ISRC, quality, clientIP, id.Provider()); err == nil && fallbackURL != "" {
+		if fallbackURL, fallbackProv, fallbackID, err := c.providers.ResolveStreamByISRC(ctx, track.ISRC, quality, clientIP, id.Provider()); err == nil && fallbackURL != "" {
 			fallbackIsPreview := strings.Contains(fallbackURL, "range=20-30") || strings.Contains(fallbackURL, "range=0-30") || strings.Contains(fallbackURL, "preview")
 			if !fallbackIsPreview {
 				log.Printf("[STREAM] ISRC RESOLUTION: Resolved %s (ISRC %s) via %s", id.String(), track.ISRC, fallbackProv.Name())
@@ -356,13 +361,12 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 				isSamplePreview = false
 				needsFallback = false
 
-				// Memorize cross-provider link in track_sources
-				if c.dbc != nil && track != nil {
+				// Memorize cross-provider link in track_sources with actual resolved track ID
+				if c.dbc != nil && track != nil && fallbackID != nil {
 					clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
-					fbURI := fmt.Sprintf("%s:tr:%s", fallbackProv.ID(), track.ISRC)
 					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
 						db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
-						db.TrackSource{ClusterKey: clusterKey, Provider: fallbackProv.ID(), URI: fbURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: fallbackProv.ID(), URI: fallbackID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
 					)
 				}
 			}
@@ -437,6 +441,10 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	}
 	if trackErr != nil {
 		return nil, trackErr
+	}
+
+	if url != "" {
+		c.streamURLCache.Set(cacheKey, url, 5*time.Minute)
 	}
 
 	// 5. Detection

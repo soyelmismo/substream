@@ -77,6 +77,12 @@ type cachedStream struct {
 	expiresAt time.Time
 }
 
+type inFlightCall struct {
+	done chan struct{}
+	url  string
+	err  error
+}
+
 // Client interacts with YouTube Music via InnerTube and yt-dlp
 type Client struct {
 	httpClient *http.Client
@@ -90,7 +96,7 @@ type Client struct {
 
 	// In-flight request de-duplication
 	inFlightMu sync.Mutex
-	inFlight   map[string]chan struct{}
+	inFlight   map[string]*inFlightCall
 
 	// Persistent in-memory Python worker for ~1.8s stream resolution
 	workerMu     sync.Mutex
@@ -109,7 +115,7 @@ func NewClient() *Client {
 	c := &Client{
 		httpClient:  &http.Client{Timeout: 10 * time.Second},
 		streamCache: make(map[string]cachedStream),
-		inFlight:    make(map[string]chan struct{}),
+		inFlight:    make(map[string]*inFlightCall),
 	}
 	// Warm up the resident python worker in background
 	go c.warmupWorker()
@@ -1037,6 +1043,11 @@ func (c *Client) resolveViaCLI(ctx context.Context, videoID string) (string, err
 
 // GetStreamURL resolves the direct audio stream URL using persistent worker or CLI fallback
 func (c *Client) GetStreamURL(ctx context.Context, videoID string) (string, error) {
+	videoID = strings.TrimSpace(videoID)
+	if len(videoID) != 11 {
+		return "", fmt.Errorf("invalid YouTube videoID format %q (expected 11 chars)", videoID)
+	}
+
 	// 1. Fast path: check in-memory cache
 	c.streamCacheMu.RLock()
 	if entry, ok := c.streamCache[videoID]; ok && time.Now().Before(entry.expiresAt) {
@@ -1047,39 +1058,42 @@ func (c *Client) GetStreamURL(ctx context.Context, videoID string) (string, erro
 
 	// 2. Singleflight: de-duplicate simultaneous requests for the same videoID
 	c.inFlightMu.Lock()
-	if ch, running := c.inFlight[videoID]; running {
+	if call, running := c.inFlight[videoID]; running {
 		c.inFlightMu.Unlock()
 		select {
-		case <-ch:
-			c.streamCacheMu.RLock()
-			entry, ok := c.streamCache[videoID]
-			c.streamCacheMu.RUnlock()
-			if ok && time.Now().Before(entry.expiresAt) {
-				return entry.url, nil
-			}
+		case <-call.done:
+			return call.url, call.err
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
 	}
-	doneCh := make(chan struct{})
-	c.inFlight[videoID] = doneCh
+
+	call := &inFlightCall{done: make(chan struct{})}
+	c.inFlight[videoID] = call
 	c.inFlightMu.Unlock()
 
+	var streamURL string
+	var err error
+
 	defer func() {
+		call.url = streamURL
+		call.err = err
+		close(call.done)
+
 		c.inFlightMu.Lock()
 		delete(c.inFlight, videoID)
-		close(doneCh)
 		c.inFlightMu.Unlock()
 	}()
 
 	// 3. Try fast persistent resident worker (~1.8s)
 	t0 := time.Now()
-	streamURL, err := c.resolveViaWorker(videoID)
+	streamURL, err = c.resolveViaWorker(videoID)
 	if err != nil || streamURL == "" {
 		log.Printf("[YTMUSIC] ⚠️ Worker failed (%v), falling back to optimized CLI...", err)
 		streamURL, err = c.resolveViaCLI(ctx, videoID)
 		if err != nil {
-			return "", fmt.Errorf("stream resolution failed for %s: %w", videoID, err)
+			err = fmt.Errorf("stream resolution failed for %s: %w", videoID, err)
+			return "", err
 		}
 	}
 

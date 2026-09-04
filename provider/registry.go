@@ -340,9 +340,9 @@ func (r *Registry) BatchGetTracksByURI(ctx context.Context, uris []string) []*sp
 }
 
 // ResolveStreamByISRC attempts to find a full stream across all registered providers using ISRC
-func (r *Registry) ResolveStreamByISRC(ctx context.Context, isrc string, quality string, clientIP string, excludeProviderID string) (string, MusicProvider, error) {
+func (r *Registry) ResolveStreamByISRC(ctx context.Context, isrc string, quality string, clientIP string, excludeProviderID string) (string, MusicProvider, *specid.ID, error) {
 	if isrc == "" {
-		return "", nil, fmt.Errorf("empty isrc")
+		return "", nil, nil, fmt.Errorf("empty isrc")
 	}
 
 	r.mu.RLock()
@@ -385,10 +385,10 @@ func (r *Registry) ResolveStreamByISRC(ctx context.Context, isrc string, quality
 		if err == nil && streamURL != "" {
 			isPreview := strings.Contains(streamURL, "range=20-30") || strings.Contains(streamURL, "range=0-30") || (t.Duration > 45 && strings.Contains(streamURL, "preview"))
 			if !isPreview {
-				return streamURL, p, nil
+				return streamURL, p, t.ID, nil
 			}
 		}
 	}
 
-	return "", nil, fmt.Errorf("no full stream found for ISRC %s across registered providers", isrc)
+	return "", nil, nil, fmt.Errorf("no full stream found for ISRC %s across registered providers", isrc)
 }

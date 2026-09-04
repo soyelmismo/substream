@@ -245,7 +245,7 @@ func (p *Provider) GetStreamURL(ctx context.Context, rawID string, quality strin
 	}
 
 	if p.registry != nil {
-		streamURL, _, err := p.registry.ResolveStreamByISRC(ctx, isrc, quality, clientIP, p.ID())
+		streamURL, _, _, err := p.registry.ResolveStreamByISRC(ctx, isrc, quality, clientIP, p.ID())
 		if err == nil && streamURL != "" {
 			return streamURL, nil
 		}
