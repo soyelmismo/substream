@@ -457,7 +457,19 @@ func (c *Client) fetchTrackViaNext(ctx context.Context, videoID string) *YTTrack
 
 	first, _ := panelContents[0].(map[string]interface{})
 	renderer, _ := first["playlistPanelVideoRenderer"].(map[string]interface{})
+	return parsePlaylistPanelVideoRenderer(renderer, videoID)
+}
+
+func parsePlaylistPanelVideoRenderer(renderer map[string]interface{}, fallbackVideoID string) *YTTrack {
 	if renderer == nil {
+		return nil
+	}
+
+	videoID, _ := renderer["videoId"].(string)
+	if videoID == "" {
+		videoID = fallbackVideoID
+	}
+	if videoID == "" {
 		return nil
 	}
 
@@ -572,6 +584,89 @@ func (c *Client) fetchTrackViaNext(ctx context.Context, videoID string) *YTTrack
 		Duration:  duration,
 		Thumbnail: bestThumb,
 	}
+}
+
+// GetRecommendations fetches algorithmic radio recommendations for a track
+func (c *Client) GetRecommendations(ctx context.Context, videoID string, limit int) ([]*YTTrack, error) {
+	if videoID == "" {
+		return nil, fmt.Errorf("empty video ID")
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+
+	bodyData := map[string]interface{}{
+		"context":    c.buildContextPayload(),
+		"videoId":    videoID,
+		"playlistId": "RDAMVM" + videoID,
+	}
+	bodyBytes, err := json.Marshal(bodyData)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, innertubeNextURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var parsed map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+
+	contents, _ := parsed["contents"].(map[string]interface{})
+	singleCol, _ := contents["singleColumnMusicWatchNextResultsRenderer"].(map[string]interface{})
+	tabbed, _ := singleCol["tabbedRenderer"].(map[string]interface{})
+	watchNextTabbed, _ := tabbed["watchNextTabbedResultsRenderer"].(map[string]interface{})
+	tabs, _ := watchNextTabbed["tabs"].([]interface{})
+	if len(tabs) == 0 {
+		return nil, nil
+	}
+
+	tab0, _ := tabs[0].(map[string]interface{})
+	tabRenderer, _ := tab0["tabRenderer"].(map[string]interface{})
+	tabContent, _ := tabRenderer["content"].(map[string]interface{})
+	musicQueue, _ := tabContent["musicQueueRenderer"].(map[string]interface{})
+	queueContent, _ := musicQueue["content"].(map[string]interface{})
+	playlistPanel, _ := queueContent["playlistPanelRenderer"].(map[string]interface{})
+	panelContents, _ := playlistPanel["contents"].([]interface{})
+
+	var results []*YTTrack
+	for _, item := range panelContents {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		renderer, ok := itemMap["playlistPanelVideoRenderer"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		track := parsePlaylistPanelVideoRenderer(renderer, "")
+		if track == nil {
+			continue
+		}
+		// Exclude the seed track itself
+		if track.VideoID == videoID {
+			continue
+		}
+		// Cache track for subsequent lookups
+		c.trackCache.Store(track.VideoID, track)
+		results = append(results, track)
+		if len(results) >= limit {
+			break
+		}
+	}
+
+	return results, nil
 }
 
 func (c *Client) fetchTrackViaPlayer(ctx context.Context, videoID string) (*YTTrack, error) {

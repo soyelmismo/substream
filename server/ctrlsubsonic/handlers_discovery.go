@@ -23,14 +23,17 @@ func (c *Controller) ServeGetRandomSongs(r *http.Request) *spec.Response {
 	size := p.GetOrInt("size", 10)
 	genre, _ := p.Get("genre")
 
-	var tidalIDs []int
+	var uris []string
 
 	// If genre specified, try to get genre tracks from hot.monochrome.tf
 	if genre != "" {
 		log.Printf("[RANDOM] Genre requested: %s", genre)
-		tidalIDs = c.fetchHotGenreTracks(r.Context(), genre, size)
+		tidalIDs := c.fetchHotGenreTracks(r.Context(), genre, size)
 		if len(tidalIDs) > 0 {
-			tracks := c.batchFetchTracks(r, tidalIDs)
+			for _, id := range tidalIDs {
+				uris = append(uris, fmt.Sprintf("td:tr:%d", id))
+			}
+			tracks := c.batchFetchTracksByURIs(r, uris)
 			sub := spec.NewResponse()
 			sub.RandomTracks = &spec.RandomTracks{List: tracks}
 			return sub
@@ -48,24 +51,26 @@ func (c *Controller) ServeGetRandomSongs(r *http.Request) *spec.Response {
 	c.dbc.Where("user_id=?", user.ID).Order("RANDOM()").Limit(favSize).Find(&stars)
 
 	for _, s := range stars {
-		tidalIDs = appendUnique(tidalIDs, extractIDFromURI(s.URI))
+		if s.URI != "" {
+			uris = appendUniqueString(uris, s.URI)
+		}
 	}
 
 	// 2. Get some from Discovery (Tidal Top Tracks)
-	discoverySize := size - len(tidalIDs)
+	discoverySize := size - len(uris)
 	if discoverySize > 0 {
 		top, err := c.proxy.GetTopTracks(r.Context(), discoverySize+randomSongsDiscoveryExtra)
 		if err == nil {
 			for _, t := range top {
-				if len(tidalIDs) >= size {
+				if len(uris) >= size {
 					break
 				}
-				tidalIDs = appendUnique(tidalIDs, t.ID)
+				uris = appendUniqueString(uris, fmt.Sprintf("td:tr:%d", t.ID))
 			}
 		}
 	}
 
-	tracks := c.batchFetchTracks(r, tidalIDs)
+	tracks := c.batchFetchTracksByURIs(r, uris)
 
 	sub := spec.NewResponse()
 	sub.RandomTracks = &spec.RandomTracks{List: tracks}
@@ -222,31 +227,80 @@ func (c *Controller) ServeGetSimilarSongsTwo(r *http.Request) *spec.Response {
 		return spec.NewError(10, "provide an `id` parameter")
 	}
 
-	var trackID int
-	switch id.Type() {
-	case specid.Track:
-		trackID = id.Value()
-	case specid.Artist:
-		// Use top tracks for artist - much faster than full discography aggregation
-		ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
-		top, err := c.proxy.GetArtistTopTracks(ctx, id.Value(), 1)
-		cancel()
-		if err != nil || len(top) == 0 {
-			return c.ServeGetRandomSongs(r)
-		}
-		trackID = top[0].ID
-	default:
-		return c.ServeGetRandomSongs(r)
-	}
-
-	tracks := c.getSimilarSongsMerged(r, trackID, count)
-	if tracks == nil {
+	tracks := c.getSimilarSongsForID(r, id, count)
+	if len(tracks) == 0 {
 		return c.ServeGetRandomSongs(r)
 	}
 
 	sub := spec.NewResponse()
 	sub.SimilarSongsTwo = &spec.SimilarSongsTwo{Tracks: tracks}
 	return sub
+}
+
+// getSimilarSongsForID resolves similar tracks / radio recommendations across any provider
+func (c *Controller) getSimilarSongsForID(r *http.Request, id specid.ID, count int) []*spec.TrackChild {
+	user := r.Context().Value(CtxUser).(*db.User)
+
+	// If the ID belongs to a non-Tidal provider (e.g. yt:tr:... or yt:ar:...)
+	if id.Provider() != "" && id.Provider() != "td" {
+		prov := c.getProvider(id.Provider())
+		if prov != nil {
+			trackRawID := ""
+			switch id.Type() {
+			case specid.Track:
+				trackRawID = id.RawID()
+			case specid.Artist:
+				ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
+				top, err := prov.GetArtistTopTracks(ctx, id.RawID(), 1)
+				cancel()
+				if err == nil && len(top) > 0 && top[0].ID != nil {
+					trackRawID = top[0].ID.RawID()
+				}
+			}
+
+			if trackRawID != "" {
+				ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
+				recs, err := prov.GetRecommendations(ctx, trackRawID)
+				cancel()
+				if err == nil && len(recs) > 0 {
+					if count > 0 && len(recs) > count {
+						recs = recs[:count]
+					}
+					for _, t := range recs {
+						c.applyTrackStar(user.ID, t)
+						c.applyTrackPlayCount(user.ID, t)
+						if t.ID != nil {
+							t.UserRating = c.getTrackRating(user.ID, t.ID.String())
+						}
+					}
+					return recs
+				}
+			}
+		}
+	}
+
+	// Tidal / fallback resolution
+	var trackID int
+	switch id.Type() {
+	case specid.Track:
+		trackID = id.Value()
+	case specid.Artist:
+		ctx, cancel := context.WithTimeout(r.Context(), similarSongsTimeout)
+		top, err := c.proxy.GetArtistTopTracks(ctx, id.Value(), 1)
+		cancel()
+		if err != nil || len(top) == 0 {
+			return nil
+		}
+		trackID = top[0].ID
+	default:
+		return nil
+	}
+
+	if trackID <= 0 {
+		return nil
+	}
+
+	return c.getSimilarSongsMerged(r, trackID, count)
 }
 
 // getSimilarSongsMerged returns merged recommendations from Tidal native and external providers.
@@ -308,13 +362,12 @@ func (c *Controller) ServeGetSimilarSongs(r *http.Request) *spec.Response {
 	}
 
 	id, err := p.GetID("id")
-	if err != nil || id.Type() != specid.Track {
+	if err != nil {
 		return c.ServeGetRandomSongs(r)
 	}
-	trackID := id.Value()
 
-	tracks := c.getSimilarSongsMerged(r, trackID, count)
-	if tracks == nil {
+	tracks := c.getSimilarSongsForID(r, id, count)
+	if len(tracks) == 0 {
 		return c.ServeGetRandomSongs(r)
 	}
 
@@ -336,50 +389,77 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 	// search artist by name to get ID
 	// fetch more candidates to find exact match if Tidal search is fuzzy
 	candidates, err := c.proxy.SearchArtists(r.Context(), artistName, topSongsSearchCandidates, 0)
-	if err != nil || len(candidates) == 0 {
-		return spec.NewResponse()
-	}
+	var artistID int
+	if err == nil && len(candidates) > 0 {
+		for _, a := range candidates {
+			if strings.EqualFold(a.Name, artistName) {
+				artistID = a.ID
+				break
+			}
+		}
 
-	artistID := 0
-	for _, a := range candidates {
-		if strings.EqualFold(a.Name, artistName) {
-			artistID = a.ID
-			break
+		// If no exact match, fallback to first ONLY if it's a very similar name
+		if artistID == 0 {
+			first := candidates[0]
+			if strings.Contains(strings.ToLower(first.Name), strings.ToLower(artistName)) ||
+				strings.Contains(strings.ToLower(artistName), strings.ToLower(first.Name)) {
+				artistID = first.ID
+			}
 		}
 	}
 
-	// If no exact match, fallback to first ONLY if it's a very similar name
-	if artistID == 0 {
-		first := candidates[0]
-		if strings.Contains(strings.ToLower(first.Name), strings.ToLower(artistName)) ||
-			strings.Contains(strings.ToLower(artistName), strings.ToLower(first.Name)) {
-			artistID = first.ID
+	if artistID > 0 {
+		// get artist top tracks (precise)
+		topTracks, err := c.proxy.GetArtistTopTracks(r.Context(), artistID, count)
+		if err == nil && len(topTracks) > 0 {
+			tracks := make([]*spec.TrackChild, len(topTracks))
+			for i := range topTracks {
+				tracks[i] = NewTrackFromTidal(&topTracks[i])
+				c.applyTrackStar(user.ID, tracks[i])
+				c.applyTrackPlayCount(user.ID, tracks[i])
+			}
+
+			sub := spec.NewResponse()
+			sub.TopSongs = &spec.TopSongs{Tracks: tracks}
+			return sub
 		}
 	}
 
-	if artistID == 0 {
-		return spec.NewResponse()
+	// Fallback to providers (e.g. YouTube Music)
+	if c.providers != nil {
+		for _, prov := range c.providers.All() {
+			if prov.ID() == "td" {
+				continue
+			}
+			artists, err := prov.SearchArtists(r.Context(), artistName, 5, 0)
+			if err == nil && len(artists) > 0 {
+				targetArtist := artists[0]
+				for _, a := range artists {
+					if strings.EqualFold(a.Name, artistName) {
+						targetArtist = a
+						break
+					}
+				}
+				if targetArtist.ID != nil {
+					top, err := prov.GetArtistTopTracks(r.Context(), targetArtist.ID.RawID(), count)
+					if err == nil && len(top) > 0 {
+						for _, t := range top {
+							c.applyTrackStar(user.ID, t)
+							c.applyTrackPlayCount(user.ID, t)
+							if t.ID != nil {
+								t.UserRating = c.getTrackRating(user.ID, t.ID.String())
+							}
+						}
+						sub := spec.NewResponse()
+						sub.TopSongs = &spec.TopSongs{Tracks: top}
+						return sub
+					}
+				}
+			}
+		}
 	}
 
-	// get artist top tracks (precise)
-	topTracks, err := c.proxy.GetArtistTopTracks(r.Context(), artistID, count)
-	if err != nil {
-		log.Printf("[DISC] error fetching artist top tracks for %d: %v", artistID, err)
-		// Fallback to searching tracks by artist name if this fails?
-		// For now just return empty or error.
-		return spec.NewResponse()
-	}
-
-	tracks := make([]*spec.TrackChild, len(topTracks))
-	for i := range topTracks {
-		tracks[i] = NewTrackFromTidal(&topTracks[i])
-		c.applyTrackStar(user.ID, tracks[i])
-		c.applyTrackPlayCount(user.ID, tracks[i])
-	}
-
-	sub := spec.NewResponse()
-	sub.TopSongs = &spec.TopSongs{Tracks: tracks}
-	return sub
+	return spec.NewResponse()
 }
 
 // mergeRecommendations interleaves and deduplicates native and external recommendations
@@ -422,3 +502,13 @@ func mergeRecommendations(native []tidal.TidalTrack, external []tidal.TidalTrack
 
 	return merged
 }
+
+func appendUniqueString(slice []string, val string) []string {
+	for _, v := range slice {
+		if v == val {
+			return slice
+		}
+	}
+	return append(slice, val)
+}
+

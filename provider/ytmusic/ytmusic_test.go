@@ -126,4 +126,27 @@ func TestGetArtistByName(t *testing.T) {
 	}
 }
 
+func TestGetRecommendations(t *testing.T) {
+	p := New()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
+	// Test GetRecommendations for Daft Punk - Voyager (OWiVJMgms9E)
+	recs, err := p.GetRecommendations(ctx, "OWiVJMgms9E")
+	if err != nil {
+		t.Fatalf("GetRecommendations failed: %v", err)
+	}
+	if len(recs) == 0 {
+		t.Fatal("expected recommendations > 0, got 0")
+	}
+	t.Logf("Got %d recommendations for Voyager", len(recs))
+	for i, r := range recs[:5] {
+		t.Logf("  [%d] %s - %s (%s)", i, r.Artist, r.Title, r.ID.String())
+		if r.ID == nil || r.ID.String() == "" {
+			t.Errorf("expected valid ID for recommendation %d", i)
+		}
+		if r.Title == "" {
+			t.Errorf("expected valid title for recommendation %d", i)
+		}
+	}
+}

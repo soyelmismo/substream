@@ -403,7 +403,21 @@ func (p *Provider) GetSimilarArtists(ctx context.Context, artistRawID string) ([
 }
 
 func (p *Provider) GetRecommendations(ctx context.Context, trackRawID string) ([]*spec.TrackChild, error) {
-	return nil, nil
+	if trackRawID == "" {
+		return nil, fmt.Errorf("empty track ID")
+	}
+	tracks, err := p.client.GetRecommendations(ctx, trackRawID, 50)
+	if err != nil {
+		return nil, err
+	}
+	res := make([]*spec.TrackChild, 0, len(tracks))
+	for _, t := range tracks {
+		st := p.trackToSpec(t)
+		if st != nil {
+			res = append(res, st)
+		}
+	}
+	return res, nil
 }
 
 // GetTrackByISRC attempts to find an official track on YouTube Music using ISRC or metadata
