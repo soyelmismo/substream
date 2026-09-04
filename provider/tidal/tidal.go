@@ -641,4 +641,71 @@ func setupTokenManager(dbc *db.DB, pool *Pool) {
 		}
 		return getTokenForAccounts(accounts)
 	})
+
+	// Background worker: proactively auto-refreshes all active Tidal accounts
+	// before they expire (every 5 minutes, refreshes anything expiring in < 30 minutes)
+	go func() {
+		time.Sleep(3 * time.Second)
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		refreshAll := func() {
+			accounts, err := dbc.GetTidalAccounts()
+			if err != nil || len(accounts) == 0 {
+				return
+			}
+			now := time.Now()
+			for _, acc := range accounts {
+				if !acc.IsActive {
+					continue
+				}
+				if acc.AccessToken == "" || now.After(acc.ExpiresAt.Add(-30*time.Minute)) {
+					refreshMu.Lock()
+					freshAccs, _ := dbc.GetTidalAccounts()
+					for _, fa := range freshAccs {
+						if fa.ID == acc.ID {
+							acc = fa
+							break
+						}
+					}
+					if !acc.IsActive {
+						refreshMu.Unlock()
+						continue
+					}
+					if acc.AccessToken == "" || time.Now().After(acc.ExpiresAt.Add(-30*time.Minute)) {
+						log.Printf("[TIDAL-OAUTH] 🔄 Proactive background refresh for account %s (%s)...", acc.Username, acc.UserID)
+						ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+						tokResp, err := RefreshAccessToken(ctx, acc.RefreshToken)
+						cancel()
+						if err != nil {
+							log.Printf("[TIDAL-OAUTH] ❌ Background refresh failed for %s: %v", acc.Username, err)
+							refreshMu.Unlock()
+							continue
+						}
+						expiresAt := time.Now().Add(time.Duration(tokResp.ExpiresIn) * time.Second)
+						if err := dbc.UpdateTidalAccountTokens(acc.ID, tokResp.AccessToken, expiresAt); err != nil {
+							log.Printf("[TIDAL-OAUTH] ⚠️ Failed to persist refreshed token for %s: %v", acc.Username, err)
+						} else {
+							log.Printf("[TIDAL-OAUTH] ✅ Background refreshed token for %s! Valid until %s", acc.Username, expiresAt.Format("15:04:05 MST"))
+						}
+
+						// Refresh subscription status (in case account was upgraded or changed)
+						subCtx, subCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						subType, highestQuality, tier, subErr := FetchAccountSubscription(subCtx, acc.UserID, tokResp.AccessToken)
+						subCancel()
+						if subErr == nil {
+							_ = dbc.UpdateTidalAccountSubscription(acc.ID, subType, highestQuality, tier)
+						}
+					}
+					refreshMu.Unlock()
+				}
+			}
+		}
+
+		refreshAll()
+
+		for range ticker.C {
+			refreshAll()
+		}
+	}()
 }
