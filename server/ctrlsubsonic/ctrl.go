@@ -74,6 +74,15 @@ type Controller struct {
 
 	// User preferences cache (L3) - warms on activity to eliminate repeated SQLite queries
 	userPrefsCache *cache.Cache[*userPreferences] // userID -> cached preferences
+
+	lastViewedArtists sync.Map // userID (int) -> *lastArtistView (for resolving provider context in getTopSongs)
+}
+
+type lastArtistView struct {
+	Provider string
+	RawID    string
+	Name     string
+	ViewedAt time.Time
 }
 
 // userPreferences holds all user metadata (stars, ratings, plays) in memory

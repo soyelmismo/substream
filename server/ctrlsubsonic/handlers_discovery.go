@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -386,24 +387,76 @@ func (c *Controller) ServeGetTopSongs(r *http.Request) *spec.Response {
 		return spec.NewError(10, "provide an `artist` parameter")
 	}
 
-	// search artist by name to get ID
-	// fetch more candidates to find exact match if Tidal search is fuzzy
-	candidates, err := c.proxy.SearchArtists(r.Context(), artistName, topSongsSearchCandidates, 0)
-	var artistID int
-	if err == nil && len(candidates) > 0 {
-		for _, a := range candidates {
-			if strings.EqualFold(a.Name, artistName) {
-				artistID = a.ID
-				break
+	// 1. Check if direct provider ID was supplied (via id, artistId, or prefix in artist parameter)
+	// or if the current user recently viewed this artist from a provider
+	var targetProvider string
+	var targetRawID string
+
+	if id, err := p.GetID("id"); err == nil && id.RawID() != "" {
+		targetProvider = id.Provider()
+		targetRawID = id.RawID()
+	} else if id, err := p.GetID("artistId"); err == nil && id.RawID() != "" {
+		targetProvider = id.Provider()
+		targetRawID = id.RawID()
+	} else if strings.HasPrefix(artistName, "sc:ar:") || strings.HasPrefix(artistName, "yt:ar:") || strings.HasPrefix(artistName, "td:ar:") {
+		parts := strings.Split(artistName, ":")
+		if len(parts) >= 3 {
+			targetProvider = parts[0]
+			targetRawID = strings.Join(parts[2:], ":")
+		}
+	} else if val, ok := c.lastViewedArtists.Load(user.ID); ok {
+		if last, ok := val.(*lastArtistView); ok && last != nil {
+			if time.Since(last.ViewedAt) < 15*time.Minute && strings.EqualFold(last.Name, artistName) {
+				targetProvider = last.Provider
+				targetRawID = last.RawID
 			}
 		}
+	}
 
-		// If no exact match, fallback to first ONLY if it's a very similar name
-		if artistID == 0 {
-			first := candidates[0]
-			if strings.Contains(strings.ToLower(first.Name), strings.ToLower(artistName)) ||
-				strings.Contains(strings.ToLower(artistName), strings.ToLower(first.Name)) {
-				artistID = first.ID
+	log.Printf("[GET_TOP_SONGS] user=%d artist=%q targetProvider=%q targetRawID=%q", user.ID, artistName, targetProvider, targetRawID)
+
+	if targetProvider != "" && targetProvider != "td" {
+		if prov := c.getProvider(targetProvider); prov != nil {
+			top, err := prov.GetArtistTopTracks(r.Context(), targetRawID, count)
+			if err == nil && len(top) > 0 {
+				for _, t := range top {
+					c.applyTrackStar(user.ID, t)
+					c.applyTrackPlayCount(user.ID, t)
+					if t.ID != nil {
+						t.UserRating = c.getTrackRating(user.ID, t.ID.String())
+					}
+				}
+				sub := spec.NewResponse()
+				sub.TopSongs = &spec.TopSongs{Tracks: top}
+				return sub
+			}
+		}
+	}
+
+	var artistID int
+	if targetProvider == "td" && targetRawID != "" {
+		artistID, _ = strconv.Atoi(targetRawID)
+	}
+
+	// search artist by name to get ID
+	// fetch more candidates to find exact match if Tidal search is fuzzy
+	if artistID == 0 {
+		candidates, err := c.proxy.SearchArtists(r.Context(), artistName, topSongsSearchCandidates, 0)
+		if err == nil && len(candidates) > 0 {
+			for _, a := range candidates {
+				if strings.EqualFold(a.Name, artistName) {
+					artistID = a.ID
+					break
+				}
+			}
+
+			// If no exact match, fallback to first ONLY if it's a very similar name
+			if artistID == 0 {
+				first := candidates[0]
+				if strings.Contains(strings.ToLower(first.Name), strings.ToLower(artistName)) ||
+					strings.Contains(strings.ToLower(artistName), strings.ToLower(first.Name)) {
+					artistID = first.ID
+				}
 			}
 		}
 	}

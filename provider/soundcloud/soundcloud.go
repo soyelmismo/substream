@@ -165,15 +165,18 @@ func (p *Provider) albumToSpec(a *SoundCloudPlaylist) *spec.Album {
 	}
 
 	return &spec.Album{
-		ID:         albumID,
-		ParentID:   artistID,
-		Name:       title,
-		Artist:     artistName,
-		ArtistID:   artistID,
-		CoverID:    coverID,
-		TrackCount: a.TrackCount,
-		Duration:   a.Duration / 1000,
-		Year:       year,
+		ID:           albumID,
+		ParentID:     artistID,
+		Name:         title,
+		Title:        title,
+		Album:        title,
+		Artist:       artistName,
+		ArtistID:     artistID,
+		CoverID:      coverID,
+		TrackCount:   a.TrackCount,
+		Duration:     a.Duration / 1000,
+		Year:         year,
+		ReleaseTypes: []string{"ALBUM"},
 	}
 }
 
@@ -261,13 +264,17 @@ func (p *Provider) GetAlbum(ctx context.Context, rawID string) (*spec.Album, err
 			p.coverCache.Store(albumID.RawID(), u.AvatarURL)
 		}
 		album := &spec.Album{
-			ID:         albumID,
-			ParentID:   artistID,
-			Name:       fmt.Sprintf("%s - Popular Tracks", username),
-			Artist:     username,
-			ArtistID:   artistID,
-			CoverID:    coverID,
-			TrackCount: len(tList),
+			ID:            albumID,
+			ParentID:      artistID,
+			Name:          fmt.Sprintf("%s - All Tracks", username),
+			Title:         fmt.Sprintf("%s - All Tracks", username),
+			Album:         fmt.Sprintf("%s - All Tracks", username),
+			Artist:        username,
+			ArtistID:      artistID,
+			CoverID:       coverID,
+			TrackCount:    len(tList),
+			IsCompilation: true,
+			ReleaseTypes:  []string{"COMPILATION"},
 		}
 		for i, t := range tList {
 			st := p.trackToSpec(t)
@@ -312,16 +319,19 @@ func (p *Provider) GetAlbum(ctx context.Context, rawID string) (*spec.Album, err
 		return nil, fmt.Errorf("track not found")
 	}
 	album := &spec.Album{
-		ID:         st.AlbumID,
-		ParentID:   st.ArtistID,
-		Name:       st.Title,
-		Artist:     st.Artist,
-		ArtistID:   st.ArtistID,
-		CoverID:    st.CoverID,
-		TrackCount: 1,
-		Duration:   st.Duration,
-		Year:       st.Year,
-		Tracks:     []*spec.TrackChild{st},
+		ID:           st.AlbumID,
+		ParentID:     st.ArtistID,
+		Name:         st.Title,
+		Title:        st.Title,
+		Album:        st.Title,
+		Artist:       st.Artist,
+		ArtistID:     st.ArtistID,
+		CoverID:      st.CoverID,
+		TrackCount:   1,
+		Duration:     st.Duration,
+		Year:         st.Year,
+		ReleaseTypes: []string{"SINGLE"},
+		Tracks:       []*spec.TrackChild{st},
 	}
 	return album, nil
 }
@@ -335,7 +345,7 @@ func (p *Provider) GetArtist(ctx context.Context, rawID string) (*spec.Artist, e
 	return p.userToSpec(u), nil
 }
 
-// GetArtistAlbums fetches albums/playlists and top tracks for an artist
+// GetArtistAlbums fetches albums/playlists and tracks for an artist
 func (p *Provider) GetArtistAlbums(ctx context.Context, rawID string, skipTracks bool) ([]*spec.Album, []*spec.TrackChild, error) {
 	var albums []*spec.Album
 	var tracks []*spec.TrackChild
@@ -345,41 +355,78 @@ func (p *Provider) GetArtistAlbums(ctx context.Context, rawID string, skipTracks
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if plList, err := p.client.GetUserAlbums(ctx, rawID, 20); err == nil {
+		if plList, err := p.client.GetUserAlbums(ctx, rawID, 30); err == nil {
 			for _, pl := range plList {
-				albums = append(albums, p.albumToSpec(pl))
+				alb := p.albumToSpec(pl)
+				if alb != nil {
+					alb.ReleaseTypes = []string{"ALBUM"}
+					albums = append(albums, alb)
+				}
 			}
 		}
 	}()
 
-	// Fetch top tracks
+	// Fetch tracks/singles (up to 50 tracks)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if tList, err := p.client.GetUserTracks(ctx, rawID, 30); err == nil {
+		if tList, err := p.client.GetUserTracks(ctx, rawID, 50); err == nil {
 			for _, t := range tList {
-				tracks = append(tracks, p.trackToSpec(t))
+				st := p.trackToSpec(t)
+				if st != nil {
+					tracks = append(tracks, st)
+				}
 			}
 		}
 	}()
 
 	wg.Wait()
 
-	// If the artist has no formal albums/playlists on SoundCloud, synthesize a "Popular Tracks" album
-	if len(albums) == 0 && len(tracks) > 0 {
+	if len(tracks) > 0 {
 		firstTrack := tracks[0]
 		artistName := firstTrack.Artist
 		artistID := firstTrack.ArtistID
-		albumID := &specid.ID{URI: fmt.Sprintf("sc:al:user_tracks:%s", rawID)}
-		albums = append(albums, &spec.Album{
-			ID:         albumID,
-			ParentID:   artistID,
-			Name:       fmt.Sprintf("%s - Popular Tracks", artistName),
-			Artist:     artistName,
-			ArtistID:   artistID,
-			CoverID:    firstTrack.CoverID,
-			TrackCount: len(tracks),
-		})
+		coverID := firstTrack.CoverID
+
+		// 1. If multiple tracks, provide synthetic "All Tracks" compilation album
+		if len(tracks) > 1 {
+			compID := &specid.ID{URI: fmt.Sprintf("sc:al:user_tracks:%s", rawID)}
+			albums = append(albums, &spec.Album{
+				ID:            compID,
+				ParentID:      artistID,
+				Name:          fmt.Sprintf("%s - All Tracks", artistName),
+				Title:         fmt.Sprintf("%s - All Tracks", artistName),
+				Album:         fmt.Sprintf("%s - All Tracks", artistName),
+				Artist:        artistName,
+				ArtistID:      artistID,
+				CoverID:       coverID,
+				TrackCount:    len(tracks),
+				IsCompilation: true,
+				ReleaseTypes:  []string{"COMPILATION"},
+			})
+		}
+
+		// 2. Add each track as an individual Single release album
+		for _, t := range tracks {
+			singleAlbumID := t.AlbumID
+			if singleAlbumID == nil {
+				singleAlbumID = &specid.ID{URI: fmt.Sprintf("sc:al:%s", t.ID.RawID())}
+			}
+			albums = append(albums, &spec.Album{
+				ID:           singleAlbumID,
+				ParentID:     t.ArtistID,
+				Name:         t.Title,
+				Title:        t.Title,
+				Album:        t.Title,
+				Artist:       t.Artist,
+				ArtistID:     t.ArtistID,
+				CoverID:      t.CoverID,
+				TrackCount:   1,
+				Duration:     t.Duration,
+				Year:         t.Year,
+				ReleaseTypes: []string{"SINGLE"},
+			})
+		}
 	}
 
 	if skipTracks {
@@ -502,8 +549,8 @@ func (p *Provider) GetCoverURL(coverID string, size int) string {
 			imgURL = u.AvatarURL
 		}
 	} else if strings.HasPrefix(coverID, "sc:al:") {
-		if strings.HasPrefix(rawID, "user_tracks:") {
-			uID := strings.TrimPrefix(rawID, "user_tracks:")
+		if strings.HasPrefix(rawID, "user_tracks:") || strings.HasPrefix(rawID, "user_tracks_") {
+			uID := strings.TrimPrefix(strings.TrimPrefix(rawID, "user_tracks:"), "user_tracks_")
 			if u, err := p.client.GetUser(ctx, uID); err == nil && u != nil {
 				imgURL = u.AvatarURL
 			}

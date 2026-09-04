@@ -130,11 +130,25 @@ func (c *Controller) ServeGetArtist(r *http.Request) *spec.Response {
 		return spec.NewError(0, "error fetching artist albums: %v", errPage)
 	}
 
+	log.Printf("[GET_ARTIST] user=%d id=%s name=%s", user.ID, id.String(), artist.Name)
+	c.lastViewedArtists.Store(user.ID, &lastArtistView{
+		Provider: id.Provider(),
+		RawID:    id.RawID(),
+		Name:     artist.Name,
+		ViewedAt: time.Now(),
+	})
+
 	c.applyArtistStar(user.ID, artist)
 
 	artist.AlbumCount = len(albums)
 	artist.Albums = albums
 	for _, a := range artist.Albums {
+		if a.Title == "" && a.Name != "" {
+			a.Title = a.Name
+		}
+		if a.Name == "" && a.Title != "" {
+			a.Name = a.Title
+		}
 		c.applyAlbumStar(user.ID, a)
 	}
 
@@ -160,6 +174,13 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 	a, err := prov.GetAlbum(r.Context(), id.RawID())
 	if err != nil {
 		return spec.NewError(0, "error fetching album: %v", err)
+	}
+
+	if a.Title == "" && a.Name != "" {
+		a.Title = a.Name
+	}
+	if a.Name == "" && a.Title != "" {
+		a.Name = a.Title
 	}
 
 	// Batch apply user metadata (stars, ratings, play counts) in 3 queries instead of 3*N

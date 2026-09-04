@@ -87,3 +87,41 @@ func TestSoundCloudProvider(t *testing.T) {
 		t.Fatalf("expected either albums or tracks for artist")
 	}
 }
+
+func TestSoundCloudArtistAche(t *testing.T) {
+	prov := New()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// ache's SoundCloud user ID: 133054467
+	acheID := "133054467"
+	albums, topTracks, err := prov.GetArtistAlbums(ctx, acheID, false)
+	if err != nil {
+		t.Fatalf("GetArtistAlbums failed for ache: %v", err)
+	}
+	if len(albums) == 0 {
+		t.Fatalf("expected albums for ache, got 0")
+	}
+	t.Logf("ache has %d albums/releases and %d top tracks", len(albums), len(topTracks))
+
+	// Verify every album has a non-empty Title and Name
+	for i, alb := range albums {
+		if alb.Title == "" {
+			t.Errorf("album %d (%s) has empty Title", i, alb.ID.String())
+		}
+		if alb.Name == "" {
+			t.Errorf("album %d (%s) has empty Name", i, alb.ID.String())
+		}
+	}
+
+	// Verify top tracks
+	top, err := prov.GetArtistTopTracks(ctx, acheID, 10)
+	if err != nil {
+		t.Fatalf("GetArtistTopTracks failed: %v", err)
+	}
+	if len(top) == 0 {
+		t.Fatalf("expected at least 1 top track for ache")
+	}
+	t.Logf("ache first top track: Title=%q, Artist=%q", top[0].Title, top[0].Artist)
+}
+
