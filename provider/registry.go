@@ -347,7 +347,7 @@ func (r *Registry) ResolveStreamByISRC(ctx context.Context, isrc string, quality
 
 	r.mu.RLock()
 	providers := make([]MusicProvider, 0, len(r.providers))
-	priorityOrder := []string{"qb", "dz", "am", "td", "yt"}
+	priorityOrder := []string{"qb", "dz", "am", "td", "sp", "yt", "sc"}
 	for _, id := range priorityOrder {
 		if !r.IsAudioEnabled(id) {
 			continue

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -92,6 +93,8 @@ func main() {
 	confDeezerURL := flag.String("deezer-url", getEnv("SUBSTREAM_DEEZER_URL", "https://dzr.tabs-vs-spaces.wtf"), "Deezer proxy/mirror URL")
 	confDeezerARL := flag.String("deezer-arl", getEnv("SUBSTREAM_DEEZER_ARL", ""), "optional Deezer ARL cookie")
 	confAmazonURL := flag.String("amazon-url", getEnv("SUBSTREAM_AMAZON_URL", "https://amz.geeked.wtf"), "Amazon Music proxy/mirror URL")
+	confSpotifySPDC := flag.String("spotify-sp-dc", getEnv("SUBSTREAM_SPOTIFY_SP_DC", getEnv("SPOTIFY_SP_DC", "")), "optional Spotify sp_dc session cookie for Widevine audio playback")
+	confSpotifyWVD := flag.String("spotify-wvd-path", getEnv("SUBSTREAM_SPOTIFY_WVD_PATH", getEnv("SPOTIFY_WVD_PATH", "spotify.wvd")), "path to Widevine .wvd device file for Spotify audio decryption")
 
 	flag.Parse()
 
@@ -167,8 +170,12 @@ func main() {
 	providers.Register(ytProvider)
 	log.Printf("[PROVIDER] Registered YouTube Music provider (yt)")
 
-	// 6. Spotify Provider (Universal Metadata & ISRC Resolution via Anonymous TOTP)
-	spotifyProvider := spotify.New(providers)
+	// 6. Spotify Provider (Universal Metadata, ISRC Fallback & Native Widevine MP4_128 AAC)
+	spotifyProvider := spotify.New(providers, spotify.Options{
+		SPDC:     *confSpotifySPDC,
+		WVDPath:  *confSpotifyWVD,
+		CacheDir: filepath.Join(*confCachePath, "spotify"),
+	})
 	providers.Register(spotifyProvider)
 	log.Printf("[PROVIDER] Registered Spotify provider (sp)")
 

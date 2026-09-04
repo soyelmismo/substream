@@ -310,7 +310,7 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 	// Priority 3: Try ISRC across lossless providers (Tidal, Deezer, Qobuz)
 	if track.ISRC != "" {
 		if jm.providers != nil {
-			losslessProvIDs := []string{"td", "dz", "qb"}
+			losslessProvIDs := []string{"td", "dz", "qb", "sp"}
 			for _, pID := range losslessProvIDs {
 				if !jm.providers.IsMetadataEnabled(pID) {
 					continue
@@ -374,7 +374,32 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 		}
 	}
 
-	// Priority 5: Fallback to YouTube Music (The "No track left behind" guarantee)
+	// Priority 5: Fallback to Spotify (Extensive streaming catalog)
+	if jm.providers != nil && jm.providers.IsMetadataEnabled("sp") {
+		if spProv, err := jm.providers.Get("sp"); err == nil && spProv != nil {
+			if matcher, ok := spProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if spTrack, err := matcher.MatchTrackByMetadata(ctx, track.Artist, track.Title, track.Duration); err == nil && spTrack != nil && spTrack.ID != nil {
+					spFallbackURI := fmt.Sprintf("sp:tr:%s", spTrack.ID.RawID())
+					log.Printf("[IMPORT] ✅ Cross-provider fallback to Spotify for %q by %q: %s",
+						track.Title, track.Artist, spFallbackURI)
+					if jm.db != nil {
+						_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+							ClusterKey:  clusterKey,
+							Provider:    "sp",
+							URI:         spFallbackURI,
+							QualityTier: db.QualityTierStandard,
+							IsAvailable: true,
+						})
+					}
+					return spFallbackURI
+				}
+			}
+		}
+	}
+
+	// Priority 6: Fallback to YouTube Music (The "No track left behind" guarantee)
 	if jm.providers != nil && jm.providers.IsMetadataEnabled("yt") {
 		if ytProv, err := jm.providers.Get("yt"); err == nil && ytProv != nil {
 			if matcher, ok := ytProv.(interface {
@@ -399,7 +424,7 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 		}
 	}
 
-	// Priority 6: Fallback to SoundCloud (Underground, indie, remix & DJ set rescue)
+	// Priority 7: Fallback to SoundCloud (Underground, indie, remix & DJ set rescue)
 	if jm.providers != nil && jm.providers.IsMetadataEnabled("sc") {
 		if scProv, err := jm.providers.Get("sc"); err == nil && scProv != nil {
 			if matcher, ok := scProv.(interface {

@@ -22,10 +22,25 @@ type Provider struct {
 var _ provider.MusicProvider = (*Provider)(nil)
 var _ provider.ISRCResolver = (*Provider)(nil)
 
+// Options configures Spotify credentials and Widevine DRM paths
+type Options struct {
+	SPDC     string
+	WVDPath  string
+	CacheDir string
+}
+
 // New creates a new Spotify Provider
-func New(reg *provider.Registry) *Provider {
+func New(reg *provider.Registry, opts ...Options) *Provider {
+	var clientOpts []ClientOptions
+	if len(opts) > 0 {
+		clientOpts = append(clientOpts, ClientOptions{
+			SPDC:     opts[0].SPDC,
+			WVDPath:  opts[0].WVDPath,
+			CacheDir: opts[0].CacheDir,
+		})
+	}
 	return &Provider{
-		client:   NewClient(),
+		client:   NewClient(clientOpts...),
 		registry: reg,
 	}
 }
@@ -233,8 +248,19 @@ func (p *Provider) Search(ctx context.Context, query string, limit, offset int) 
 	}, nil
 }
 
-// GetStreamURL resolves a lossless stream for a Spotify track using its ISRC across Qobuz, Deezer, and Tidal
+// GetStreamURL resolves native Widevine decrypted audio if configured, or falls back to ISRC resolution
 func (p *Provider) GetStreamURL(ctx context.Context, rawID string, quality string, clientIP string) (string, error) {
+	// 1. Native Widevine DRM decryption (Free MP4_128 AAC or Premium MP4_256)
+	if p.client.HasWidevine() {
+		if streamPath, err := p.client.GetWidevineStream(ctx, rawID); err == nil && streamPath != "" {
+			log.Printf("[SPOTIFY] 🚀 Resolved native Widevine audio stream for %s -> %s", rawID, streamPath)
+			return streamPath, nil
+		} else if err != nil {
+			log.Printf("[SPOTIFY] ⚠️ Widevine resolution failed for %s: %v (falling back to ISRC)", rawID, err)
+		}
+	}
+
+	// 2. Fallback via ISRC across registered lossless providers
 	track, err := p.client.GetTrack(ctx, rawID)
 	if err != nil {
 		return "", err
@@ -312,3 +338,35 @@ func (p *Provider) GetTrackByISRC(ctx context.Context, isrc string) (*spec.Track
 	}
 	return p.trackToSpec(t), nil
 }
+
+// MatchTrackByMetadata matches a track by artist, title, and duration for cross-provider fallback
+func (p *Provider) MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error) {
+	query := fmt.Sprintf("%s %s", strings.TrimSpace(artist), strings.TrimSpace(title))
+	tracks, err := p.SearchTracks(ctx, query, 5, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(tracks) == 0 {
+		return nil, fmt.Errorf("no tracks found on Spotify for %q", query)
+	}
+
+	// Select best candidate matching duration (within +- 5 seconds)
+	for _, t := range tracks {
+		if expectedDuration <= 0 {
+			return t, nil
+		}
+		diff := t.Duration - expectedDuration
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff <= 5 {
+			log.Printf("[SPOTIFY] ✅ Matched track %q by %q with Spotify track %s (duration diff: %ds)", title, artist, t.ID.RawID(), diff)
+			return t, nil
+		}
+	}
+
+	// If no exact duration match, return the top candidate
+	log.Printf("[SPOTIFY] ⚠️ Fallback to top Spotify result for %q by %q: %s", title, artist, tracks[0].ID.RawID())
+	return tracks[0], nil
+}
+

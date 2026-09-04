@@ -20,6 +20,8 @@ LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:4533}"
 TIDAL_TOKEN="${TIDAL_TOKENS:-${TIDAL_TOKEN:-${SUBSTREAM_TIDAL_TOKENS:-${SUBSTREAM_TIDAL_TOKEN:-}}}}"
 DEEZER_ARL="${DEEZER_ARL:-${SUBSTREAM_DEEZER_ARL:-}}"
 QOBUZ_TOKEN="${QOBUZ_TOKEN:-${SUBSTREAM_QOBUZ_TOKEN:-}}"
+SPOTIFY_SP_DC="${SPOTIFY_SP_DC:-${SUBSTREAM_SPOTIFY_SP_DC:-}}"
+SPOTIFY_WVD_PATH="${SPOTIFY_WVD_PATH:-${SUBSTREAM_SPOTIFY_WVD_PATH:-spotify.wvd}}"
 
 REMOTE="${SSH_USER}@${SERVER}"
 
@@ -53,6 +55,21 @@ if [ -f "cert.pem" ] && [ -f "key.pem" ]; then
     scp -P "${SSH_PORT}" cert.pem key.pem "${REMOTE}:${PATH_REMOTE}/"
 fi
 
+# Si existe WVD local, lo subimos
+LOCAL_WVD="${SPOTIFY_WVD_PATH}"
+if [ -f "${LOCAL_WVD}" ]; then
+    echo -e "${YELLOW}Uploading ${LOCAL_WVD} device as spotify.wvd...${NC}"
+    scp -P "${SSH_PORT}" "${LOCAL_WVD}" "${REMOTE}:${PATH_REMOTE}/spotify.wvd"
+elif [ -f "spotify.wvd" ]; then
+    echo -e "${YELLOW}Uploading spotify.wvd device...${NC}"
+    scp -P "${SSH_PORT}" spotify.wvd "${REMOTE}:${PATH_REMOTE}/spotify.wvd"
+fi
+
+REMOTE_WVD="${SPOTIFY_WVD_PATH}"
+if [ -f "${LOCAL_WVD}" ] || [ -f "spotify.wvd" ]; then
+    REMOTE_WVD="spotify.wvd"
+fi
+
 # 4. Remote Setup & Service Restart
 echo -e "\n${BLUE}[4/4] Configuring Systemd & Restarting...${NC}"
 ssh -p "${SSH_PORT}" "${REMOTE}" "bash -s" << ENDSSH
@@ -74,6 +91,8 @@ WorkingDirectory=${PATH_REMOTE}
 Environment="SUBSTREAM_TIDAL_TOKEN=${TIDAL_TOKEN}"
 Environment="SUBSTREAM_DEEZER_ARL=${DEEZER_ARL}"
 Environment="SUBSTREAM_QOBUZ_TOKEN=${QOBUZ_TOKEN}"
+Environment="SUBSTREAM_SPOTIFY_SP_DC=${SPOTIFY_SP_DC}"
+Environment="SUBSTREAM_SPOTIFY_WVD_PATH=${REMOTE_WVD}"
 ExecStart=${PATH_REMOTE}/substream --listen-addr="${LISTEN_ADDR}" --cert-path="cert.pem" --key-path="key.pem"
 Restart=always
 RestartSec=5

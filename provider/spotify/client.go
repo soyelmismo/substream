@@ -21,6 +21,13 @@ const (
 	defaultUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 )
 
+// ClientOptions configures credentials and Widevine DRM paths for Spotify
+type ClientOptions struct {
+	SPDC     string
+	WVDPath  string
+	CacheDir string
+}
+
 // Client interacts with Spotify API using automatic anonymous TOTP tokens & client tokens
 type Client struct {
 	httpClient    *http.Client
@@ -32,14 +39,25 @@ type Client struct {
 	clientVersion string
 	cookies       map[string]string
 	expiresAt     time.Time
+	spDC          string
+	wvdWorker     *WidevineWorker
 }
 
 // NewClient creates a new Spotify client
-func NewClient() *Client {
-	return &Client{
+func NewClient(opts ...ClientOptions) *Client {
+	c := &Client{
 		httpClient: &http.Client{Timeout: 20 * time.Second},
 		cookies:    make(map[string]string),
 	}
+	if len(opts) > 0 {
+		opt := opts[0]
+		c.spDC = opt.SPDC
+		if opt.WVDPath != "" {
+			c.wvdWorker = NewWidevineWorker(opt.WVDPath, opt.SPDC, opt.CacheDir)
+			go c.wvdWorker.Warmup()
+		}
+	}
+	return c
 }
 
 func (c *Client) getSessionInfo(ctx context.Context) error {
@@ -51,6 +69,9 @@ func (c *Client) getSessionInfo(ctx context.Context) error {
 
 	for name, value := range c.cookies {
 		req.AddCookie(&http.Cookie{Name: name, Value: value})
+	}
+	if c.spDC != "" {
+		req.AddCookie(&http.Cookie{Name: "sp_dc", Value: c.spDC})
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -172,6 +193,9 @@ func (c *Client) ensureToken(ctx context.Context) (string, string, error) {
 	}
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	if c.spDC != "" {
+		req.AddCookie(&http.Cookie{Name: "sp_dc", Value: c.spDC})
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -311,4 +335,18 @@ func (c *Client) SearchByISRC(ctx context.Context, isrc string) (*SpotifyTrack, 
 		return nil, fmt.Errorf("no spotify track for isrc %s", isrc)
 	}
 	return &res.Tracks.Items[0], nil
+}
+
+// HasWidevine returns true if the Widevine worker is active and configured
+func (c *Client) HasWidevine() bool {
+	return c.wvdWorker != nil && c.wvdWorker.IsConfigured()
+}
+
+// GetWidevineStream decrypts and retrieves a native Spotify track audio stream
+func (c *Client) GetWidevineStream(ctx context.Context, trackID string) (string, error) {
+	if !c.HasWidevine() {
+		return "", fmt.Errorf("widevine worker not configured")
+	}
+	token, _, _ := c.ensureToken(ctx)
+	return c.wvdWorker.Resolve(ctx, trackID, token)
 }

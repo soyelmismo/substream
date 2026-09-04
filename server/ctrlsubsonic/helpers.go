@@ -241,7 +241,18 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							url = fbURL
 						}
 					}
-					if url == "" && c.providers.IsAudioEnabled("yt") {
+					if url == "" && c.providers.IsAudioEnabled("sp") && fallbackProvID != "sp" {
+						if spProv, err := c.providers.Get("sp"); err == nil && spProv != nil {
+							if matcher, ok := spProv.(interface {
+								MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+							}); ok {
+								if matched, mErr := matcher.MatchTrackByMetadata(ctx, t.Artist, t.Title, t.Duration); mErr == nil && matched != nil && matched.ID != nil {
+									url, urlErr = spProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP)
+								}
+							}
+						}
+					}
+					if url == "" && c.providers.IsAudioEnabled("yt") && fallbackProvID != "yt" {
 						if ytProv, err := c.providers.Get("yt"); err == nil && ytProv != nil {
 							if matcher, ok := ytProv.(interface {
 								MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
@@ -375,7 +386,38 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		}
 	}
 
-	// 3. Universal Fallback to YouTube Music if stream still failed or missing
+	// 3. Universal Fallback to Spotify if stream still failed or missing
+	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("sp") && track != nil && id.Provider() != "sp" {
+		if spProv, err := c.providers.Get("sp"); err == nil && spProv != nil {
+			if matcher, ok := spProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if matched, mErr := matcher.MatchTrackByMetadata(ctx, track.Artist.Name, track.Title, track.Duration); mErr == nil && matched != nil && matched.ID != nil {
+					log.Printf("[STREAM] 🚀 Universal fallback to Spotify for %s (%s - %s) -> %s", id.String(), track.Artist.Name, track.Title, matched.ID.RawID())
+					if spURL, spErr := spProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP); spErr == nil && spURL != "" {
+						spIsPreview := strings.Contains(spURL, "range=20-30") || strings.Contains(spURL, "range=0-30") || strings.Contains(spURL, "preview")
+						if !spIsPreview {
+							url = spURL
+							urlErr = nil
+							isSamplePreview = false
+
+							// Memorize cross-provider link in track_sources
+							if c.dbc != nil && track != nil {
+								clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+								spURI := fmt.Sprintf("sp:tr:%s", matched.ID.RawID())
+								_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: "sp", URI: spURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+								)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Universal Fallback to YouTube Music if stream still failed or missing
 	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("yt") && track != nil {
 		if ytProv, err := c.providers.Get("yt"); err == nil && ytProv != nil {
 			if matcher, ok := ytProv.(interface {
@@ -403,7 +445,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		}
 	}
 
-	// 4. Universal Fallback to SoundCloud if stream still failed or missing
+	// 5. Universal Fallback to SoundCloud if stream still failed or missing
 	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("sc") && track != nil {
 		if scProv, err := c.providers.Get("sc"); err == nil && scProv != nil {
 			if matcher, ok := scProv.(interface {

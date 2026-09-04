@@ -255,6 +255,17 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// Subsonic /rest/stream clients expect a continuous audio stream (e.g. audio/flac).
 	// HLS manifests must always be stitched so standard Subsonic clients get native audio.
 	// YouTube streams must ALWAYS be proxied because googlevideo.com links are IP-locked.
+	// Local decrypted/cached file stream (e.g. Spotify Widevine M4A)
+	if strings.HasPrefix(streamURL, "/") {
+		urlPreview := streamURL
+		if len(urlPreview) > 100 {
+			urlPreview = urlPreview[:100]
+		}
+		log.Printf("[STREAM] Serving local file track=%s path=%s", id.String(), urlPreview)
+		http.ServeFile(w, r, streamURL)
+		return nil
+	}
+
 	isDataURL := strings.HasPrefix(streamURL, "data:")
 	needsStitch := prep.IsHLS || isDataURL
 	isYT := id.Provider() == "yt" || strings.Contains(streamURL, "googlevideo.com")
