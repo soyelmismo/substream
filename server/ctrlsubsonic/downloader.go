@@ -282,14 +282,19 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 	var targetWriter io.Writer = w
 	var remuxCmd *exec.Cmd
 	var remuxPipe *io.PipeWriter
+	var remuxPr *io.PipeReader
 	var remuxErrBuf bytes.Buffer
 	var taggerDone chan struct{}
 
 	defer func() {
 		if remuxPipe != nil {
-			remuxPipe.Close()
+			_ = remuxPipe.Close()
+		}
+		if remuxPr != nil {
+			_ = remuxPr.Close()
 		}
 		if remuxCmd != nil && remuxCmd.Process != nil {
+			_ = remuxCmd.Process.Kill()
 			_ = remuxCmd.Wait()
 		}
 		if taggerDone != nil {
@@ -333,19 +338,23 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			if track != nil {
 				cleanName = strings.ReplaceAll(fmt.Sprintf("%s - %s", track.Artist.Name, track.Title), "/", "_")
 			}
-			if isFLACInFMP4 {
+			if isFLACInFMP4 && clientName == "download" {
 				rw.Header().Set("Content-Type", "audio/flac")
-				log.Printf("[DOWNLOAD] Genuine FLAC stream detected in fMP4, serving audio/flac for %s", clientName)
+				log.Printf("[DOWNLOAD] Genuine FLAC stream detected in fMP4, serving audio/flac for download")
 				if rw.Header().Get("Content-Disposition") != "" && cleanName != "" {
 					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".flac"))
 				}
 				rw.Header().Set("Accept-Ranges", "none")
 			} else if isFMP4 {
-				// Standard MIME type for MP4 container audio (AAC)
+				// Standard MIME type for MP4 container audio (AAC or FLAC in fMP4)
 				rw.Header().Set("Content-Type", "audio/mp4")
-				log.Printf("[DOWNLOAD] AAC in fMP4 container detected, using Content-Type audio/mp4 for %s", clientName)
+				log.Printf("[DOWNLOAD] fMP4 container detected (FLAC=%v), using Content-Type audio/mp4 for %s", isFLACInFMP4, clientName)
 				if rw.Header().Get("Content-Disposition") != "" && cleanName != "" {
-					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+".m4a"))
+					extName := ".m4a"
+					if isFLACInFMP4 {
+						extName = ".flac"
+					}
+					rw.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName+extName))
 				}
 
 				// Inject fake sidx ONLY for Android ExoPlayer/Tempus/Symfonium to force seek bar.
@@ -353,7 +362,10 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 				if isExoPlayer {
 					ftypLen := binary.BigEndian.Uint32(initData[0:4])
 					if ftypLen > 0 && ftypLen < uint32(len(initData)) && track != nil && track.Duration > 0 && startByte == 0 {
-						bps := int64(40000)
+						bps := int64(125000)
+						if !isFLACInFMP4 {
+							bps = 40000
+						}
 						if totalBytes > 0 {
 							bps = totalBytes / int64(track.Duration)
 						}
@@ -372,7 +384,7 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 						if totalBytes > 0 {
 							totalBytes += int64(len(fakeSidx))
 						}
-						log.Printf("[DOWNLOAD] Injected simulated sidx index box (%d bytes) to support seeking", len(fakeSidx))
+						log.Printf("[DOWNLOAD] Injected simulated sidx index box (%d bytes) to support seeking for %s", len(fakeSidx), clientName)
 					}
 				}
 
@@ -388,9 +400,13 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			}
 		}
 
-		if isFLACInFMP4 {
+		// Only remux fMP4 to native FLAC for file downloads (single track / album zip)
+		// For live streaming, clients (Tempus/Symfonium/Supersonic) play fMP4 directly,
+		// and ExoPlayer clients require the synthesized sidx box and byte ranges to seek.
+		if isFLACInFMP4 && clientName == "download" {
 			if _, lookErr := exec.LookPath("ffmpeg"); lookErr == nil {
 				pr, pw := io.Pipe()
+				remuxPr = pr
 				cmd := exec.CommandContext(ctx, "ffmpeg",
 					"-loglevel", "error",
 					"-f", "mp4",
@@ -408,10 +424,11 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 					remuxCmd = cmd
 					remuxPipe = pw
 					taggerDone = make(chan struct{})
-					log.Printf("[DOWNLOAD] 🚀 Remuxing fMP4 FLAC to native lossless .flac with metadata/cover for %s", clientName)
+					log.Printf("[DOWNLOAD] 🚀 Remuxing fMP4 FLAC to native lossless .flac with metadata/cover for download")
 
 					go func() {
 						defer close(taggerDone)
+						defer ffmpegOut.Close()
 						if track != nil {
 							t := &flacTagger{w: w, track: track, startByte: startByte, totalBytes: totalBytes}
 							if tagErr := t.process(ffmpegOut, c); tagErr != nil && ctx.Err() == nil {
@@ -597,6 +614,10 @@ func (c *Controller) downloadAndStitchHLS(ctx context.Context, manifestURL strin
 			}
 			remuxCmd = nil
 		}
+	}
+	if remuxPr != nil {
+		remuxPr.Close()
+		remuxPr = nil
 	}
 	if taggerDone != nil {
 		<-taggerDone

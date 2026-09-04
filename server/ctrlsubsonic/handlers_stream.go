@@ -100,17 +100,17 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 	// Per-user stream limiting - prevent a single user from consuming all slots
 	user := r.Context().Value(CtxUser).(*db.User)
-	const maxStreamsPerUser = 5
+	const maxStreamsPerUser = 12
 	userSemVal, _ := c.userStreamLimits.LoadOrStore(user.ID, make(chan struct{}, maxStreamsPerUser))
 	userSem := userSemVal.(chan struct{})
 	select {
 	case userSem <- struct{}{}:
 		defer func() { <-userSem }()
+	case <-time.After(3 * time.Second):
+		log.Printf("[STREAM] User %d at stream limit (%d) after 3s timeout, rejecting request", user.ID, maxStreamsPerUser)
+		return spec.NewError(0, "too many concurrent streams for this user")
 	case <-r.Context().Done():
 		return spec.NewError(0, "request cancelled")
-	default:
-		log.Printf("[STREAM] User %d at stream limit (%d), rejecting request", user.ID, maxStreamsPerUser)
-		return spec.NewError(0, "too many concurrent streams for this user")
 	}
 
 	// [Deduplication] Prevent concurrent identical stream requests from hitting upstream
@@ -272,21 +272,30 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 
 	if r.Method == http.MethodHead {
 		contentType := "audio/flac"
-		switch prep.Ext {
-		case "m4a", "mp4":
+		if prep.IsHLS {
 			contentType = "audio/mp4"
-		case "webm":
-			contentType = "audio/webm"
-		case "opus", "ogg":
-			contentType = "audio/ogg"
-		case "mp3":
-			contentType = "audio/mpeg"
+		} else {
+			switch prep.Ext {
+			case "m4a", "mp4":
+				contentType = "audio/mp4"
+			case "webm":
+				contentType = "audio/webm"
+			case "opus", "ogg":
+				contentType = "audio/ogg"
+			case "mp3":
+				contentType = "audio/mpeg"
+			}
 		}
 		w.Header().Set("Content-Type", contentType)
 		if isExoPlayerClient(prep.ClientName) {
 			w.Header().Set("Accept-Ranges", "bytes")
 			if prep.Track != nil && prep.Track.Duration > 0 {
 				bytesPerSec := int64(125000)
+				if prep.Quality == "HIGH" || prep.Quality == "LOW" || prep.Ext == "m4a" {
+					bytesPerSec = 40000
+				} else if prep.Quality == "HI_RES_LOSSLESS" {
+					bytesPerSec = 175000
+				}
 				w.Header().Set("Content-Length", fmt.Sprint(int64(prep.Track.Duration)*bytesPerSec))
 			}
 		} else {
