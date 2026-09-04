@@ -249,6 +249,12 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidal.TidalProxy, resolvePro
 	c.Handle("/tidal_toggle_account_do", adminChain(resp(c.ServeTidalToggleAccountDo)))
 	c.Handle("/tidal_refresh_account_do", adminChain(resp(c.ServeTidalRefreshAccountDo)))
 
+	// admin ytmusic accounts
+	c.Handle("/ytmusic_accounts", adminChain(resp(c.ServeYTMusicAccounts)))
+	c.Handle("/ytmusic_add_account_do", adminChain(resp(c.ServeYTMusicAddAccountDo)))
+	c.Handle("/ytmusic_toggle_account_do", adminChain(resp(c.ServeYTMusicToggleAccountDo)))
+	c.Handle("/ytmusic_delete_account_do", adminChain(resp(c.ServeYTMusicDeleteAccountDo)))
+
 	// admin providers manager
 	c.Handle("/providers", adminChain(resp(c.ServeProviders)))
 	c.Handle("/providers_toggle_do", adminChain(resp(c.ServeToggleProviderDo)))
@@ -586,6 +592,9 @@ type templateData struct {
 	// tidal accounts
 	TidalAccounts []*db.TidalAccount
 	PendingOAuth  *tidal.DeviceCodeResponse
+
+	// ytmusic accounts
+	YTMusicAccounts []*db.YTMusicAccount
 
 	// providers
 	Providers []ProviderViewModel

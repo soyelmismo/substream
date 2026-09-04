@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ const (
 	pythonWorkerScript = `
 import sys, yt_dlp
 
-ydl = yt_dlp.YoutubeDL({
+ydl_free = yt_dlp.YoutubeDL({
     'quiet': True,
     'no_warnings': True,
     'format': 'ba/b',
@@ -36,14 +37,38 @@ ydl = yt_dlp.YoutubeDL({
 print('READY', flush=True)
 
 for line in sys.stdin:
-    vid = line.strip()
-    if not vid: continue
-    try:
-        info = ydl.extract_info(f'https://www.youtube.com/watch?v={vid}', download=False)
-        url = info.get('url') or ''
+    line = line.strip()
+    if not line: continue
+    parts = line.split()
+    vid = parts[0]
+    cookie_file = parts[1] if len(parts) > 1 else ''
+    
+    url = ''
+    if cookie_file:
+        try:
+            ydl_auth = yt_dlp.YoutubeDL({
+                'quiet': True,
+                'no_warnings': True,
+                'format': '141/ba/b',
+                'cookiefile': cookie_file
+            })
+            info = ydl_auth.extract_info(f'https://www.youtube.com/watch?v={vid}', download=False)
+            url = info.get('url') or ''
+        except Exception:
+            url = ''
+            
+    if not url:
+        try:
+            info = ydl_free.extract_info(f'https://www.youtube.com/watch?v={vid}', download=False)
+            url = info.get('url') or ''
+        except Exception as e:
+            print(f'ERR {e}', flush=True)
+            continue
+            
+    if url:
         print(f'OK {url}', flush=True)
-    except Exception as e:
-        print(f'ERR {e}', flush=True)
+    else:
+        print('ERR no url found', flush=True)
 `
 )
 
@@ -72,6 +97,11 @@ type Client struct {
 	workerCmd    *exec.Cmd
 	workerStdin  io.WriteCloser
 	workerReader *bufio.Reader
+
+	// Active account / session cookies
+	activeAccountMu    sync.RWMutex
+	activeCookieFile   string
+	activeCookieHeader string
 }
 
 // NewClient creates a new YouTube Music API client
@@ -84,6 +114,37 @@ func NewClient() *Client {
 	// Warm up the resident python worker in background
 	go c.warmupWorker()
 	return c
+}
+
+// SetActiveAccount updates the active cookie file and header for streaming & InnerTube
+func (c *Client) SetActiveAccount(cookieFileContent, cookieHeader string) {
+	c.activeAccountMu.Lock()
+	defer c.activeAccountMu.Unlock()
+
+	c.activeCookieHeader = strings.TrimSpace(cookieHeader)
+
+	if strings.TrimSpace(cookieFileContent) == "" {
+		c.activeCookieFile = ""
+		return
+	}
+
+	tmpFile := "/tmp/substream_yt_active_cookies.txt"
+	if err := os.WriteFile(tmpFile, []byte(cookieFileContent), 0600); err == nil {
+		c.activeCookieFile = tmpFile
+	} else {
+		log.Printf("[YTMUSIC] Failed to write cookie file %s: %v", tmpFile, err)
+	}
+}
+
+func (c *Client) prepareRequest(req *http.Request) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Origin", "https://music.youtube.com")
+	c.activeAccountMu.RLock()
+	if c.activeCookieHeader != "" {
+		req.Header.Set("Cookie", c.activeCookieHeader)
+	}
+	c.activeAccountMu.RUnlock()
 }
 
 func (c *Client) buildContextPayload() map[string]interface{} {
@@ -116,9 +177,7 @@ func (c *Client) SearchTracks(ctx context.Context, query string, limit int) ([]*
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Origin", "https://music.youtube.com")
+	c.prepareRequest(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -164,42 +223,95 @@ func (c *Client) parseSearchSongs(data map[string]interface{}, limit int) []*YTT
 		// 1. Check musicCardShelfRenderer (Top Result card)
 		if card, ok := secMap["musicCardShelfRenderer"].(map[string]interface{}); ok {
 			title := ""
+			videoID := ""
 			if tObj, ok := card["title"].(map[string]interface{}); ok {
 				if runs, _ := tObj["runs"].([]interface{}); len(runs) > 0 {
 					if r0, ok := runs[0].(map[string]interface{}); ok {
 						title, _ = r0["text"].(string)
+						if nav, ok := r0["navigationEndpoint"].(map[string]interface{}); ok {
+							if w, ok := nav["watchEndpoint"].(map[string]interface{}); ok {
+								videoID, _ = w["videoId"].(string)
+							}
+						}
 					}
 				}
 			}
-			videoID := ""
-			if onTap, ok := card["onTap"].(map[string]interface{}); ok {
-				if w, ok := onTap["watchEndpoint"].(map[string]interface{}); ok {
-					videoID, _ = w["videoId"].(string)
+			if videoID == "" {
+				if onTap, ok := card["onTap"].(map[string]interface{}); ok {
+					if w, ok := onTap["watchEndpoint"].(map[string]interface{}); ok {
+						videoID, _ = w["videoId"].(string)
+					}
 				}
 			}
 			artist := ""
+			artistID := ""
 			duration := 0
 			if sub, ok := card["subtitle"].(map[string]interface{}); ok {
 				if runs, _ := sub["runs"].([]interface{}); len(runs) > 0 {
 					for _, r := range runs {
 						if rm, ok := r.(map[string]interface{}); ok {
 							txt, _ := rm["text"].(string)
+							txt = strings.TrimSpace(txt)
+							if txt == "" || txt == "•" {
+								continue
+							}
 							if strings.Contains(txt, ":") {
 								duration = parseTimeString(txt)
-							} else if txt != "•" && txt != "Song" && artist == "" {
-								artist = strings.TrimSpace(txt)
+								continue
+							}
+							lower := strings.ToLower(txt)
+							if lower == "video" || lower == "song" || strings.Contains(lower, "view") || strings.Contains(lower, "visualiz") {
+								continue
+							}
+							nav, _ := rm["navigationEndpoint"].(map[string]interface{})
+							browse, _ := nav["browseEndpoint"].(map[string]interface{})
+							browseID, _ := browse["browseId"].(string)
+							if artist == "" {
+								artist = txt
+								artistID = browseID
 							}
 						}
 					}
 				}
 			}
+
+			// Handle "Artist - Title" UGC video titles
+			if strings.Contains(title, " - ") {
+				parts := strings.SplitN(title, " - ", 2)
+				candArtist := strings.TrimSpace(parts[0])
+				candTitle := strings.TrimSpace(parts[1])
+				if candArtist != "" && candTitle != "" {
+					if artist == "" || strings.EqualFold(artist, "video") || strings.EqualFold(artist, "song") || !strings.EqualFold(artist, candArtist) {
+						artist = candArtist
+						title = candTitle
+					}
+				}
+			}
+
+			bestThumb := ""
+			if thumbObj, ok := card["thumbnail"].(map[string]interface{}); ok {
+				if mThumb, ok := thumbObj["musicThumbnailRenderer"].(map[string]interface{}); ok {
+					if tMap, ok := mThumb["thumbnail"].(map[string]interface{}); ok {
+						if thumbs, ok := tMap["thumbnails"].([]interface{}); ok && len(thumbs) > 0 {
+							if last, ok := thumbs[len(thumbs)-1].(map[string]interface{}); ok {
+								bestThumb, _ = last["url"].(string)
+							}
+						}
+					}
+				}
+			}
+
 			if videoID != "" && title != "" {
-				tracks = append(tracks, &YTTrack{
-					VideoID:  videoID,
-					Title:    title,
-					Artist:   artist,
-					Duration: duration,
-				})
+				track := &YTTrack{
+					VideoID:   videoID,
+					Title:     title,
+					Artist:    artist,
+					ArtistID:  artistID,
+					Duration:  duration,
+					Thumbnail: bestThumb,
+				}
+				c.trackCache.Store(videoID, track)
+				tracks = append(tracks, track)
 			}
 		}
 
@@ -311,8 +423,29 @@ func (c *Client) parseFlexItem(flex map[string]interface{}) *YTTrack {
 	}
 
 	if artist == "" && len(runs1) > 0 {
-		r0, _ := runs1[0].(map[string]interface{})
-		artist, _ = r0["text"].(string)
+		for _, r := range runs1 {
+			if rm, ok := r.(map[string]interface{}); ok {
+				t, _ := rm["text"].(string)
+				t = strings.TrimSpace(t)
+				lower := strings.ToLower(t)
+				if t != "" && t != "•" && lower != "video" && lower != "song" && !strings.Contains(lower, "view") && !strings.Contains(lower, "visualiz") && !strings.Contains(t, ":") {
+					artist = t
+					break
+				}
+			}
+		}
+	}
+
+	if strings.Contains(title, " - ") {
+		parts := strings.SplitN(title, " - ", 2)
+		candArtist := strings.TrimSpace(parts[0])
+		candTitle := strings.TrimSpace(parts[1])
+		if candArtist != "" && candTitle != "" {
+			if artist == "" || strings.EqualFold(artist, "video") || strings.EqualFold(artist, "song") {
+				artist = candArtist
+				title = candTitle
+			}
+		}
 	}
 
 	// Thumbnail
@@ -326,7 +459,7 @@ func (c *Client) parseFlexItem(flex map[string]interface{}) *YTTrack {
 		bestThumb, _ = lastThumb["url"].(string)
 	}
 
-	return &YTTrack{
+	track := &YTTrack{
 		VideoID:   videoID,
 		Title:     title,
 		Artist:    artist,
@@ -336,6 +469,8 @@ func (c *Client) parseFlexItem(flex map[string]interface{}) *YTTrack {
 		Duration:  duration,
 		Thumbnail: bestThumb,
 	}
+	c.trackCache.Store(videoID, track)
+	return track
 }
 
 func parseTimeString(s string) int {
@@ -421,8 +556,7 @@ func (c *Client) fetchTrackViaNext(ctx context.Context, videoID string) *YTTrack
 	if err != nil {
 		return nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
+	c.prepareRequest(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -609,8 +743,7 @@ func (c *Client) GetRecommendations(ctx context.Context, videoID string, limit i
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
+	c.prepareRequest(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -683,8 +816,7 @@ func (c *Client) fetchTrackViaPlayer(ctx context.Context, videoID string) (*YTTr
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
+	c.prepareRequest(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -796,7 +928,18 @@ func (c *Client) resolveViaWorker(videoID string) (string, error) {
 		return "", err
 	}
 
-	if _, err := io.WriteString(c.workerStdin, videoID+"\n"); err != nil {
+	c.activeAccountMu.RLock()
+	cookieFile := c.activeCookieFile
+	c.activeAccountMu.RUnlock()
+
+	var input string
+	if cookieFile != "" {
+		input = fmt.Sprintf("%s %s\n", videoID, cookieFile)
+	} else {
+		input = fmt.Sprintf("%s\n", videoID)
+	}
+
+	if _, err := io.WriteString(c.workerStdin, input); err != nil {
 		if c.workerCmd != nil && c.workerCmd.Process != nil {
 			_ = c.workerCmd.Process.Kill()
 		}
@@ -850,15 +993,36 @@ func (c *Client) resolveViaWorker(videoID string) (string, error) {
 
 func (c *Client) resolveViaCLI(ctx context.Context, videoID string) (string, error) {
 	targetURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID)
-	cmd := exec.CommandContext(ctx, "yt-dlp",
+
+	c.activeAccountMu.RLock()
+	cookieFile := c.activeCookieFile
+	c.activeAccountMu.RUnlock()
+
+	args := []string{
 		"--no-warnings",
 		"--no-playlist",
-		"--extractor-args", "youtube:player_client=android_music",
-		"-f", "ba/b",
-		"-g", targetURL,
-	)
+	}
 
+	if cookieFile != "" {
+		args = append(args, "--cookies", cookieFile, "-f", "141/ba/b")
+	} else {
+		args = append(args, "--extractor-args", "youtube:player_client=android_music", "-f", "ba/b")
+	}
+	args = append(args, "-g", targetURL)
+
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	out, err := cmd.Output()
+	if err != nil && cookieFile != "" {
+		// Silent instant fallback to free anonymous CLI extraction
+		cmdFree := exec.CommandContext(ctx, "yt-dlp",
+			"--no-warnings",
+			"--no-playlist",
+			"--extractor-args", "youtube:player_client=android_music",
+			"-f", "ba/b",
+			"-g", targetURL,
+		)
+		out, err = cmdFree.Output()
+	}
 	if err != nil {
 		return "", fmt.Errorf("yt-dlp cli failed: %w", err)
 	}
@@ -959,9 +1123,7 @@ func (c *Client) GetAlbum(ctx context.Context, browseID string) (*YTAlbum, []*YT
 	if err != nil {
 		return nil, nil, fmt.Errorf("build album request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Origin", "https://music.youtube.com")
+	c.prepareRequest(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -1258,9 +1420,7 @@ func (c *Client) ResolveArtistID(ctx context.Context, nameOrID string) (string, 
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Origin", "https://music.youtube.com")
+	c.prepareRequest(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -1345,9 +1505,7 @@ func (c *Client) GetArtist(ctx context.Context, nameOrID string) (*YTArtistDetai
 	if err != nil {
 		return nil, fmt.Errorf("build artist request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", defaultUserAgent)
-	req.Header.Set("Origin", "https://music.youtube.com")
+	c.prepareRequest(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

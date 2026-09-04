@@ -729,5 +729,7 @@ func (db *DB) Migrate() error {
 		&TrackMetadata{},
 		&MetadataCache{},
 		&TrackSource{},
+		&YTMusicAccount{},
 	).Error
 }
+

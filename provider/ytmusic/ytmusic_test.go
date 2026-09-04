@@ -150,3 +150,38 @@ func TestGetRecommendations(t *testing.T) {
 		}
 	}
 }
+
+func TestSearchTracks(t *testing.T) {
+	p := New()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tracks, err := p.SearchTracks(ctx, "ache eighteen william crooks", 10, 0)
+	if err != nil {
+		t.Fatalf("SearchTracks failed: %v", err)
+	}
+	if len(tracks) == 0 {
+		t.Fatal("expected at least 1 track, got 0")
+	}
+
+	for i, tr := range tracks {
+		t.Logf("  [%d] ID=%s, Title=%q, Artist=%q", i, tr.ID.String(), tr.Title, tr.Artist)
+	}
+
+	found := false
+	for _, tr := range tracks {
+		if tr.ID.String() == "yt:tr:IfUQM_3e7l0" {
+			found = true
+			if tr.Artist == "Video" || tr.Artist == "" {
+				t.Errorf("expected artist not to be 'Video', got %q", tr.Artist)
+			}
+			if tr.Title == "" {
+				t.Errorf("expected non-empty title, got %q", tr.Title)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected track yt:tr:IfUQM_3e7l0 in results, but was not found")
+	}
+}

@@ -160,6 +160,9 @@ func main() {
 
 	// 5. YouTube Music Provider (Universal Fallback & Opus 160kbps streaming)
 	ytProvider := ytmusic.New()
+	if ytAccounts, err := dbc.GetActiveYTMusicAccounts(); err == nil && len(ytAccounts) > 0 {
+		ytProvider.SyncAccounts(ytAccounts)
+	}
 	providers.Register(ytProvider)
 	log.Printf("[PROVIDER] Registered YouTube Music provider (yt)")
 

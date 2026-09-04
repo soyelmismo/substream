@@ -415,10 +415,14 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	isHLS := strings.Contains(url, ".m3u8") || strings.Contains(url, "manifestType=HLS") || strings.HasPrefix(url, "data:")
 	isDASH := strings.Contains(url, ".mpd") || strings.Contains(url, "manifestType=MPEG_DASH")
 	ext := "flac"
-	if strings.Contains(url, ".m4a") || strings.Contains(url, ".mp4") {
+	if strings.Contains(url, ".m4a") || strings.Contains(url, ".mp4") || strings.Contains(url, "mime=audio%2Fmp4") || strings.Contains(url, "mime=audio/mp4") {
 		ext = "m4a"
-	} else if strings.Contains(url, ".mp3") {
+	} else if strings.Contains(url, ".mp3") || strings.Contains(url, "mime=audio%2Fmpeg") {
 		ext = "mp3"
+	} else if strings.Contains(url, ".webm") || strings.Contains(url, "mime=audio%2Fwebm") || strings.Contains(url, "mime=audio/webm") {
+		ext = "webm"
+	} else if strings.Contains(url, ".opus") || strings.Contains(url, ".ogg") || strings.Contains(url, "mime=audio%2Fogg") {
+		ext = "opus"
 	}
 
 	return &streamRequest{

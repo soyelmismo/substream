@@ -194,3 +194,22 @@ type TrackSource struct {
 func (TrackSource) TableName() string {
 	return "track_sources"
 }
+
+// YTMusicAccount represents a stored YouTube Music user account / session cookies
+type YTMusicAccount struct {
+	ID           int       `gorm:"primary_key"`
+	Name         string    `gorm:"not null"`
+	CookieData   string    `gorm:"type:text;not null"`
+	CookieFile   string    `gorm:"type:text;not null"`
+	CookieHeader string    `gorm:"type:text;not null"`
+	IsActive     bool      `gorm:"not null;default:true"`
+	IsPremium    bool      `gorm:"not null;default:false"`
+	CreatedAt    time.Time `sql:"DEFAULT:current_timestamp"`
+	UpdatedAt    time.Time `sql:"DEFAULT:current_timestamp"`
+}
+
+// TableName overrides table name for YTMusicAccount
+func (YTMusicAccount) TableName() string {
+	return "ytmusic_accounts"
+}
+

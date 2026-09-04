@@ -537,3 +537,42 @@ func (db *DB) ClearAllCache() error {
 	log.Printf("[CACHE] metadata_cache count after delete: %d", countAfter)
 	return nil
 }
+
+// GetYTMusicAccounts returns all configured YouTube Music accounts
+func (db *DB) GetYTMusicAccounts() ([]*YTMusicAccount, error) {
+	var accounts []*YTMusicAccount
+	err := db.Order("id desc").Find(&accounts).Error
+	return accounts, err
+}
+
+// GetActiveYTMusicAccounts returns all active YouTube Music accounts
+func (db *DB) GetActiveYTMusicAccounts() ([]*YTMusicAccount, error) {
+	var accounts []*YTMusicAccount
+	err := db.Where("is_active = ?", true).Order("id asc").Find(&accounts).Error
+	return accounts, err
+}
+
+// AddYTMusicAccount adds a new YouTube Music account
+func (db *DB) AddYTMusicAccount(name, cookieData, cookieFile, cookieHeader string, isPremium bool) (*YTMusicAccount, error) {
+	acc := &YTMusicAccount{
+		Name:         name,
+		CookieData:   cookieData,
+		CookieFile:   cookieFile,
+		CookieHeader: cookieHeader,
+		IsActive:     true,
+		IsPremium:    isPremium,
+	}
+	err := db.Create(acc).Error
+	return acc, err
+}
+
+// DeleteYTMusicAccount deletes an account by ID
+func (db *DB) DeleteYTMusicAccount(id int) error {
+	return db.Where("id = ?", id).Delete(&YTMusicAccount{}).Error
+}
+
+// ToggleYTMusicAccount enables or disables an account
+func (db *DB) ToggleYTMusicAccount(id int, active bool) error {
+	return db.Model(&YTMusicAccount{}).Where("id = ?", id).Update("is_active", active).Error
+}
+

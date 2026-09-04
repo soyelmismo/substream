@@ -136,7 +136,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	clientNameLower := strings.ToLower(p.GetOr("c", ""))
 	if clientNeedsHelp || clientNameLower == "supersonic" {
 		// For HLS-stitching clients or Supersonic, don't wait - process immediately
-		log.Printf("[STREAM] LATENCY PRIORITY: Processing track=%d immediately for %s (no dedup)", id.Value(), p.GetOr("c", ""))
+		log.Printf("[STREAM] LATENCY PRIORITY: Processing track=%s immediately for %s (no dedup)", id.String(), p.GetOr("c", ""))
 		loaded = false
 	} else {
 		lockVal, loaded = c.streamLocks.LoadOrStore(streamKey, &streamLock{done: make(chan struct{})})
@@ -148,17 +148,17 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		<-lock.done
 		// If the first request failed, do NOT return a cached error to this new request!
 		if lock.err != nil {
-			log.Printf("[STREAM] Previous request had error (%v), starting fresh for track=%d", lock.err, id.Value())
+			log.Printf("[STREAM] Previous request had error (%v), starting fresh for track=%s", lock.err, id.String())
 			c.streamLocks.Delete(streamKey)
-		} else if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute && !strings.HasPrefix(lock.prep.StreamURL, "data:") && !lock.prep.IsHLS && proxyStreams != "true" {
-			// Safe to redirect to cached progressive URL (non-HLS)
-			log.Printf("[STREAM] GAPLESS reusing cached stream for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
+		} else if lock.prep != nil && time.Since(lock.cached) < 10*time.Minute && !strings.HasPrefix(lock.prep.StreamURL, "data:") && !lock.prep.IsHLS && proxyStreams != "true" && id.Provider() != "yt" && !strings.Contains(lock.prep.StreamURL, "googlevideo.com") {
+			// Safe to redirect to cached progressive URL (non-HLS) - only if not YouTube
+			log.Printf("[STREAM] GAPLESS reusing cached stream for track=%s (age=%v)", id.String(), time.Since(lock.cached))
 			urlPreview := lock.prep.StreamURL
 			if len(urlPreview) > 100 {
 				urlPreview = urlPreview[:100]
 			}
-			log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s (cached)",
-				id.Value(), lock.prep.IsHLS, urlPreview)
+			log.Printf("[STREAM] REDIRECT track=%s IsHLS=%v URL=%s (cached)",
+				id.String(), lock.prep.IsHLS, urlPreview)
 			http.Redirect(w, r, lock.prep.StreamURL, http.StatusFound)
 			return nil
 		}
@@ -176,7 +176,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			// Don't propagate client disconnection errors to other waiting requests
 			// If a client closes the connection, that doesn't mean the stream is broken
 			if isClientDisconnectError(streamErr) {
-				log.Printf("[STREAM] Client disconnected for track=%d, not propagating error to waiters", id.Value())
+				log.Printf("[STREAM] Client disconnected for track=%s, not propagating error to waiters", id.String())
 				lock.err = nil // Don't store client errors
 			} else {
 				lock.err = streamErr
@@ -196,7 +196,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	if lockVal != nil {
 		if lock, ok := lockVal.(*streamLock); ok && lock.prep != nil && time.Since(lock.cached) < 10*time.Minute {
 			prep = lock.prep
-			log.Printf("[STREAM] GAPLESS reusing prepared stream metadata for track=%d (age=%v)", id.Value(), time.Since(lock.cached))
+			log.Printf("[STREAM] GAPLESS reusing prepared stream metadata for track=%s (age=%v)", id.String(), time.Since(lock.cached))
 		}
 	}
 	if prep == nil {
@@ -215,11 +215,21 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	defer streamCancel()
 
 	// 1. Ingest metadata for virtual library
-	trackURI := fmt.Sprintf("td:tr:%d", id.Value())
+	trackURI := id.String()
+	albumURI := ""
+	artistURI := ""
+	if prep.Track != nil {
+		if prep.Track.Album.ID != 0 {
+			albumURI = fmt.Sprintf("%s:al:%d", id.Provider(), prep.Track.Album.ID)
+		}
+		if prep.Track.Artist.ID != 0 {
+			artistURI = fmt.Sprintf("%s:ar:%d", id.Provider(), prep.Track.Artist.ID)
+		}
+	}
 	c.dbc.Exec(`INSERT OR REPLACE INTO track_metadata (uri, album_uri, artist_uri, updated_at) VALUES (?, ?, ?, ?)`,
-		trackURI, fmt.Sprintf("td:al:%d", prep.Track.Album.ID), fmt.Sprintf("td:ar:%d", prep.Track.Artist.ID), time.Now())
-	c.dbc.Exec(`INSERT INTO plays (user_id, uri, provider, played_at, count) VALUES (?, ?, 'tidal', ?, 1) ON CONFLICT(user_id, uri) DO UPDATE SET count=count+1, played_at=?`,
-		user.ID, trackURI, time.Now(), time.Now())
+		trackURI, albumURI, artistURI, time.Now())
+	c.dbc.Exec(`INSERT INTO plays (user_id, uri, provider, played_at, count) VALUES (?, ?, ?, ?, 1) ON CONFLICT(user_id, uri) DO UPDATE SET count=count+1, played_at=?`,
+		user.ID, trackURI, id.Provider(), time.Now(), time.Now())
 
 	// 2. Route based on client HLS support
 	clientNeedsHelp = doesntSupportHLS(prep.ClientName) // Already declared earlier
@@ -228,7 +238,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	if clientNeedsHelp && prep.IsHLS {
 		// Client can't handle HLS natively - try to unwrap to progressive URL
 		if directURL := c.unwrapTidalManifest(r.Context(), prep.StreamURL, prep.ClientIP, 0); directURL != "" {
-			log.Printf("[STREAM] Unwrapped HLS to progressive for %s track=%d", prep.ClientName, id.Value())
+			log.Printf("[STREAM] Unwrapped HLS to progressive for %s track=%s", prep.ClientName, id.String())
 			streamURL = directURL
 			prep.IsHLS = false // Now it's a direct progressive stream
 		} else {
@@ -237,30 +247,40 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			if len(urlPreview) > 100 {
 				urlPreview = urlPreview[:100] + "..."
 			}
-			log.Printf("[STREAM] HLS stitch mode for %s track=%d URL=%s", prep.ClientName, id.Value(), urlPreview)
+			log.Printf("[STREAM] HLS stitch mode for %s track=%s URL=%s", prep.ClientName, id.String(), urlPreview)
 			// Fall through to stitching logic below
 		}
 	}
 
 	// Subsonic /rest/stream clients expect a continuous audio stream (e.g. audio/flac).
 	// HLS manifests must always be stitched so standard Subsonic clients get native audio.
+	// YouTube streams must ALWAYS be proxied because googlevideo.com links are IP-locked.
 	isDataURL := strings.HasPrefix(streamURL, "data:")
 	needsStitch := prep.IsHLS || isDataURL
-	if proxyStreams != "true" && !needsStitch {
+	isYT := id.Provider() == "yt" || strings.Contains(streamURL, "googlevideo.com")
+	needsProxy := proxyStreams == "true" || isYT
+	if !needsProxy && !needsStitch {
 		urlPreview := streamURL
 		if len(urlPreview) > 100 {
 			urlPreview = urlPreview[:100]
 		}
-		log.Printf("[STREAM] REDIRECT track=%d IsHLS=%v URL=%s",
-			id.Value(), prep.IsHLS, urlPreview)
+		log.Printf("[STREAM] REDIRECT track=%s IsHLS=%v URL=%s",
+			id.String(), prep.IsHLS, urlPreview)
 		http.Redirect(w, r, streamURL, http.StatusFound)
 		return nil
 	}
 
 	if r.Method == http.MethodHead {
-		contentType := "audio/mp4"
-		if prep.Ext == "flac" {
-			contentType = "audio/flac"
+		contentType := "audio/flac"
+		switch prep.Ext {
+		case "m4a", "mp4":
+			contentType = "audio/mp4"
+		case "webm":
+			contentType = "audio/webm"
+		case "opus", "ogg":
+			contentType = "audio/ogg"
+		case "mp3":
+			contentType = "audio/mpeg"
 		}
 		w.Header().Set("Content-Type", contentType)
 		if isExoPlayerClient(prep.ClientName) {
@@ -279,13 +299,30 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// 3. Proxy/Stitch stream
 	if !prep.IsHLS && !prep.IsDASH {
 		contentType := "audio/flac"
-		if prep.Ext == "m4a" {
+		switch prep.Ext {
+		case "m4a", "mp4":
 			contentType = "audio/mp4"
+		case "webm":
+			contentType = "audio/webm"
+		case "opus", "ogg":
+			contentType = "audio/ogg"
+		case "mp3":
+			contentType = "audio/mpeg"
 		}
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Accept-Ranges", "bytes")
 		if strings.Contains(r.URL.Path, "download") {
-			cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s.%s", prep.Track.Artist.Name, prep.Track.Title, prep.Ext), "/", "_")
+			artistName := "Unknown Artist"
+			trackTitle := "Track"
+			if prep.Track != nil {
+				if prep.Track.Artist.Name != "" {
+					artistName = prep.Track.Artist.Name
+				}
+				if prep.Track.Title != "" {
+					trackTitle = prep.Track.Title
+				}
+			}
+			cleanName := strings.ReplaceAll(fmt.Sprintf("%s - %s.%s", artistName, trackTitle, prep.Ext), "/", "_")
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", cleanName))
 		}
 	}
@@ -296,7 +333,7 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		if len(urlPreview) > 100 {
 			urlPreview = urlPreview[:100]
 		}
-		log.Printf("[STREAM] Starting HLS stitch for %s track=%d", prep.ClientName, id.Value())
+		log.Printf("[STREAM] Starting HLS stitch for %s track=%s", prep.ClientName, id.String())
 
 		// Subsonic time-based seeking (via timeOffset query param)
 		offsetSeconds := p.GetOrFloat("timeOffset", 0.0)
@@ -340,23 +377,23 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 		err = c.downloadAndStitchHLS(streamCtx, prep.StreamURL, w, prep.ClientIP, prep.Track, offsetSeconds, startByte, totalBytes, prep.ClientName)
 		if err != nil {
 			streamErr = err
-			log.Printf("[STREAM] ERROR: HLS stitch failed for track %d: %v", id.Value(), err)
+			log.Printf("[STREAM] ERROR: HLS stitch failed for track %s: %v", id.String(), err)
 		} else {
-			log.Printf("[STREAM] HLS stitch succeeded for track %d", id.Value())
+			log.Printf("[STREAM] HLS stitch succeeded for track %s", id.String())
 		}
 	} else if prep.IsDASH {
 		// [NEW] Serve DASH manifest directly
 		err = c.proxyDASHManifest(streamCtx, prep.StreamURL, w, prep.ClientIP)
 		if err != nil {
 			streamErr = err
-			log.Printf("[STREAM] ERROR: DASH proxy failed for track %d: %v", id.Value(), err)
+			log.Printf("[STREAM] ERROR: DASH proxy failed for track %s: %v", id.String(), err)
 		}
 	} else {
 		// Direct proxy with proper error handling and header passthrough
 		err = c.proxyDirectStream(streamCtx, w, r, prep)
 		if err != nil {
 			streamErr = err
-			log.Printf("[STREAM] ERROR: direct proxy failed for track %d: %v", id.Value(), err)
+			log.Printf("[STREAM] ERROR: direct proxy failed for track %s: %v", id.String(), err)
 		}
 	}
 	return nil
@@ -376,29 +413,53 @@ func (c *Controller) ServeHLS(w http.ResponseWriter, r *http.Request) *spec.Resp
 	ctx := r.Context()
 	prep, err := c.prepareStream(ctx, r, &id)
 	if err != nil {
-		log.Printf("[HLS] Failed to prepare stream for track %d: %v", id.Value(), err)
+		log.Printf("[HLS] Failed to prepare stream for track %s: %v", id.String(), err)
 		return spec.NewError(0, "failed to get stream: %v", err)
 	}
 
-	// Verify we got an HLS stream
-	if !prep.IsHLS {
-		log.Printf("[HLS] Track %d is not available as HLS (URL: %s)", id.Value(), prep.StreamURL)
-		return spec.NewError(0, "track not available as HLS stream")
+	// Native HLS stream (e.g. Tidal HLS fMP4): proxy the upstream manifest
+	if prep.IsHLS {
+		urlPreview := prep.StreamURL
+		if len(urlPreview) > 100 {
+			urlPreview = urlPreview[:100]
+		}
+		log.Printf("[HLS] Proxying native M3U8 manifest for track=%s URL=%s client=%s",
+			id.String(), urlPreview, prep.ClientName)
+
+		if err := c.proxyHLSManifest(ctx, prep.StreamURL, w, prep.ClientIP); err != nil {
+			log.Printf("[HLS] Failed to proxy manifest for track %s: %v", id.String(), err)
+			return spec.NewError(0, "failed to proxy HLS manifest: %v", err)
+		}
+		return nil
 	}
 
-	// Proxy the HLS manifest - this rewrites relative URLs to absolute
-	// and ensures the client gets a valid M3U8 that works from their IP
-	urlPreview := prep.StreamURL
-	if len(urlPreview) > 100 {
-		urlPreview = urlPreview[:100]
+	// Progressive audio stream (YouTube Music, direct FLAC, MP3, etc.):
+	// Synthesize a valid RFC 8216 single-segment M3U8 playlist pointing to the server's /stream.
+	// This satisfies MPV (Supersonic) and other HLS-capable clients without error.
+	duration := 300.0
+	if prep.Track != nil && prep.Track.Duration > 0 {
+		duration = float64(prep.Track.Duration)
 	}
-	log.Printf("[HLS] Proxying M3U8 manifest for track=%d URL=%s client=%s",
-		id.Value(), urlPreview, prep.ClientName)
+	targetDuration := int(duration) + 1
+	if targetDuration < 1 {
+		targetDuration = 10
+	}
 
-	if err := c.proxyHLSManifest(ctx, prep.StreamURL, w, prep.ClientIP); err != nil {
-		log.Printf("[HLS] Failed to proxy manifest for track %d: %v", id.Value(), err)
-		return spec.NewError(0, "failed to proxy HLS manifest: %v", err)
-	}
+	q := r.URL.Query()
+	q.Del("f") // Clear JSON/XML format flag so /stream serves the raw audio stream
+	segmentURL := "stream?" + q.Encode()
+
+	manifest := fmt.Sprintf("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:%.3f,\n%s\n#EXT-X-ENDLIST\n",
+		targetDuration, duration, segmentURL)
+
+	log.Printf("[HLS] Serving synthetic M3U8 for progressive track=%s dur=%.1fs client=%s",
+		id.String(), duration, prep.ClientName)
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Content-Disposition", "inline; filename=\"stream.m3u8\"")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(manifest))
 	return nil
 }
 

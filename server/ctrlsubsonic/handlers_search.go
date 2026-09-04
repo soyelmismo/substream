@@ -3,12 +3,14 @@ package ctrlsubsonic
 import (
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -155,11 +157,20 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	} else {
 		prov := c.providers.Default()
 		searchQuery := query
+		hasPrefix := false
 		if colonIdx := strings.Index(query, ":"); colonIdx > 0 && colonIdx <= 4 {
 			prefix := strings.ToLower(query[:colonIdx])
 			if p, err := c.providers.Get(prefix); err == nil && p != nil {
 				prov = p
 				searchQuery = strings.TrimSpace(query[colonIdx+1:])
+				hasPrefix = true
+			}
+		}
+
+		var extraProv provider.MusicProvider
+		if !hasPrefix && c.providers.IsMetadataEnabled("yt") && (prov == nil || prov.ID() != "yt") {
+			if yt, err := c.providers.Get("yt"); err == nil && yt != nil {
+				extraProv = yt
 			}
 		}
 
@@ -170,24 +181,130 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					tracksCh <- nil
 				}
 			}()
-			if songCount <= 0 || prov == nil || !c.providers.IsMetadataEnabled(prov.ID()) {
+			if songCount <= 0 || (prov == nil && extraProv == nil) {
 				tracksCh <- nil
 				return
 			}
-			tData, err := prov.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
-			if err != nil {
-				log.Printf("[SUBS] SearchTracks error: %v", err)
-				tracksCh <- nil
-				return
+
+			var primaryTracks []*spec.TrackChild
+			var secondaryTracks []*spec.TrackChild
+			var wg sync.WaitGroup
+
+			if prov != nil && c.providers.IsMetadataEnabled(prov.ID()) {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[SUBS] Primary SearchTracks panic: %v", r)
+						}
+					}()
+					tData, err := prov.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
+					if err == nil {
+						primaryTracks = tData
+					} else {
+						log.Printf("[SUBS] Primary SearchTracks error: %v", err)
+					}
+				}()
 			}
-			if len(tData) > songCount {
-				tData = tData[:songCount]
+
+			if extraProv != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[SUBS] Secondary SearchTracks panic: %v", r)
+						}
+					}()
+					tData, err := extraProv.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
+					if err == nil {
+						secondaryTracks = tData
+					} else {
+						log.Printf("[SUBS] Secondary SearchTracks error: %v", err)
+					}
+				}()
 			}
-			out := make([]spec.TrackChild, len(tData))
-			for i, t := range tData {
-				if t != nil {
-					out[i] = *t
+
+			wg.Wait()
+
+			scoreTrack := func(t *spec.TrackChild) int {
+				if t == nil {
+					return 0
 				}
+				score := 0
+				text := strings.ToLower(t.Title + " " + t.Artist + " " + t.Album)
+				terms := strings.Fields(strings.ToLower(searchQuery))
+				allMatch := true
+				for _, term := range terms {
+					if strings.Contains(text, term) {
+						score += 10
+					} else {
+						allMatch = false
+					}
+				}
+				if allMatch && len(terms) > 0 {
+					score += 50
+				}
+				if strings.EqualFold(t.Title, searchQuery) {
+					score += 100
+				}
+				return score
+			}
+
+			type scoredTrack struct {
+				track     *spec.TrackChild
+				score     int
+				isPrimary bool
+			}
+
+			var allScored []scoredTrack
+			seenKeys := make(map[string]bool)
+
+			cleanKey := func(title, artist string) string {
+				t := strings.ToLower(strings.TrimSpace(title))
+				a := strings.ToLower(strings.TrimSpace(artist))
+				return t + "|||" + a
+			}
+
+			for _, t := range primaryTracks {
+				if t != nil {
+					k := cleanKey(t.Title, t.Artist)
+					if !seenKeys[k] {
+						seenKeys[k] = true
+						allScored = append(allScored, scoredTrack{track: t, score: scoreTrack(t), isPrimary: true})
+					}
+				}
+			}
+
+			for _, t := range secondaryTracks {
+				if t != nil {
+					k := cleanKey(t.Title, t.Artist)
+					if !seenKeys[k] {
+						seenKeys[k] = true
+						allScored = append(allScored, scoredTrack{track: t, score: scoreTrack(t), isPrimary: false})
+					}
+				}
+			}
+
+			// Sort stable: higher score first, if score equal, primary first
+			sort.SliceStable(allScored, func(i, j int) bool {
+				if allScored[i].score != allScored[j].score {
+					return allScored[i].score > allScored[j].score
+				}
+				if allScored[i].isPrimary != allScored[j].isPrimary {
+					return allScored[i].isPrimary // primary first when tied
+				}
+				return false
+			})
+
+			if len(allScored) > songCount {
+				allScored = allScored[:songCount]
+			}
+
+			out := make([]spec.TrackChild, len(allScored))
+			for i, st := range allScored {
+				out[i] = *st.track
 			}
 			tracksCh <- out
 		}()

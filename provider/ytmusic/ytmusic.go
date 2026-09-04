@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -35,6 +36,26 @@ func (p *Provider) ID() string {
 
 func (p *Provider) Name() string {
 	return "YouTube Music"
+}
+
+// SetActiveAccount updates the active cookie session
+func (p *Provider) SetActiveAccount(cookieFileContent, cookieHeader string) {
+	if p.client != nil {
+		p.client.SetActiveAccount(cookieFileContent, cookieHeader)
+	}
+}
+
+// SyncAccounts updates the active account from DB accounts
+func (p *Provider) SyncAccounts(accounts []*db.YTMusicAccount) {
+	for _, acc := range accounts {
+		if acc.IsActive {
+			p.SetActiveAccount(acc.CookieFile, acc.CookieHeader)
+			log.Printf("[YTMUSIC] Switched active account to: %s (fallback to free ready)", acc.Name)
+			return
+		}
+	}
+	p.SetActiveAccount("", "")
+	log.Printf("[YTMUSIC] No active accounts; running in anonymous free mode")
 }
 
 func sanitizeFilename(s string) string {

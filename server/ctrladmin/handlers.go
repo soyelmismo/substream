@@ -24,6 +24,7 @@ import (
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/listenbrainz"
 	"go.senan.xyz/gonic/provider/tidal"
+	"go.senan.xyz/gonic/provider/ytmusic"
 )
 
 func (c *Controller) ServeNotFound(_ *http.Request) *Response {
@@ -1764,4 +1765,117 @@ func (c *Controller) ServeToggleProviderDo(r *http.Request) *Response {
 		redirect: "/admin/providers",
 		flashN:   []string{fmt.Sprintf("Provider %s: %s successfully %s!", strings.ToUpper(providerID), sector, actionStr)},
 	}
+}
+
+func (c *Controller) ServeYTMusicAccounts(r *http.Request) *Response {
+	accounts, err := c.dbc.GetYTMusicAccounts()
+	if err != nil {
+		return &Response{code: 500, err: fmt.Sprintf("get ytmusic accounts: %v", err)}
+	}
+
+	data := &templateData{}
+	data.YTMusicAccounts = accounts
+
+	return &Response{
+		template: "ytmusic_accounts.tmpl",
+		data:     data,
+	}
+}
+
+func (c *Controller) ServeYTMusicAddAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	name := strings.TrimSpace(r.FormValue("name"))
+	cookieData := strings.TrimSpace(r.FormValue("cookie_data"))
+
+	if name == "" {
+		name = "YouTube Music Account"
+	}
+	if cookieData == "" {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{"cookie data is required"}}
+	}
+
+	netscape, header, count, err := ytmusic.ParseCookies(cookieData)
+	if err != nil {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{fmt.Sprintf("could not parse cookies: %v", err)}}
+	}
+
+	acc, err := c.dbc.AddYTMusicAccount(name, cookieData, netscape, header, false)
+	if err != nil {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{fmt.Sprintf("could not save account: %v", err)}}
+	}
+
+	// Sync active account to provider
+	if c.providers != nil {
+		if p, err := c.providers.Get("yt"); err == nil && p != nil {
+			if ytp, ok := p.(*ytmusic.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveYTMusicAccounts()
+				ytp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	log.Printf("[AUDIT] YouTube Music account added: %s (ID: %d, parsed %d cookies)", name, acc.ID, count)
+	return &Response{
+		redirect: "/admin/ytmusic_accounts",
+		flashN:   []string{fmt.Sprintf("YouTube Music account %q added! (%d cookies parsed, fallback to free ready)", name, count)},
+	}
+}
+
+func (c *Controller) ServeYTMusicToggleAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	active := r.FormValue("active") == "true"
+	if err := c.dbc.ToggleYTMusicAccount(idInt, active); err != nil {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{fmt.Sprintf("update account: %v", err)}}
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("yt"); err == nil && p != nil {
+			if ytp, ok := p.(*ytmusic.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveYTMusicAccounts()
+				ytp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	return &Response{redirect: "/admin/ytmusic_accounts", flashN: []string{"account status updated"}}
+}
+
+func (c *Controller) ServeYTMusicDeleteAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	if err := c.dbc.DeleteYTMusicAccount(idInt); err != nil {
+		return &Response{redirect: "/admin/ytmusic_accounts", flashW: []string{fmt.Sprintf("delete account: %v", err)}}
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("yt"); err == nil && p != nil {
+			if ytp, ok := p.(*ytmusic.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveYTMusicAccounts()
+				ytp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	log.Printf("[AUDIT] YouTube Music account deleted (ID: %d)", idInt)
+	return &Response{redirect: "/admin/ytmusic_accounts", flashN: []string{"YouTube Music account removed"}}
 }
