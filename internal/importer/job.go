@@ -272,6 +272,41 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 		return ytURI
 	}
 
+	// Priority 2b: Track has direct SoundCloud SourceURI (e.g. from SoundCloud playlist)
+	scURI := ""
+	if track.SourceURI != "" && strings.HasPrefix(track.SourceURI, "sc:tr:") {
+		scURI = track.SourceURI
+	}
+
+	if scURI != "" {
+		// If Tidal metadata is enabled, attempt Lossless Upgrade to Tidal FLAC
+		if jm.proxy != nil && (jm.providers == nil || jm.providers.IsMetadataEnabled("td")) {
+			if tidalID := jm.searchByText(ctx, track.Artist, track.Title, track.Album); tidalID > 0 {
+				tdURI := fmt.Sprintf("td:tr:%d", tidalID)
+				log.Printf("[IMPORT] 🚀 Lossless Upgrade: SoundCloud track %q by %q matched to Tidal FLAC %s (linked with %s)",
+					track.Title, track.Artist, tdURI, scURI)
+				if jm.db != nil {
+					_ = db.SaveTrackSources(jm.db.DB, clusterKey,
+						db.TrackSource{ClusterKey: clusterKey, Provider: "td", URI: tdURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: "sc", URI: scURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+					)
+				}
+				return tdURI
+			}
+		}
+		// If Tidal didn't match, record SoundCloud source and return it
+		if jm.db != nil {
+			_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+				ClusterKey:  clusterKey,
+				Provider:    "sc",
+				URI:         scURI,
+				QualityTier: db.QualityTierStandard,
+				IsAvailable: true,
+			})
+		}
+		return scURI
+	}
+
 	// Priority 3: Try ISRC across lossless providers (Tidal, Deezer, Qobuz)
 	if track.ISRC != "" {
 		if jm.providers != nil {
@@ -359,6 +394,31 @@ func (jm *JobManager) findTrack(ctx context.Context, track ImportedTrack) string
 						})
 					}
 					return ytFallbackURI
+				}
+			}
+		}
+	}
+
+	// Priority 6: Fallback to SoundCloud (Underground, indie, remix & DJ set rescue)
+	if jm.providers != nil && jm.providers.IsMetadataEnabled("sc") {
+		if scProv, err := jm.providers.Get("sc"); err == nil && scProv != nil {
+			if matcher, ok := scProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if scTrack, err := matcher.MatchTrackByMetadata(ctx, track.Artist, track.Title, track.Duration); err == nil && scTrack != nil {
+					scFallbackURI := fmt.Sprintf("sc:tr:%s", scTrack.ID.RawID())
+					log.Printf("[IMPORT] ✅ Cross-provider fallback to SoundCloud for %q by %q: %s",
+						track.Title, track.Artist, scFallbackURI)
+					if jm.db != nil {
+						_ = db.SaveTrackSources(jm.db.DB, clusterKey, db.TrackSource{
+							ClusterKey:  clusterKey,
+							Provider:    "sc",
+							URI:         scFallbackURI,
+							QualityTier: db.QualityTierStandard,
+							IsAvailable: true,
+						})
+					}
+					return scFallbackURI
 				}
 			}
 		}

@@ -41,3 +41,49 @@ func TestSoundCloudClient(t *testing.T) {
 	}
 	t.Logf("Resolved stream URL: %s", streamURL)
 }
+
+func TestSoundCloudProvider(t *testing.T) {
+	prov := New()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 1. Test GetAlbum with a single track (fallback to single album)
+	trackID := "238289066"
+	album, err := prov.GetAlbum(ctx, trackID)
+	if err != nil {
+		t.Fatalf("GetAlbum single fallback failed: %v", err)
+	}
+	if album == nil || len(album.Tracks) == 0 {
+		t.Fatalf("expected album with at least 1 track")
+	}
+	t.Logf("GetAlbum: Title=%q Artist=%q Tracks=%d", album.Name, album.Artist, len(album.Tracks))
+
+	// 2. Test GetCoverURL on cold cache
+	coverURL := prov.GetCoverURL("sc:tr:238289066", 500)
+	if coverURL == "" {
+		t.Fatalf("expected non-empty cover URL")
+	}
+	t.Logf("GetCoverURL: %s", coverURL)
+
+	// 3. Test GetRecommendations
+	recs, err := prov.GetRecommendations(ctx, trackID)
+	if err != nil {
+		t.Fatalf("GetRecommendations failed: %v", err)
+	}
+	if len(recs) == 0 {
+		t.Fatalf("expected at least 1 recommendation")
+	}
+	t.Logf("GetRecommendations: returned %d tracks. First: %s - %s", len(recs), recs[0].Artist, recs[0].Title)
+
+	// 4. Test GetArtistAlbums
+	artistID := "161472065" // William Crooks
+	albums, topTracks, err := prov.GetArtistAlbums(ctx, artistID, false)
+	if err != nil {
+		t.Fatalf("GetArtistAlbums failed: %v", err)
+	}
+	t.Logf("GetArtistAlbums: found %d albums/playlists and %d tracks", len(albums), len(topTracks))
+	if len(albums) == 0 && len(topTracks) == 0 {
+		t.Fatalf("expected either albums or tracks for artist")
+	}
+}

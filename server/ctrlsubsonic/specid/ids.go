@@ -64,7 +64,7 @@ func (i ID) Type() IDT {
 func (i ID) RawID() string {
 	parts := strings.Split(i.URI, ":")
 	if len(parts) >= 3 {
-		return parts[2]
+		return strings.Join(parts[2:], ":")
 	}
 	// Fallback: try legacy format
 	_, partValue, _ := strings.Cut(i.URI, separator)
@@ -96,7 +96,7 @@ func New(in string) (ID, error) {
 		if len(parts) >= 3 {
 			provider := parts[0]
 			idType := IDT(parts[1])
-			rawID := parts[2]
+			rawID := strings.Join(parts[2:], ":")
 
 			// Validate provider is not empty
 			if provider == "" {

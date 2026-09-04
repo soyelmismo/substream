@@ -81,3 +81,8 @@ type SoundCloudSearchUsersResponse struct {
 type SoundCloudStreamResponse struct {
 	URL string `json:"url"`
 }
+
+// SoundCloudResolveHeader identifies the kind of resource returned by /resolve
+type SoundCloudResolveHeader struct {
+	Kind string `json:"kind"` // "playlist", "track", "user"
+}

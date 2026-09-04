@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
@@ -236,25 +237,93 @@ func (p *Provider) GetTracksBatch(ctx context.Context, rawIDs []string) []*spec.
 	return clean
 }
 
-// GetAlbum fetches playlist/album metadata and its tracks
+// GetAlbum fetches playlist/album metadata and its tracks, with fallback for standalone single tracks
 func (p *Provider) GetAlbum(ctx context.Context, rawID string) (*spec.Album, error) {
-	pl, err := p.client.GetPlaylist(ctx, rawID)
+	// 1. Check if synthetic user catalog was requested
+	if strings.HasPrefix(rawID, "user_tracks:") || strings.HasPrefix(rawID, "user_tracks_") {
+		userID := strings.TrimPrefix(strings.TrimPrefix(rawID, "user_tracks:"), "user_tracks_")
+		u, uErr := p.client.GetUser(ctx, userID)
+		tList, tErr := p.client.GetUserTracks(ctx, userID, 50)
+		if tErr != nil || len(tList) == 0 {
+			if uErr != nil {
+				return nil, uErr
+			}
+			return nil, tErr
+		}
+		username := "Artist"
+		if u != nil && u.Username != "" {
+			username = u.Username
+		}
+		albumID := &specid.ID{URI: fmt.Sprintf("sc:al:user_tracks:%s", userID)}
+		artistID := &specid.ID{URI: fmt.Sprintf("sc:ar:%s", userID)}
+		coverID := albumID
+		if u != nil && u.AvatarURL != "" {
+			p.coverCache.Store(albumID.RawID(), u.AvatarURL)
+		}
+		album := &spec.Album{
+			ID:         albumID,
+			ParentID:   artistID,
+			Name:       fmt.Sprintf("%s - Popular Tracks", username),
+			Artist:     username,
+			ArtistID:   artistID,
+			CoverID:    coverID,
+			TrackCount: len(tList),
+		}
+		for i, t := range tList {
+			st := p.trackToSpec(t)
+			if st != nil {
+				st.TrackNumber = i + 1
+				st.Album = album.Name
+				st.AlbumID = album.ID
+				album.Tracks = append(album.Tracks, st)
+				album.Duration += st.Duration
+			}
+		}
+		return album, nil
+	}
+
+	// 2. Try fetching as playlist / album
+	cleanID := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(rawID, "single:"), "single_"), "tr_"), "tr:")
+	if !strings.HasPrefix(rawID, "single:") && !strings.HasPrefix(rawID, "single_") && !strings.HasPrefix(rawID, "tr_") && !strings.HasPrefix(rawID, "tr:") {
+		if pl, err := p.client.GetPlaylist(ctx, cleanID); err == nil && pl != nil {
+			specAlbum := p.albumToSpec(pl)
+			if len(pl.Tracks) > 0 {
+				for i, t := range pl.Tracks {
+					st := p.trackToSpec(&t)
+					if st != nil {
+						st.TrackNumber = i + 1
+						st.Album = specAlbum.Name
+						st.AlbumID = specAlbum.ID
+						specAlbum.Tracks = append(specAlbum.Tracks, st)
+					}
+				}
+			}
+			return specAlbum, nil
+		}
+	}
+
+	// 3. Fallback: single track standalone album (so "Go to Album" never returns 404!)
+	t, err := p.client.GetTrack(ctx, cleanID)
 	if err != nil {
 		return nil, err
 	}
-	specAlbum := p.albumToSpec(pl)
-	if len(pl.Tracks) > 0 {
-		for i, t := range pl.Tracks {
-			st := p.trackToSpec(&t)
-			if st != nil {
-				st.TrackNumber = i + 1
-				st.Album = specAlbum.Name
-				st.AlbumID = specAlbum.ID
-				specAlbum.Tracks = append(specAlbum.Tracks, st)
-			}
-		}
+	st := p.trackToSpec(t)
+	if st == nil {
+		return nil, fmt.Errorf("track not found")
 	}
-	return specAlbum, nil
+	album := &spec.Album{
+		ID:         st.AlbumID,
+		ParentID:   st.ArtistID,
+		Name:       st.Title,
+		Artist:     st.Artist,
+		ArtistID:   st.ArtistID,
+		CoverID:    st.CoverID,
+		TrackCount: 1,
+		Duration:   st.Duration,
+		Year:       st.Year,
+		Tracks:     []*spec.TrackChild{st},
+	}
+	return album, nil
 }
 
 // GetArtist fetches artist profile
@@ -283,20 +352,40 @@ func (p *Provider) GetArtistAlbums(ctx context.Context, rawID string, skipTracks
 		}
 	}()
 
-	// Fetch top tracks if requested
-	if !skipTracks {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if tList, err := p.client.GetUserTracks(ctx, rawID, 30); err == nil {
-				for _, t := range tList {
-					tracks = append(tracks, p.trackToSpec(t))
-				}
+	// Fetch top tracks
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if tList, err := p.client.GetUserTracks(ctx, rawID, 30); err == nil {
+			for _, t := range tList {
+				tracks = append(tracks, p.trackToSpec(t))
 			}
-		}()
-	}
+		}
+	}()
 
 	wg.Wait()
+
+	// If the artist has no formal albums/playlists on SoundCloud, synthesize a "Popular Tracks" album
+	if len(albums) == 0 && len(tracks) > 0 {
+		firstTrack := tracks[0]
+		artistName := firstTrack.Artist
+		artistID := firstTrack.ArtistID
+		albumID := &specid.ID{URI: fmt.Sprintf("sc:al:user_tracks:%s", rawID)}
+		albums = append(albums, &spec.Album{
+			ID:         albumID,
+			ParentID:   artistID,
+			Name:       fmt.Sprintf("%s - Popular Tracks", artistName),
+			Artist:     artistName,
+			ArtistID:   artistID,
+			CoverID:    firstTrack.CoverID,
+			TrackCount: len(tracks),
+		})
+	}
+
+	if skipTracks {
+		tracks = nil
+	}
+
 	return albums, tracks, nil
 }
 
@@ -386,35 +475,71 @@ func (p *Provider) GetStreamURL(ctx context.Context, rawID string, quality strin
 	return p.client.GetStreamURL(ctx, rawID)
 }
 
-// GetCoverURL returns high-resolution cover image URL
+// GetCoverURL returns high-resolution cover image URL with on-demand resolution
 func (p *Provider) GetCoverURL(coverID string, size int) string {
 	rawID := coverID
-	if strings.HasPrefix(rawID, "sc:tr:") {
-		rawID = strings.TrimPrefix(rawID, "sc:tr:")
-	} else if strings.HasPrefix(rawID, "sc:al:") {
-		rawID = strings.TrimPrefix(rawID, "sc:al:")
-	} else if strings.HasPrefix(rawID, "sc:ar:") {
-		rawID = strings.TrimPrefix(rawID, "sc:ar:")
+	rawID = strings.TrimPrefix(rawID, "sc:tr:")
+	rawID = strings.TrimPrefix(rawID, "sc:al:")
+	rawID = strings.TrimPrefix(rawID, "sc:ar:")
+	rawID = strings.TrimPrefix(rawID, "single:")
+	rawID = strings.TrimPrefix(rawID, "tr_")
+
+	if strings.HasPrefix(rawID, "http://") || strings.HasPrefix(rawID, "https://") {
+		return upgradeCoverSize(rawID, size)
 	}
+
+	if val, ok := p.coverCache.Load(rawID); ok {
+		return upgradeCoverSize(val.(string), size)
+	}
+
+	// On-demand resolution with fast 3-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
 	imgURL := ""
-	if strings.HasPrefix(rawID, "http://") || strings.HasPrefix(rawID, "https://") {
-		imgURL = rawID
-	} else if val, ok := p.coverCache.Load(rawID); ok {
-		imgURL = val.(string)
-	}
-
-	if imgURL == "" {
-		return ""
-	}
-
-	// Upgrade SoundCloud artwork to 500x500 if larger image requested
-	if strings.Contains(imgURL, "-large.") {
-		if size > 100 {
-			imgURL = strings.Replace(imgURL, "-large.", "-t500x500.", 1)
+	if strings.HasPrefix(coverID, "sc:ar:") {
+		if u, err := p.client.GetUser(ctx, rawID); err == nil && u != nil {
+			imgURL = u.AvatarURL
+		}
+	} else if strings.HasPrefix(coverID, "sc:al:") {
+		if strings.HasPrefix(rawID, "user_tracks:") {
+			uID := strings.TrimPrefix(rawID, "user_tracks:")
+			if u, err := p.client.GetUser(ctx, uID); err == nil && u != nil {
+				imgURL = u.AvatarURL
+			}
+		} else if pl, err := p.client.GetPlaylist(ctx, rawID); err == nil && pl != nil {
+			imgURL = pl.ArtworkURL
+			if imgURL == "" {
+				imgURL = pl.User.AvatarURL
+			}
 		}
 	}
 
+	// Fallback to track lookup
+	if imgURL == "" {
+		if t, err := p.client.GetTrack(ctx, rawID); err == nil && t != nil {
+			imgURL = t.ArtworkURL
+			if imgURL == "" {
+				imgURL = t.User.AvatarURL
+			}
+		}
+	}
+
+	if imgURL != "" {
+		p.coverCache.Store(rawID, imgURL)
+		return upgradeCoverSize(imgURL, size)
+	}
+
+	return ""
+}
+
+func upgradeCoverSize(imgURL string, size int) string {
+	if imgURL == "" {
+		return ""
+	}
+	if strings.Contains(imgURL, "-large.") && size > 100 {
+		return strings.Replace(imgURL, "-large.", "-t500x500.", 1)
+	}
 	return imgURL
 }
 
@@ -441,8 +566,22 @@ func (p *Provider) GetArtistTopTracks(ctx context.Context, artistRawID string, l
 	return results, nil
 }
 
-// GetSimilarArtists finds users by query based on the artist name
+// GetSimilarArtists finds users based on artist followings or username search
 func (p *Provider) GetSimilarArtists(ctx context.Context, artistRawID string) ([]*spec.Artist, error) {
+	// 1. Try artist followings
+	if followings, err := p.client.GetUserFollowings(ctx, artistRawID, 5); err == nil && len(followings) > 0 {
+		var results []*spec.Artist
+		for _, u := range followings {
+			if su := p.userToSpec(u); su != nil {
+				results = append(results, su)
+			}
+		}
+		if len(results) > 0 {
+			return results, nil
+		}
+	}
+
+	// 2. Fallback to searching artists by username
 	u, err := p.client.GetUser(ctx, artistRawID)
 	if err != nil {
 		return nil, err

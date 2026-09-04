@@ -35,6 +35,7 @@ func NewRegistry(tidalProxy tidal.TidalProxy) *Registry {
 	r.Register(&DeezerProvider{})
 	r.Register(NewTidalProvider(tidalProxy))
 	r.Register(NewYouTubeMusicProvider())
+	r.Register(NewSoundCloudProvider())
 	return r
 }
 

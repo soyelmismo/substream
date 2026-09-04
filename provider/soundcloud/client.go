@@ -408,3 +408,54 @@ func (c *Client) SearchUsers(ctx context.Context, query string, limit, offset in
 	}
 	return resp.Collection, nil
 }
+
+// BatchGetTracks fetches full metadata for multiple track IDs in chunks of up to 50
+func (c *Client) BatchGetTracks(ctx context.Context, ids []string) ([]*SoundCloudTrack, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var allTracks []*SoundCloudTrack
+	chunkSize := 50
+	for i := 0; i < len(ids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+		q := url.Values{}
+		q.Set("ids", strings.Join(chunk, ","))
+		var chunkTracks []*SoundCloudTrack
+		if err := c.get(ctx, "/tracks", q, &chunkTracks); err != nil {
+			return allTracks, err
+		}
+		allTracks = append(allTracks, chunkTracks...)
+	}
+	return allTracks, nil
+}
+
+// Resolve resolves a SoundCloud permalink URL (playlist, track, or user)
+func (c *Client) Resolve(ctx context.Context, targetURL string) (json.RawMessage, error) {
+	q := url.Values{}
+	q.Set("url", targetURL)
+	var raw json.RawMessage
+	if err := c.get(ctx, "/resolve", q, &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// GetUserFollowings fetches users followed by a given user
+func (c *Client) GetUserFollowings(ctx context.Context, userID string, limit int) ([]*SoundCloudUser, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(limit))
+	var resp struct {
+		Collection []*SoundCloudUser `json:"collection"`
+	}
+	if err := c.get(ctx, fmt.Sprintf("/users/%s/followings", userID), q, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Collection, nil
+}
