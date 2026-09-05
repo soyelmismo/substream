@@ -25,8 +25,7 @@ var lrcRegex = regexp.MustCompile(`^\[(\d{2}):(\d{2}\.\d{2,3})\]\s*(.*)$`)
 var DefaultSeeds = []string{
 	"https://ohio-1.monochrome.tf",
 	"https://frankfurt-1.monochrome.tf",
-	"https://eu-central.monochrome.tf",
-	"https://us-west.monochrome.tf",
+	"https://monochrome-api.samidy.com",
 	"https://singapore-1.monochrome.tf",
 }
 

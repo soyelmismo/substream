@@ -1062,16 +1062,24 @@ func (p *Pool) gatherFromMirrors(ctx context.Context, query url.Values) [][]byte
 		}(m)
 	}
 
-	// Collect all successful responses
+	// Collect all successful responses with fast early-return
 	var allBodies [][]byte
 	successCount := 0
 	errorCount := 0
+
+	// Grace timer: once first fast mirror succeeds, wait at most 250ms for other nearby mirrors
+	graceTimer := time.NewTimer(12 * time.Second)
+	defer graceTimer.Stop()
+
 	for i := 0; i < len(mirrors); i++ {
 		select {
 		case res := <-results:
 			if res.err == nil && len(res.body) > 0 {
 				allBodies = append(allBodies, res.body)
 				successCount++
+				if successCount == 1 {
+					graceTimer.Reset(250 * time.Millisecond)
+				}
 				// Log preview of response for debugging
 				preview := string(res.body)
 				if len(preview) > 200 {
@@ -1084,6 +1092,11 @@ func (p *Pool) gatherFromMirrors(ctx context.Context, query url.Values) [][]byte
 			} else {
 				errorCount++
 				log.Printf("[GATHER] Mirror %s returned empty body", res.mirrorURL)
+			}
+		case <-graceTimer.C:
+			if successCount > 0 {
+				log.Printf("[GATHER] Fast mirror responded; returning %d bodies early (skipped slower mirrors)", successCount)
+				return allBodies
 			}
 		case <-searchCtx.Done():
 			// Timeout reached, stop waiting for more

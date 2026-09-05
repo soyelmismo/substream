@@ -351,7 +351,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	isSamplePreview := strings.Contains(url, "range=20-30") || strings.Contains(url, "range=0-30") || strings.Contains(url, "preview")
 	needsFallback := urlErr != nil || url == "" || isSamplePreview
 
-	var lastResortURL string
+	var lastResortAlt *db.TrackSource
 	hasLosslessProviders := c.providers != nil && (c.providers.IsAudioEnabled("td") || c.providers.IsAudioEnabled("dz"))
 
 	// 1. Rescuing via mapped track_sources in local DB (0 ms fast path)
@@ -368,11 +368,11 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 						continue
 					}
 					if altProv := c.getProvider(altID.Provider()); altProv != nil {
-						if altURL, altErr := altProv.GetStreamURL(ctx, altID.RawID(), quality, clientIP); altErr == nil && altURL != "" {
-							altIsPreview := strings.Contains(altURL, "range=20-30") || strings.Contains(altURL, "range=0-30") || strings.Contains(altURL, "preview")
-							if !altIsPreview {
-								// If this alternative source is Lossless (or no lossless providers are active), use immediately
-								if alt.QualityTier >= db.QualityTierLossless || !hasLosslessProviders {
+						// If this alternative source is Lossless (or no lossless providers are active), resolve and use immediately
+						if alt.QualityTier >= db.QualityTierLossless || !hasLosslessProviders {
+							if altURL, altErr := altProv.GetStreamURL(ctx, altID.RawID(), quality, clientIP); altErr == nil && altURL != "" {
+								altIsPreview := strings.Contains(altURL, "range=20-30") || strings.Contains(altURL, "range=0-30") || strings.Contains(altURL, "preview")
+								if !altIsPreview {
 									log.Printf("[STREAM] 🔄 Rescuing stream via mapped lossless track_source %s (Quality: %d)", alt.URI, alt.QualityTier)
 									url = altURL
 									urlErr = nil
@@ -380,12 +380,12 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 									needsFallback = false
 									break
 								}
-								// If it's lossy (e.g. YouTube tier 30), keep as last-resort fallback to attempt Lossless Tidal/Deezer first
-								if lastResortURL == "" {
-									log.Printf("[STREAM] 💡 Saved lossy mapped track_source %s (Quality: %d) as last resort to prioritize Lossless FLAC", alt.URI, alt.QualityTier)
-									lastResortURL = altURL
-								}
 							}
+						} else if lastResortAlt == nil {
+							// If it's lossy (e.g. YouTube tier 30), save as last resort WITHOUT wasting seconds resolving upfront!
+							log.Printf("[STREAM] 💡 Saved lossy mapped track_source %s (Quality: %d) as last resort to prioritize Lossless FLAC", alt.URI, alt.QualityTier)
+							altCopy := alt
+							lastResortAlt = &altCopy
 						}
 					}
 				}
@@ -576,13 +576,19 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		}
 	}
 
-	// If all lossless/metadata fallbacks failed, rescue using our last-resort lossy mapped URL (e.g. YouTube):
-	if (urlErr != nil || url == "" || isSamplePreview) && lastResortURL != "" {
-		log.Printf("[STREAM] ⚠️ All lossless fallbacks exhausted; falling back to lossy mapped stream")
-		url = lastResortURL
-		urlErr = nil
-		isSamplePreview = false
-		needsFallback = false
+	// If all lossless/metadata fallbacks failed, rescue using our last-resort lossy mapped source (e.g. YouTube):
+	if (urlErr != nil || url == "" || isSamplePreview) && lastResortAlt != nil {
+		if altProv := c.getProvider(lastResortAlt.Provider); altProv != nil {
+			if altID, err := specid.New(lastResortAlt.URI); err == nil {
+				log.Printf("[STREAM] ⚠️ All lossless fallbacks exhausted; resolving lossy mapped stream %s", lastResortAlt.URI)
+				if altURL, altErr := altProv.GetStreamURL(ctx, altID.RawID(), quality, clientIP); altErr == nil && altURL != "" {
+					url = altURL
+					urlErr = nil
+					isSamplePreview = false
+					needsFallback = false
+				}
+			}
+		}
 	}
 
 	// Strictly reject previews - do not serve 30-second clips for full songs
@@ -1067,9 +1073,14 @@ func (c *Controller) enrichTracksFromFullAlbum(targetAlbum, fullAlbum *spec.Albu
 					targetAlbum.Tracks[i].Duration = fullAlbum.Tracks[i].Duration
 				}
 				if c.dbc != nil && targetAlbum.Tracks[i].ID != nil && fullAlbum.Tracks[i].ID != nil {
+					targetProv := targetAlbum.Tracks[i].ID.Provider()
+					targetTier := db.QualityTierStandard
+					if targetProv == "sc" {
+						targetTier = db.QualityTierFree
+					}
 					clusterKey := db.MakeClusterKey("", targetAlbum.Tracks[i].Artist, targetAlbum.Tracks[i].Title)
 					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-						db.TrackSource{ClusterKey: clusterKey, Provider: targetAlbum.Tracks[i].ID.Provider(), URI: targetAlbum.Tracks[i].ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: targetProv, URI: targetAlbum.Tracks[i].ID.String(), QualityTier: targetTier, IsAvailable: true},
 						db.TrackSource{ClusterKey: clusterKey, Provider: fullAlbum.Tracks[i].ID.Provider(), URI: fullAlbum.Tracks[i].ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
 					)
 				}
@@ -1100,9 +1111,14 @@ func (c *Controller) enrichTracksFromFullAlbum(targetAlbum, fullAlbum *spec.Albu
 					targetTrack.Duration = fullTrack.Duration
 				}
 				if c.dbc != nil && targetTrack.ID != nil && fullTrack.ID != nil {
+					targetProv := targetTrack.ID.Provider()
+					targetTier := db.QualityTierStandard
+					if targetProv == "sc" {
+						targetTier = db.QualityTierFree
+					}
 					clusterKey := db.MakeClusterKey("", targetTrack.Artist, targetTrack.Title)
 					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-						db.TrackSource{ClusterKey: clusterKey, Provider: targetTrack.ID.Provider(), URI: targetTrack.ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: targetProv, URI: targetTrack.ID.String(), QualityTier: targetTier, IsAvailable: true},
 						db.TrackSource{ClusterKey: clusterKey, Provider: fullTrack.ID.Provider(), URI: fullTrack.ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
 					)
 				}
