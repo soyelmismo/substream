@@ -666,6 +666,9 @@ func MigrateSubsonicPassword(db *gorm.DB) error {
 }
 
 func (db *DB) Migrate() error {
+	// Ensure settings table exists for storing migration flags
+	_ = db.Exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").Error
+
 	// Run URN migration before AutoMigrate
 	if err := MigrateToURNs(db.DB); err != nil {
 		return fmt.Errorf("urn migration failed: %w", err)
@@ -730,6 +733,7 @@ func (db *DB) Migrate() error {
 		&MetadataCache{},
 		&TrackSource{},
 		&YTMusicAccount{},
+		&DeezerAccount{},
 	).Error
 }
 

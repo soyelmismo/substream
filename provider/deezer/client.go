@@ -8,10 +8,14 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"go.senan.xyz/gonic/db"
 )
 
 const (
@@ -25,6 +29,10 @@ type Client struct {
 	baseURL         string
 	customURL       string // Optional custom Deezer proxy/mirror
 	arl             string // Optional Deezer ARL cookie
+	streamFilter    *StreamFilterProfile
+	cacheDir        string
+	pool            *AccountPool
+	downloadLocks   sync.Map
 	mirrorHealthy   bool
 	lastHealthCheck time.Time
 	mu              sync.RWMutex
@@ -32,10 +40,14 @@ type Client struct {
 
 // ClientOptions configures Deezer client
 type ClientOptions struct {
-	BaseURL   string
-	CustomURL string
-	ARL       string
-	Timeout   time.Duration
+	BaseURL      string
+	CustomURL    string
+	ARL          string
+	StreamFilter string // Optional generic stream filter activation token for direct stream decryption
+	SecretKey    string // Deprecated alias for StreamFilter
+	CacheDir     string
+	DB           *db.DB
+	Timeout      time.Duration
 }
 
 // NewClient creates a new Deezer client
@@ -49,14 +61,87 @@ func NewClient(opts ClientOptions) *Client {
 		timeout = 15 * time.Second
 	}
 
+	cacheDir := opts.CacheDir
+	if cacheDir == "" {
+		cacheDir = "cache/deezer"
+	}
+	_ = os.MkdirAll(cacheDir, 0755)
+
+	pool := NewAccountPool(opts.DB)
+	if opts.DB != nil {
+		if accs, err := opts.DB.GetActiveDeezerAccounts(); err == nil && len(accs) > 0 {
+			pool.SyncAccounts(accs)
+		}
+	}
+
+	arl := strings.TrimSpace(opts.ARL)
+	if arl != "" && pool.Count() == 0 {
+		pool.SyncAccounts([]*db.DeezerAccount{
+			{
+				ID:               1,
+				ARL:              arl,
+				Username:         "Default ARL",
+				SubscriptionType: "PREMIUM",
+				HighestQuality:   "FLAC",
+				QualityTier:      db.QualityTierLossless,
+				IsActive:         true,
+			},
+		})
+	}
+
+	spec := ResolveStreamFilterSpec(opts.StreamFilter)
+	if spec == "" && opts.SecretKey != "" {
+		spec = ResolveStreamFilterSpec(opts.SecretKey)
+	}
+	var streamFilter *StreamFilterProfile
+	if spec != "" {
+		p, err := ParseStreamFilterSpec(spec)
+		if err != nil {
+			log.Printf("[DEEZER] ⚠️ Failed to parse stream filter spec: %v", err)
+		} else {
+			streamFilter = p
+		}
+	}
+
 	return &Client{
 		httpClient:    &http.Client{Timeout: timeout},
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		customURL:     strings.TrimRight(strings.TrimSpace(opts.CustomURL), "/"),
-		arl:           strings.TrimSpace(opts.ARL),
+		arl:           arl,
+		streamFilter:  streamFilter,
+		cacheDir:      cacheDir,
+		pool:          pool,
 		mirrorHealthy: true, // Optimistically true until first check
 	}
 }
+
+// SyncAccounts synchronizes active Deezer accounts with the pool
+func (c *Client) SyncAccounts(accounts []*db.DeezerAccount) {
+	if c.pool != nil {
+		c.pool.SyncAccounts(accounts)
+	}
+}
+
+// SetDB updates the database reference on the pool
+func (c *Client) SetDB(dbc *db.DB) {
+	if c.pool != nil {
+		c.pool.SetDB(dbc)
+	}
+}
+
+// SetCacheDir sets the local directory for caching decrypted streams
+func (c *Client) SetCacheDir(dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cacheDir = dir
+	_ = os.MkdirAll(dir, 0755)
+}
+
+// Pool returns the underlying AccountPool
+func (c *Client) Pool() *AccountPool {
+	return c.pool
+}
+
 
 func (c *Client) get(ctx context.Context, endpoint string, query url.Values, target interface{}) error {
 	u := fmt.Sprintf("%s/%s", c.baseURL, strings.TrimPrefix(endpoint, "/"))
@@ -293,13 +378,208 @@ func (c *Client) isMirrorHealthy(ctx context.Context) bool {
 	return true
 }
 
-// GetStreamURL returns the audio stream URL for a track
+// GetStreamURL returns the audio stream URL for a track.
+// When Deezer accounts are configured via ARL, it resolves, decrypts, and caches
+// lossless FLAC audio files locally, returning the absolute file path.
+// If local caching is bypassed or accounts are unavailable, it falls back to custom mirror if configured.
 func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality string) (string, error) {
-	if track == nil {
-		return "", fmt.Errorf("nil track")
+	if track == nil || track.ID <= 0 {
+		return "", fmt.Errorf("invalid Deezer track")
 	}
 
-	// 1. If custom mirror is configured and healthy, query custom instance (e.g. dzr instance)
+	trackIDStr := strconv.FormatInt(track.ID, 10)
+	c.mu.RLock()
+	cacheDir := c.cacheDir
+	c.mu.RUnlock()
+
+	if cacheDir == "" {
+		cacheDir = filepath.Join(os.TempDir(), "substream-deezer")
+		_ = os.MkdirAll(cacheDir, 0755)
+	}
+
+	reqQuality := strings.ToUpper(strings.TrimSpace(quality))
+	flacFile := filepath.Join(cacheDir, fmt.Sprintf("%d.flac", track.ID))
+	mp3File := filepath.Join(cacheDir, fmt.Sprintf("%d.mp3", track.ID))
+
+	// 1. Fast Cache Check:
+	// If lossless FLAC already exists, serve immediately
+	if fi, err := os.Stat(flacFile); err == nil && fi.Size() > 1024 {
+		if absPath, absErr := filepath.Abs(flacFile); absErr == nil {
+			return absPath, nil
+		}
+		return flacFile, nil
+	}
+	// For lossy requests or when no lossless account is available, serve existing MP3
+	if reqQuality == "LOW" || reqQuality == "HIGH" || (c.pool != nil && !c.pool.HasLosslessAccount()) {
+		if fi, err := os.Stat(mp3File); err == nil && fi.Size() > 1024 {
+			if absPath, absErr := filepath.Abs(mp3File); absErr == nil {
+				return absPath, nil
+			}
+			return mp3File, nil
+		}
+	}
+
+	// 2. Direct Deezer ARL Streaming with Account Rotation
+	if c.pool != nil && c.pool.Count() > 0 {
+		// Serialize concurrent downloads for the same track
+		lockVal, _ := c.downloadLocks.LoadOrStore(track.ID, &sync.Mutex{})
+		mu := lockVal.(*sync.Mutex)
+		mu.Lock()
+		defer func() {
+			mu.Unlock()
+			c.downloadLocks.Delete(track.ID)
+		}()
+
+		// Re-check cache under lock in case another worker just downloaded it
+		if fi, err := os.Stat(flacFile); err == nil && fi.Size() > 1024 {
+			if absPath, absErr := filepath.Abs(flacFile); absErr == nil {
+				return absPath, nil
+			}
+			return flacFile, nil
+		}
+		if reqQuality == "LOW" || reqQuality == "HIGH" || !c.pool.HasLosslessAccount() {
+			if fi, err := os.Stat(mp3File); err == nil && fi.Size() > 1024 {
+				if absPath, absErr := filepath.Abs(mp3File); absErr == nil {
+					return absPath, nil
+				}
+				return mp3File, nil
+			}
+		}
+
+		minTier := db.QualityTierLossless
+		if reqQuality == "HIGH" {
+			minTier = db.QualityTierHigh
+		} else if reqQuality == "LOW" {
+			minTier = db.QualityTierFree
+		}
+
+		totalAccounts := c.pool.Count()
+		var lastErr error
+		filter := c.StreamFilter()
+
+		if (filter == nil || filter.ChunkSize == 0 || filter.Stride == 0) && totalAccounts > 0 {
+			log.Printf("[DEEZER] ⚠️ Native stream decryption requires active stream filter engine (set DEEZER_STREAM_FILTER). Falling back to mirror/proxy.")
+		} else {
+			for attempt := 0; attempt < totalAccounts; attempt++ {
+				session, err := c.pool.GetNextAccount(minTier)
+				if err != nil {
+					lastErr = err
+					break
+				}
+
+				// Step A: Get track token via song.getData
+				tokenRes, err := session.GetTrackToken(ctx, track.ID)
+				if err != nil {
+					c.pool.MarkError(session.Account.ID, fmt.Errorf("get track token: %w", err))
+					lastErr = err
+					continue
+				}
+
+				// Step B: Get CDN stream URL and format via media.deezer.com/v1/get_url
+				cdnURL, chosenFormat, err := session.GetMediaURL(ctx, tokenRes.Results.TrackToken, quality)
+				if err != nil {
+					c.pool.MarkError(session.Account.ID, err)
+					lastErr = fmt.Errorf("account %s get_url: %w", session.Account.Username, err)
+					continue
+				}
+
+				ext := "flac"
+				if strings.Contains(strings.ToUpper(chosenFormat), "MP3") {
+					ext = "mp3"
+				}
+
+				// Step C: Fetch encrypted stream from CDN
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, cdnURL, nil)
+				if err != nil {
+					lastErr = err
+					continue
+				}
+				req.Header.Set("User-Agent", defaultUserAgent)
+
+				resp, err := c.httpClient.Do(req)
+				if err != nil {
+					c.pool.MarkError(session.Account.ID, fmt.Errorf("fetch CDN: %w", err))
+					lastErr = err
+					continue
+				}
+
+				if resp.StatusCode != http.StatusOK {
+					resp.Body.Close()
+					c.pool.MarkError(session.Account.ID, fmt.Errorf("CDN HTTP %d", resp.StatusCode))
+					lastErr = fmt.Errorf("CDN HTTP %d", resp.StatusCode)
+					continue
+				}
+
+				// Step D: Filter/decrypt stream chunks into a temp file
+				tempFile, err := os.CreateTemp(cacheDir, fmt.Sprintf("tmp-%d-*.%s", track.ID, ext))
+				if err != nil {
+					resp.Body.Close()
+					lastErr = fmt.Errorf("create temp file: %w", err)
+					break
+				}
+
+				decryptErr := filter.DecryptStream(tempFile, resp.Body, trackIDStr)
+				_ = tempFile.Close()
+				_ = resp.Body.Close()
+
+				if decryptErr != nil {
+					_ = os.Remove(tempFile.Name())
+					c.pool.MarkError(session.Account.ID, fmt.Errorf("decrypt stream: %w", decryptErr))
+					lastErr = decryptErr
+					continue
+				}
+
+				// Validate FLAC magic header if format is FLAC
+				if ext == "flac" {
+					fCheck, chkErr := os.Open(tempFile.Name())
+					if chkErr != nil {
+						_ = os.Remove(tempFile.Name())
+						lastErr = fmt.Errorf("open decrypted temp file: %w", chkErr)
+						continue
+					}
+					hdr := make([]byte, 4)
+					_, _ = io.ReadFull(fCheck, hdr)
+					fCheck.Close()
+					if string(hdr) != "fLaC" {
+						_ = os.Remove(tempFile.Name())
+						c.pool.MarkError(session.Account.ID, fmt.Errorf("corrupt FLAC stream: missing fLaC magic header"))
+						lastErr = fmt.Errorf("corrupt FLAC stream header")
+						continue
+					}
+				}
+
+				// Step E: Atomic rename to final cache path
+				destFile := filepath.Join(cacheDir, fmt.Sprintf("%d.%s", track.ID, ext))
+				if renErr := os.Rename(tempFile.Name(), destFile); renErr != nil {
+					_ = os.Remove(tempFile.Name())
+					lastErr = fmt.Errorf("commit cache file: %w", renErr)
+					break
+				}
+
+				log.Printf("[DEEZER] ✅ Decrypted and cached track %d (%q - %q) -> %s (format: %s via account: %s)",
+					track.ID, track.Artist.Name, track.Title, destFile, chosenFormat, session.Account.Username)
+
+				if absPath, absErr := filepath.Abs(destFile); absErr == nil {
+					return absPath, nil
+				}
+				return destFile, nil
+			}
+		}
+
+		if lastErr != nil {
+			log.Printf("[DEEZER] ⚠️ ARL account streaming failed for track %d: %v", track.ID, lastErr)
+		}
+
+		// If streaming failed but a cached MP3 is present, use it as fallback
+		if fi, err := os.Stat(mp3File); err == nil && fi.Size() > 1024 {
+			if absPath, absErr := filepath.Abs(mp3File); absErr == nil {
+				return absPath, nil
+			}
+			return mp3File, nil
+		}
+	}
+
+	// 3. Fallback to custom mirror (e.g. dzr instance) if configured and healthy
 	if c.customURL != "" {
 		if !c.isMirrorHealthy(ctx) {
 			return "", fmt.Errorf("deezer mirror %s is unhealthy (no active accounts)", c.customURL)
@@ -314,14 +594,13 @@ func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality s
 			return customStream, nil
 		}
 
-		// Trip breaker if call failed (e.g. 403 Forbidden or no accounts)
 		c.mu.Lock()
 		c.mirrorHealthy = false
 		c.lastHealthCheck = time.Now()
 		c.mu.Unlock()
 	}
 
-	return "", fmt.Errorf("no full stream available for Deezer track %d (requires active mirror/subscription)", track.ID)
+	return "", fmt.Errorf("no full stream available for Deezer track %d (configure active ARL account or mirror)", track.ID)
 }
 
 func (c *Client) getCustomStreamURL(ctx context.Context, track *DeezerTrack, format string) (string, error) {
@@ -359,3 +638,28 @@ func (c *Client) getCustomStreamURL(ctx context.Context, track *DeezerTrack, for
 
 	return "", fmt.Errorf("custom Deezer instance returned %d", resp.StatusCode)
 }
+
+// StreamFilter returns the current active stream filter profile
+func (c *Client) StreamFilter() *StreamFilterProfile {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.streamFilter
+}
+
+// SetStreamFilter updates or resets the stream filter profile
+func (c *Client) SetStreamFilter(spec string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if strings.TrimSpace(spec) == "" {
+		c.streamFilter = nil
+		return nil
+	}
+	p, err := ParseStreamFilterSpec(spec)
+	if err != nil {
+		return err
+	}
+	c.streamFilter = p
+	return nil
+}
+
+

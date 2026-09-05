@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"go.senan.xyz/gonic/internal/media/tagger"
@@ -12,6 +14,20 @@ import (
 
 // Download streams audio from a direct progressive URL and tags it if applicable
 func Download(ctx context.Context, streamURL string, w io.Writer, meta *tagger.Metadata, clientIP string, client *http.Client) error {
+	if strings.HasPrefix(streamURL, "/") {
+		f, err := os.Open(streamURL)
+		if err != nil {
+			return fmt.Errorf("open local stream file: %w", err)
+		}
+		defer f.Close()
+
+		if meta != nil {
+			return tagger.TagFLAC(ctx, f, w, meta, client)
+		}
+
+		_, err = io.Copy(w, f)
+		return err
+	}
 	if client == nil {
 		client = &http.Client{
 			Timeout: 60 * time.Second,

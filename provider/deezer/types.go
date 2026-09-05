@@ -89,3 +89,90 @@ type DeezerSearchArtistsResponse struct {
 	Total int            `json:"total"`
 	Next  string         `json:"next"`
 }
+
+// DeezerAccountInfo holds validated subscriber information from an ARL cookie
+type DeezerAccountInfo struct {
+	UserID           string
+	Username         string
+	SubscriptionType string // "PREMIUM", "FREE"
+	HighestQuality   string // "FLAC", "MP3_320", "MP3_128"
+	QualityTier      int    // 80 (Lossless FLAC), 50 (MP3_320), 10 (MP3_128)
+	LicenseToken     string
+	CheckForm        string
+	WebLossless      bool
+	WebHQ            bool
+}
+
+// GWUserDataResponse represents the response from deezer.getUserData in gw-light.php
+type GWUserDataResponse struct {
+	Error   interface{} `json:"error"`
+	Results struct {
+		User struct {
+			UserID   interface{} `json:"USER_ID"`
+			BlogName string      `json:"BLOG_NAME"`
+			Options  struct {
+				LicenseToken   string `json:"license_token"`
+				WebLossless    bool   `json:"web_lossless"`
+				WebHQ          bool   `json:"web_hq"`
+				ExpirationDate string `json:"expiration_date"`
+			} `json:"OPTIONS"`
+		} `json:"USER"`
+		CheckForm string      `json:"checkForm"`
+		OfferID   interface{} `json:"OFFER_ID"`
+	} `json:"results"`
+}
+
+// GWSongDataResponse represents the response from song.getData in gw-light.php
+type GWSongDataResponse struct {
+	Error   interface{} `json:"error"`
+	Results struct {
+		SngID           string `json:"SNG_ID"`
+		TrackToken      string `json:"TRACK_TOKEN"`
+		MD5Origin       string `json:"MD5_ORIGIN"`
+		MediaVersion    string `json:"MEDIA_VERSION"`
+		FilesizeFLAC    string `json:"FILESIZE_FLAC"`
+		FilesizeMP3_320 string `json:"FILESIZE_MP3_320"`
+		FilesizeMP3_128 string `json:"FILESIZE_MP3_128"`
+	} `json:"results"`
+}
+
+// MediaGetURLRequest is the payload sent to https://media.deezer.com/v1/get_url
+type MediaGetURLRequest struct {
+	LicenseToken string           `json:"license_token"`
+	Media        []MediaFormatReq `json:"media"`
+	TrackTokens  []string         `json:"track_tokens"`
+}
+
+// MediaFormatReq specifies the type and formats requested
+type MediaFormatReq struct {
+	Type    string       `json:"type"` // "FULL"
+	Formats []FormatSpec `json:"formats"`
+}
+
+// FormatSpec represents cipher and audio format
+type FormatSpec struct {
+	Cipher string `json:"cipher"` // stream cipher mode tag
+	Format string `json:"format"` // "FLAC", "MP3_320", "MP3_128"
+}
+
+// MediaGetURLResponse is the response from https://media.deezer.com/v1/get_url
+type MediaGetURLResponse struct {
+	Errors []struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"errors"`
+	Data []struct {
+		Errors []struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"errors"`
+		Media []struct {
+			Sources []struct {
+				URL      string `json:"url"`
+				Provider string `json:"provider"`
+			} `json:"sources"`
+			Format string `json:"format"`
+		} `json:"media"`
+	} `json:"data"`
+}
+

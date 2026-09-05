@@ -3,9 +3,16 @@ package deezer
 import (
 	"context"
 	"fmt"
+	"io"
+	"math"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 
+	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/internal/media/streamer"
+	"go.senan.xyz/gonic/internal/media/tagger"
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -16,8 +23,12 @@ type Provider struct {
 	client *Client
 }
 
-// Ensure Provider implements provider.MusicProvider
-var _ provider.MusicProvider = (*Provider)(nil)
+// Ensure Provider implements interfaces
+var (
+	_ provider.MusicProvider    = (*Provider)(nil)
+	_ provider.ISRCResolver     = (*Provider)(nil)
+	_ provider.MediaDownloader  = (*Provider)(nil)
+)
 
 // New creates a new Deezer Provider
 func New(opts ClientOptions) *Provider {
@@ -73,6 +84,11 @@ func (p *Provider) trackToSpec(t *DeezerTrack) *spec.TrackChild {
 	safeTitle := sanitizeFilename(t.Title)
 	path := fmt.Sprintf("audio/%s/%02d. %s - %s.flac", safeArtist, t.TrackPosition, safeArtist, safeTitle)
 
+	var isrcs []string
+	if strings.TrimSpace(t.ISRC) != "" {
+		isrcs = []string{strings.TrimSpace(t.ISRC)}
+	}
+
 	return &spec.TrackChild{
 		ID:          trackID,
 		Title:       t.Title,
@@ -93,6 +109,7 @@ func (p *Provider) trackToSpec(t *DeezerTrack) *spec.TrackChild {
 		Type:        "music",
 		Path:        path,
 		Year:        parseYear(t.ReleaseDate),
+		ISRC:        isrcs,
 	}
 }
 
@@ -106,6 +123,16 @@ func (p *Provider) albumToSpec(a *DeezerAlbum) *spec.Album {
 	artistID := &specid.ID{URI: fmt.Sprintf("dz:ar:%s", artistRawID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("dz:al:%s", rawID)}
 
+	var tracks []*spec.TrackChild
+	for i := range a.Tracks.Data {
+		t := &a.Tracks.Data[i]
+		if t.Album.ID == 0 {
+			t.Album.ID = a.ID
+			t.Album.Title = a.Title
+		}
+		tracks = append(tracks, p.trackToSpec(t))
+	}
+
 	return &spec.Album{
 		ID:         albumID,
 		ParentID:   artistID,
@@ -116,6 +143,7 @@ func (p *Provider) albumToSpec(a *DeezerAlbum) *spec.Album {
 		TrackCount: a.NbTracks,
 		Duration:   a.Duration,
 		Year:       parseYear(a.ReleaseDate),
+		Tracks:     tracks,
 	}
 }
 
@@ -148,13 +176,38 @@ func (p *Provider) GetTrack(ctx context.Context, rawID string) (*spec.TrackChild
 
 func (p *Provider) GetTracksBatch(ctx context.Context, rawIDs []string) []*spec.TrackChild {
 	res := make([]*spec.TrackChild, len(rawIDs))
+	if len(rawIDs) == 0 {
+		return res
+	}
+
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+
 	for i, raw := range rawIDs {
-		t, err := p.GetTrack(ctx, raw)
-		if err == nil {
-			res[i] = t
+		wg.Add(1)
+		go func(idx int, rawID string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			t, err := p.GetTrack(ctx, rawID)
+			if err == nil && t != nil {
+				res[idx] = t
+			}
+		}(i, raw)
+	}
+	wg.Wait()
+
+	var clean []*spec.TrackChild
+	for _, t := range res {
+		if t != nil {
+			clean = append(clean, t)
 		}
 	}
-	return res
+	return clean
 }
 
 func (p *Provider) GetAlbum(ctx context.Context, rawID string) (*spec.Album, error) {
@@ -271,10 +324,22 @@ func (p *Provider) GetStreamURL(ctx context.Context, rawID string, quality strin
 }
 
 func (p *Provider) GetCoverURL(coverID string, size int) string {
+	coverID = strings.TrimSpace(coverID)
 	if strings.HasPrefix(coverID, "http") {
 		return coverID
 	}
-	return fmt.Sprintf("https://e-cdns-images.dzcdn.net/images/cover/%s/500x500.jpg", coverID)
+	// If 32-character hex MD5 hash, serve from CDN image storage
+	if len(coverID) == 32 {
+		return fmt.Sprintf("https://cdn-images.dzcdn.net/images/cover/%s/500x500.jpg", coverID)
+	}
+	// For numeric IDs (album or artist), Deezer provides 302 image redirects
+	sizeParam := "big"
+	if size > 0 && size <= 250 {
+		sizeParam = "medium"
+	} else if size > 600 {
+		sizeParam = "xl"
+	}
+	return fmt.Sprintf("https://api.deezer.com/album/%s/image?size=%s", coverID, sizeParam)
 }
 
 func (p *Provider) GetLyrics(ctx context.Context, rawID string) (*spec.StructuredLyrics, error) {
@@ -317,3 +382,78 @@ func (p *Provider) GetTrackByISRC(ctx context.Context, isrc string) (*spec.Track
 	}
 	return p.trackToSpec(t), nil
 }
+
+// MatchTrackByMetadata matches a track by artist, title, and duration for cross-provider fallback
+func (p *Provider) MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error) {
+	q := fmt.Sprintf("%s %s", strings.TrimSpace(artist), strings.TrimSpace(title))
+	tracks, err := p.SearchTracks(ctx, q, 10, 0)
+	if err != nil || len(tracks) == 0 {
+		return nil, fmt.Errorf("no deezer tracks found for %q: %v", q, err)
+	}
+
+	var bestTrack *spec.TrackChild
+	minDiff := 999999
+
+	for _, t := range tracks {
+		if t == nil {
+			continue
+		}
+		diff := int(math.Abs(float64(t.Duration - expectedDuration)))
+		if expectedDuration == 0 || diff <= 5 {
+			return t, nil
+		}
+		if diff < minDiff {
+			minDiff = diff
+			bestTrack = t
+		}
+	}
+
+	if minDiff <= 10 && bestTrack != nil {
+		return bestTrack, nil
+	}
+
+	return nil, fmt.Errorf("no matching Deezer track found for %q with duration %d", q, expectedDuration)
+}
+
+// DownloadTrack implements provider.MediaDownloader for Deezer tracks
+func (p *Provider) DownloadTrack(ctx context.Context, req provider.DownloadRequest, w io.Writer) error {
+	filePath, err := p.GetStreamURL(ctx, req.TrackID, req.Quality, req.ClientIP)
+	if err != nil {
+		return err
+	}
+	if strings.HasPrefix(filePath, "/") {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("open cached stream: %w", err)
+		}
+		defer f.Close()
+		if req.Metadata != nil {
+			return tagger.TagFLAC(ctx, f, w, req.Metadata, nil)
+		}
+		_, err = io.Copy(w, f)
+		return err
+	}
+	// Fallback if remote HTTP stream URL
+	return streamer.Download(ctx, filePath, w, req.Metadata, req.ClientIP, nil)
+}
+
+// SyncAccounts updates active accounts on the underlying client
+func (p *Provider) SyncAccounts(accounts []*db.DeezerAccount) {
+	p.client.SyncAccounts(accounts)
+}
+
+// SetDB updates the database reference on the underlying client
+func (p *Provider) SetDB(dbc *db.DB) {
+	p.client.SetDB(dbc)
+}
+
+// SetCacheDir sets the cache directory for storing decrypted streams
+func (p *Provider) SetCacheDir(dir string) {
+	p.client.SetCacheDir(dir)
+}
+
+// Client returns the underlying Deezer client
+func (p *Provider) Client() *Client {
+	return p.client
+}
+

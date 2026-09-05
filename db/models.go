@@ -141,6 +141,32 @@ type TidalAccount struct {
 	UpdatedAt        time.Time `sql:"DEFAULT:current_timestamp"`
 }
 
+// DeezerAccount represents a single subscriber account used to mint direct
+// Deezer stream URLs. Authentication is performed with the long-lived `arl`
+// session cookie (NOT an OAuth refresh token), so the fields below differ from
+// TidalAccount: there is no access/refresh pair, and "subscription" is read
+// straight from the public user endpoint whenever we validate the cookie.
+type DeezerAccount struct {
+	ID               int       `gorm:"primary_key"`
+	ARL              string    `gorm:"not null"` // Deezer session cookie (NOT an OAuth token)
+	UserID           string    `sql:"default: ''"`
+	Username         string    `sql:"default: ''"`
+	SubscriptionType string    `sql:"default: 'FREE'"` // "PREMIUM" or "FREE" (Deezer calls HiFi "PREMIUM", not "HIFI")
+	HighestQuality   string    `sql:"default: 'MP3_128'"`
+	QualityTier      int       `sql:"default: 10"` // 80 (HiFi/FLAC), 50 (320k MP3), 10 (128k MP3)
+	ExpiresAt        time.Time `sql:"DEFAULT:current_timestamp"`
+	IsActive         bool      `sql:"DEFAULT: true"`
+	LastError        string    `sql:"default: ''"` // Last verification error, for admin visibility
+	LastValidatedAt  time.Time `sql:"DEFAULT:current_timestamp"`
+	CreatedAt        time.Time `sql:"DEFAULT:current_timestamp"`
+	UpdatedAt        time.Time `sql:"DEFAULT:current_timestamp"`
+}
+
+// TableName overrides GORM pluralization (deezer_accounts -> "deezer_accounts")
+func (DeezerAccount) TableName() string {
+	return "deezer_accounts"
+}
+
 // TrackMetadata stores the mapping between tracks and their album/artist.
 // This is essential for the virtual library feature - it allows us to infer
 // which artists and albums a user has interacted with based on track plays/stars.

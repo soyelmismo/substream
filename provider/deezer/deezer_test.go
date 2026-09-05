@@ -2,6 +2,7 @@ package deezer
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -38,3 +39,25 @@ func TestDeezerSearchLive(t *testing.T) {
 	}
 }
 
+func TestDeezerMatchTrackByMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live test in short mode")
+	}
+
+	prov := New(ClientOptions{})
+	ctx := t.Context()
+
+	matched, err := prov.MatchTrackByMetadata(ctx, "Daft Punk", "One More Time", 320)
+	if err != nil {
+		t.Fatalf("MatchTrackByMetadata failed: %v", err)
+	}
+	if matched == nil {
+		t.Fatalf("expected matched track, got nil")
+	}
+	if !strings.Contains(strings.ToLower(matched.Title), "one more time") {
+		t.Errorf("expected 'One More Time', got %s", matched.Title)
+	}
+	if matched.Duration < 300 || matched.Duration > 340 {
+		t.Errorf("expected duration around 320s, got %d", matched.Duration)
+	}
+}

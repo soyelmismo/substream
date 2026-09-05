@@ -255,6 +255,13 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidal.TidalProxy, resolvePro
 	c.Handle("/ytmusic_toggle_account_do", adminChain(resp(c.ServeYTMusicToggleAccountDo)))
 	c.Handle("/ytmusic_delete_account_do", adminChain(resp(c.ServeYTMusicDeleteAccountDo)))
 
+	// admin deezer accounts
+	c.Handle("/deezer_accounts", adminChain(resp(c.ServeDeezerAccounts)))
+	c.Handle("/deezer_add_account_do", adminChain(resp(c.ServeDeezerAddAccountDo)))
+	c.Handle("/deezer_toggle_account_do", adminChain(resp(c.ServeDeezerToggleAccountDo)))
+	c.Handle("/deezer_delete_account_do", adminChain(resp(c.ServeDeezerDeleteAccountDo)))
+	c.Handle("/deezer_refresh_account_do", adminChain(resp(c.ServeDeezerRefreshAccountDo)))
+
 	// admin providers manager
 	c.Handle("/providers", adminChain(resp(c.ServeProviders)))
 	c.Handle("/providers_toggle_do", adminChain(resp(c.ServeToggleProviderDo)))
@@ -595,6 +602,9 @@ type templateData struct {
 
 	// ytmusic accounts
 	YTMusicAccounts []*db.YTMusicAccount
+
+	// deezer accounts
+	DeezerAccounts []*db.DeezerAccount
 
 	// providers
 	Providers []ProviderViewModel

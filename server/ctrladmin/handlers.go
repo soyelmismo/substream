@@ -23,6 +23,7 @@ import (
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/listenbrainz"
+	"go.senan.xyz/gonic/provider/deezer"
 	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/provider/ytmusic"
 )
@@ -1685,17 +1686,33 @@ func (c *Controller) ServeProviders(r *http.Request) *Response {
 	})
 
 	// 5. Deezer
+	deezerAccounts, _ := c.dbc.GetDeezerAccounts()
+	activeDeezer := 0
+	deezerDetails := []string{}
+	for _, acc := range deezerAccounts {
+		status := "inactive"
+		if acc.IsActive {
+			status = "active"
+			activeDeezer++
+		}
+		deezerDetails = append(deezerDetails, fmt.Sprintf("Account #%d: %s [%s] (%s)", acc.ID, acc.Username, acc.HighestQuality, status))
+	}
+	if len(deezerDetails) == 0 {
+		deezerDetails = append(deezerDetails, "No accounts linked. Add via ARL in 'Deezer Accounts'.")
+	} else {
+		deezerDetails = append(deezerDetails, "Rotation: Round-Robin across active HiFi/Premium ARL accounts")
+	}
+	deezerDetails = append(deezerDetails, "Fallback Mirror: https://dzr.tabs-vs-spaces.wtf")
+
 	providerList = append(providerList, ProviderViewModel{
 		ID:              "dz",
 		Name:            "Deezer",
 		Badge:           "16-bit 44.1kHz FLAC",
-		TypeDescription: "CD quality lossless stream mirror",
+		TypeDescription: "Official subscriber accounts via ARL with round-robin rotation & CD lossless FLAC streaming",
 		MetadataEnabled: isMeta("dz"),
 		AudioEnabled:    isAudio("dz"),
-		AccountsCount:   1,
-		Details: []string{
-			"Mirror: https://dzr.tabs-vs-spaces.wtf",
-		},
+		AccountsCount:   activeDeezer,
+		Details:         deezerDetails,
 	})
 
 	// 6. Amazon Music
@@ -1895,3 +1912,208 @@ func (c *Controller) ServeYTMusicDeleteAccountDo(r *http.Request) *Response {
 	log.Printf("[AUDIT] YouTube Music account deleted (ID: %d)", idInt)
 	return &Response{redirect: "/admin/ytmusic_accounts", flashN: []string{"YouTube Music account removed"}}
 }
+
+func (c *Controller) ServeDeezerAccounts(r *http.Request) *Response {
+	accounts, err := c.dbc.GetDeezerAccounts()
+	if err != nil {
+		return &Response{code: 500, err: fmt.Sprintf("get deezer accounts: %v", err)}
+	}
+
+	data := &templateData{}
+	data.DeezerAccounts = accounts
+
+	return &Response{
+		template: "deezer_accounts.tmpl",
+		data:     data,
+	}
+}
+
+func (c *Controller) ServeDeezerAddAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	arl := strings.TrimSpace(r.FormValue("arl"))
+	arl = strings.TrimPrefix(arl, "arl=")
+	arl = strings.Trim(arl, "\";' ")
+	arl = strings.TrimSpace(arl)
+	if arl == "" {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"ARL token is required"}}
+	}
+
+	info, err := deezer.ValidateARL(r.Context(), arl)
+	if err != nil {
+		log.Printf("[AUDIT] Failed Deezer ARL validation: %v", err)
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{fmt.Sprintf("Deezer ARL validation failed: %v", err)}}
+	}
+
+	qualityLabel := info.HighestQuality
+	if info.QualityTier >= db.QualityTierLossless {
+		qualityLabel = "HiFi Lossless FLAC"
+	} else if info.QualityTier >= db.QualityTierHigh {
+		qualityLabel = "Premium 320k MP3"
+	}
+
+	// Check if account already exists to prevent duplicate rows
+	existingAccounts, _ := c.dbc.GetDeezerAccounts()
+	var existing *db.DeezerAccount
+	for _, a := range existingAccounts {
+		if a.ARL == arl || (a.UserID != "" && a.UserID == info.UserID) {
+			existing = a
+			break
+		}
+	}
+
+	if existing != nil {
+		existing.ARL = arl
+		existing.UserID = info.UserID
+		existing.Username = info.Username
+		existing.SubscriptionType = info.SubscriptionType
+		existing.HighestQuality = info.HighestQuality
+		existing.QualityTier = info.QualityTier
+		existing.IsActive = true
+		existing.LastError = ""
+		existing.LastValidatedAt = time.Now()
+		_ = c.dbc.UpdateDeezerAccount(existing)
+
+		// Sync active accounts to provider and reset cached session
+		if c.providers != nil {
+			if p, err := c.providers.Get("dz"); err == nil && p != nil {
+				if dzp, ok := p.(*deezer.Provider); ok {
+					dzp.Client().Pool().ResetAccountSession(existing.ID)
+					activeAccs, _ := c.dbc.GetActiveDeezerAccounts()
+					dzp.SyncAccounts(activeAccs)
+				}
+			}
+		}
+
+		log.Printf("[AUDIT] Deezer account updated: %s (User ID: %s, Plan: %s, Max: %s, ID: %d)", info.Username, info.UserID, info.SubscriptionType, qualityLabel, existing.ID)
+		return &Response{
+			redirect: "/admin/deezer_accounts",
+			flashN:   []string{fmt.Sprintf("Deezer account %q (User ID: %s) updated and reactivated! (Quality: %s)", info.Username, info.UserID, qualityLabel)},
+		}
+	}
+
+	acc, err := c.dbc.AddDeezerAccount(arl, info.UserID, info.Username, info.SubscriptionType, info.HighestQuality, info.QualityTier)
+	if err != nil {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{fmt.Sprintf("could not save account: %v", err)}}
+	}
+
+	// Sync active accounts to provider
+	if c.providers != nil {
+		if p, err := c.providers.Get("dz"); err == nil && p != nil {
+			if dzp, ok := p.(*deezer.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveDeezerAccounts()
+				dzp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	log.Printf("[AUDIT] Deezer account added: %s (User ID: %s, Plan: %s, Max: %s, ID: %d)", info.Username, info.UserID, info.SubscriptionType, qualityLabel, acc.ID)
+	return &Response{
+		redirect: "/admin/deezer_accounts",
+		flashN:   []string{fmt.Sprintf("Deezer account %q added! (User ID: %s, Quality: %s)", info.Username, info.UserID, qualityLabel)},
+	}
+}
+
+func (c *Controller) ServeDeezerToggleAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	active := r.FormValue("active") == "true"
+	if err := c.dbc.ToggleDeezerAccount(idInt, active); err != nil {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{fmt.Sprintf("update account: %v", err)}}
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("dz"); err == nil && p != nil {
+			if dzp, ok := p.(*deezer.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveDeezerAccounts()
+				dzp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	return &Response{redirect: "/admin/deezer_accounts", flashN: []string{"account status updated"}}
+}
+
+func (c *Controller) ServeDeezerDeleteAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	if err := c.dbc.DeleteDeezerAccount(idInt); err != nil {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{fmt.Sprintf("delete account: %v", err)}}
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("dz"); err == nil && p != nil {
+			if dzp, ok := p.(*deezer.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveDeezerAccounts()
+				dzp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	log.Printf("[AUDIT] Deezer account deleted (ID: %d)", idInt)
+	return &Response{redirect: "/admin/deezer_accounts", flashN: []string{"Deezer account removed"}}
+}
+
+func (c *Controller) ServeDeezerRefreshAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	acc, err := c.dbc.GetDeezerAccountByID(idInt)
+	if err != nil || acc == nil {
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{"account not found"}}
+	}
+
+	info, valErr := deezer.ValidateARL(r.Context(), acc.ARL)
+	if valErr != nil {
+		_ = c.dbc.UpdateDeezerAccountError(idInt, valErr.Error())
+		return &Response{redirect: "/admin/deezer_accounts", flashW: []string{fmt.Sprintf("re-validation failed: %v", valErr)}}
+	}
+
+	_ = c.dbc.UpdateDeezerAccountSubscription(idInt, info.SubscriptionType, info.HighestQuality, info.QualityTier, "")
+	if acc.Username != info.Username || acc.UserID != info.UserID {
+		acc.Username = info.Username
+		acc.UserID = info.UserID
+		_ = c.dbc.UpdateDeezerAccount(acc)
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("dz"); err == nil && p != nil {
+			if dzp, ok := p.(*deezer.Provider); ok {
+				dzp.Client().Pool().ResetAccountSession(idInt)
+				activeAccs, _ := c.dbc.GetActiveDeezerAccounts()
+				dzp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	return &Response{
+		redirect: "/admin/deezer_accounts",
+		flashN:   []string{fmt.Sprintf("Deezer account %q successfully re-validated! (Plan: %s, Max: %s)", info.Username, info.SubscriptionType, info.HighestQuality)},
+	}
+}
+

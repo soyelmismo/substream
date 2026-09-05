@@ -19,6 +19,8 @@ SERVICE_NAME="${SERVICE_NAME:-substream}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:4533}"
 TIDAL_TOKEN="${TIDAL_TOKENS:-${TIDAL_TOKEN:-${SUBSTREAM_TIDAL_TOKENS:-${SUBSTREAM_TIDAL_TOKEN:-}}}}"
 DEEZER_ARL="${DEEZER_ARL:-${SUBSTREAM_DEEZER_ARL:-}}"
+DEEZER_SECRET_KEY="${DEEZER_SECRET_KEY:-${SUBSTREAM_DEEZER_SECRET_KEY:-}}"
+DEEZER_STREAM_FILTER="${DEEZER_STREAM_FILTER:-${SUBSTREAM_DEEZER_STREAM_FILTER:-}}"
 QOBUZ_TOKEN="${QOBUZ_TOKEN:-${SUBSTREAM_QOBUZ_TOKEN:-}}"
 SPOTIFY_SP_DC="${SPOTIFY_SP_DC:-${SUBSTREAM_SPOTIFY_SP_DC:-}}"
 SPOTIFY_WVD_PATH="${SPOTIFY_WVD_PATH:-${SUBSTREAM_SPOTIFY_WVD_PATH:-spotify.wvd}}"
@@ -38,7 +40,7 @@ echo -e "${GREEN}#################################################${NC}"
 
 # 1. Local Build
 echo -e "\n${BLUE}[1/4] Building for Linux amd64...${NC}"
-GOOS=linux GOARCH=amd64 go build -o substream_linux ./cmd/substream
+GOOS=linux GOARCH=amd64 go build -tags deezer_native -o substream_linux ./cmd/substream
 echo -e "${GREEN}✅ Build successful!${NC}"
 
 # 2. Prepare Remote Server
@@ -90,6 +92,8 @@ User=${SSH_USER}
 WorkingDirectory=${PATH_REMOTE}
 Environment="SUBSTREAM_TIDAL_TOKEN=${TIDAL_TOKEN}"
 Environment="SUBSTREAM_DEEZER_ARL=${DEEZER_ARL}"
+Environment="SUBSTREAM_DEEZER_SECRET_KEY=${DEEZER_SECRET_KEY}"
+Environment="SUBSTREAM_DEEZER_STREAM_FILTER=${DEEZER_STREAM_FILTER}"
 Environment="SUBSTREAM_QOBUZ_TOKEN=${QOBUZ_TOKEN}"
 Environment="SUBSTREAM_SPOTIFY_SP_DC=${SPOTIFY_SP_DC}"
 Environment="SUBSTREAM_SPOTIFY_WVD_PATH=${REMOTE_WVD}"

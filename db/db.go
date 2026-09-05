@@ -594,3 +594,94 @@ func (db *DB) DeleteYTMusicAccount(id int) error {
 func (db *DB) ToggleYTMusicAccount(id int, active bool) error {
 	return db.Model(&YTMusicAccount{}).Where("id = ?", id).Update("is_active", active).Error
 }
+
+// GetDeezerAccounts returns all configured Deezer accounts
+func (db *DB) GetDeezerAccounts() ([]*DeezerAccount, error) {
+	var accounts []*DeezerAccount
+	err := db.Order("created_at DESC").Find(&accounts).Error
+	return accounts, err
+}
+
+// GetActiveDeezerAccounts returns all active Deezer accounts ordered by quality tier descending
+func (db *DB) GetActiveDeezerAccounts() ([]*DeezerAccount, error) {
+	var accounts []*DeezerAccount
+	err := db.Where("is_active = ?", true).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
+	return accounts, err
+}
+
+// GetActiveDeezerAccountsForQuality returns active Deezer accounts meeting minTier
+func (db *DB) GetActiveDeezerAccountsForQuality(minTier int) ([]*DeezerAccount, error) {
+	var accounts []*DeezerAccount
+	err := db.Where("is_active = ? AND quality_tier >= ?", true, minTier).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
+	return accounts, err
+}
+
+// GetDeezerAccountByID retrieves a single Deezer account by ID
+func (db *DB) GetDeezerAccountByID(id int) (*DeezerAccount, error) {
+	var acc DeezerAccount
+	err := db.Where("id = ?", id).First(&acc).Error
+	if err != nil {
+		return nil, err
+	}
+	return &acc, nil
+}
+
+// AddDeezerAccount adds a new Deezer account
+func (db *DB) AddDeezerAccount(arl, userID, username, subType, highestQuality string, qualityTier int) (*DeezerAccount, error) {
+	if qualityTier <= 0 {
+		qualityTier = QualityTierLossless
+	}
+	acc := &DeezerAccount{
+		ARL:              arl,
+		UserID:           userID,
+		Username:         username,
+		SubscriptionType: subType,
+		HighestQuality:   highestQuality,
+		QualityTier:      qualityTier,
+		IsActive:         true,
+		LastValidatedAt:  time.Now(),
+	}
+	err := db.Create(acc).Error
+	return acc, err
+}
+
+// UpdateDeezerAccount updates an existing Deezer account record
+func (db *DB) UpdateDeezerAccount(acc *DeezerAccount) error {
+	acc.UpdatedAt = time.Now()
+	return db.Save(acc).Error
+}
+
+// UpdateDeezerAccountSubscription updates subscription tier and clears/sets last error
+func (db *DB) UpdateDeezerAccountSubscription(id int, subType, highestQuality string, qualityTier int, lastError string) error {
+	return db.Model(&DeezerAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"subscription_type": subType,
+		"highest_quality":   highestQuality,
+		"quality_tier":      qualityTier,
+		"last_error":        lastError,
+		"last_validated_at": time.Now(),
+		"updated_at":        time.Now(),
+	}).Error
+}
+
+// UpdateDeezerAccountError records the last validation or stream error for an account
+func (db *DB) UpdateDeezerAccountError(id int, lastError string) error {
+	return db.Model(&DeezerAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"last_error":        lastError,
+		"last_validated_at": time.Now(),
+		"updated_at":        time.Now(),
+	}).Error
+}
+
+// ToggleDeezerAccount enables or disables an account
+func (db *DB) ToggleDeezerAccount(id int, active bool) error {
+	return db.Model(&DeezerAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"is_active":  active,
+		"updated_at": time.Now(),
+	}).Error
+}
+
+// DeleteDeezerAccount deletes an account by ID
+func (db *DB) DeleteDeezerAccount(id int) error {
+	return db.Where("id = ?", id).Delete(&DeezerAccount{}).Error
+}
+

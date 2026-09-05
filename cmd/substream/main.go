@@ -92,6 +92,7 @@ func main() {
 	confQobuzURL := flag.String("qobuz-url", getEnv("SUBSTREAM_QOBUZ_URL", ""), "optional custom Qobuz proxy/mirror URL")
 	confDeezerURL := flag.String("deezer-url", getEnv("SUBSTREAM_DEEZER_URL", "https://dzr.tabs-vs-spaces.wtf"), "Deezer proxy/mirror URL")
 	confDeezerARL := flag.String("deezer-arl", getEnv("SUBSTREAM_DEEZER_ARL", ""), "optional Deezer ARL cookie")
+	confDeezerStreamFilter := flag.String("deezer-stream-filter", getEnv("SUBSTREAM_DEEZER_STREAM_FILTER", getEnv("DEEZER_STREAM_FILTER", "")), "optional stream filter activation token/spec for direct native stream decryption")
 	confAmazonURL := flag.String("amazon-url", getEnv("SUBSTREAM_AMAZON_URL", "https://amz.geeked.wtf"), "Amazon Music proxy/mirror URL")
 	confSpotifySPDC := flag.String("spotify-sp-dc", getEnv("SUBSTREAM_SPOTIFY_SP_DC", getEnv("SPOTIFY_SP_DC", "")), "optional Spotify sp_dc session cookie for Widevine audio playback")
 	confSpotifyWVD := flag.String("spotify-wvd-path", getEnv("SUBSTREAM_SPOTIFY_WVD_PATH", getEnv("SPOTIFY_WVD_PATH", "spotify.wvd")), "path to Widevine .wvd device file for Spotify audio decryption")
@@ -151,7 +152,13 @@ func main() {
 	deezerProvider := deezer.New(deezer.ClientOptions{
 		CustomURL: *confDeezerURL,
 		ARL:       *confDeezerARL,
+		StreamFilter: *confDeezerStreamFilter,
+		CacheDir:  filepath.Join(*confCachePath, "deezer"),
+		DB:        dbc,
 	})
+	if dzAccounts, err := dbc.GetActiveDeezerAccounts(); err == nil && len(dzAccounts) > 0 {
+		deezerProvider.SyncAccounts(dzAccounts)
+	}
 	providers.Register(deezerProvider)
 	log.Printf("[PROVIDER] Registered Deezer provider (dz) -> URL: %s", *confDeezerURL)
 

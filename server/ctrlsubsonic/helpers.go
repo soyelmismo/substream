@@ -241,6 +241,17 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							url = fbURL
 						}
 					}
+					if url == "" && c.providers.IsAudioEnabled("dz") && fallbackProvID != "dz" {
+						if dzProv, err := c.providers.Get("dz"); err == nil && dzProv != nil {
+							if matcher, ok := dzProv.(interface {
+								MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+							}); ok {
+								if matched, mErr := matcher.MatchTrackByMetadata(ctx, t.Artist, t.Title, t.Duration); mErr == nil && matched != nil && matched.ID != nil {
+									url, urlErr = dzProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP)
+								}
+							}
+						}
+					}
 					if url == "" && c.providers.IsAudioEnabled("sp") && fallbackProvID != "sp" {
 						if spProv, err := c.providers.Get("sp"); err == nil && spProv != nil {
 							if matcher, ok := spProv.(interface {
@@ -386,7 +397,39 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		}
 	}
 
-	// 3. Universal Fallback to Spotify if stream still failed or missing
+	// 3. Universal Fallback to Deezer if stream still failed or missing (Priority: Lossless FLAC)
+	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("dz") && track != nil && id.Provider() != "dz" {
+		if dzProv, err := c.providers.Get("dz"); err == nil && dzProv != nil {
+			if matcher, ok := dzProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if matched, mErr := matcher.MatchTrackByMetadata(ctx, track.Artist.Name, track.Title, track.Duration); mErr == nil && matched != nil && matched.ID != nil {
+					log.Printf("[STREAM] 🚀 Universal fallback to Deezer for %s (%s - %s) -> %s", id.String(), track.Artist.Name, track.Title, matched.ID.RawID())
+					if dzURL, dzErr := dzProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP); dzErr == nil && dzURL != "" {
+						dzIsPreview := strings.Contains(dzURL, "range=20-30") || strings.Contains(dzURL, "range=0-30") || strings.Contains(dzURL, "preview")
+						if !dzIsPreview {
+							url = dzURL
+							urlErr = nil
+							isSamplePreview = false
+							needsFallback = false
+
+							// Memorize cross-provider link in track_sources
+							if c.dbc != nil && track != nil {
+								clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+								dzURI := fmt.Sprintf("dz:tr:%s", matched.ID.RawID())
+								_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: "dz", URI: dzURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+								)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Universal Fallback to Spotify if stream still failed or missing
 	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("sp") && track != nil && id.Provider() != "sp" {
 		if spProv, err := c.providers.Get("sp"); err == nil && spProv != nil {
 			if matcher, ok := spProv.(interface {
