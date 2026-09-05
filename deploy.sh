@@ -40,7 +40,7 @@ echo -e "${GREEN}#################################################${NC}"
 
 # 1. Local Build
 echo -e "\n${BLUE}[1/4] Building for Linux amd64...${NC}"
-GOOS=linux GOARCH=amd64 go build -tags deezer_native -o substream_linux ./cmd/substream
+GOOS=linux GOARCH=amd64 go build -o substream_linux ./cmd/substream
 echo -e "${GREEN}✅ Build successful!${NC}"
 
 # 2. Prepare Remote Server

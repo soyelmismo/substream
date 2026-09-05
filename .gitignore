@@ -32,5 +32,3 @@ genre-tree
 *.mp3
 cache/deezer/
 cache/spotify/
-provider/deezer/*_native*.go
-provider/deezer/mock_server_test.go
