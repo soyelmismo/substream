@@ -3,6 +3,7 @@ package qobuz
 import (
 	"context"
 	"net/url"
+	"os"
 	"testing"
 )
 
@@ -60,3 +61,55 @@ func TestQobuzSearchLive(t *testing.T) {
 	t.Logf("Qobuz stream resolution for %s (%s): url=%q, err=%v", track.Title, track.ID.RawID(), streamURL, err)
 }
 
+func TestLiveQobuzUserGet(t *testing.T) {
+	tok := os.Getenv("QOBUZ_TOKEN")
+	appID := os.Getenv("SUBSTREAM_QOBUZ_APP_ID")
+	appSecret := os.Getenv("SUBSTREAM_QOBUZ_APP_SECRET")
+	if tok == "" {
+		t.Skip("skipping test: QOBUZ_TOKEN not set")
+	}
+
+	client := NewClient(ClientOptions{
+		AppID:         appID,
+		AppSecret:     appSecret,
+		UserAuthToken: tok,
+	})
+
+	var res map[string]interface{}
+	err := client.doSignedRequest(context.Background(), "user/get", nil, &res)
+	if err != nil {
+		t.Fatalf("user/get request failed: %v", err)
+	}
+	t.Logf("user/get response: %+v", res)
+}
+
+
+
+func TestLiveQobuzGetStreamURL(t *testing.T) {
+	tok := os.Getenv("QOBUZ_TOKEN")
+	appID := os.Getenv("SUBSTREAM_QOBUZ_APP_ID")
+	appSecret := os.Getenv("SUBSTREAM_QOBUZ_APP_SECRET")
+	if tok == "" {
+		t.Skip("skipping test: QOBUZ_TOKEN not set")
+	}
+
+	client := NewClient(ClientOptions{
+		AppID:         appID,
+		AppSecret:     appSecret,
+		UserAuthToken: tok,
+	})
+
+	// Search a track to get a valid Qobuz track ID
+	res, err := client.SearchTracks(context.Background(), "daft punk one more time", 1, 0)
+	if err != nil || len(res) == 0 {
+		t.Fatalf("search track failed: %v", err)
+	}
+	track := res[0]
+	t.Logf("Found track: %d (%s by %s, hires=%v)", track.ID, track.Title, track.Performer.Name, track.Hires)
+
+	url, err := client.GetStreamURL(context.Background(), track.ID, "LOSSLESS")
+	if err != nil {
+		t.Fatalf("GetStreamURL failed: %v", err)
+	}
+	t.Logf("Successfully acquired raw FLAC stream URL: %s", url)
+}

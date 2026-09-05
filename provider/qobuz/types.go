@@ -129,3 +129,46 @@ type QobuzFileUrlResponse struct {
 		Code string `json:"code"`
 	} `json:"restrictions"`
 }
+
+// QobuzUserGetResponse represents the user/get API response
+type QobuzUserGetResponse struct {
+	ID          interface{} `json:"id"` // can be int64 or float64 or string
+	Email       string      `json:"email"`
+	DisplayName string      `json:"display_name"`
+	Login       string      `json:"login"`
+	CountryCode string      `json:"country_code"`
+	Credential  struct {
+		ID          interface{} `json:"id"`
+		Description string      `json:"description"`
+		Label       string      `json:"label"`
+		Parameters  struct {
+			Label                    string `json:"label"`
+			ShortLabel               string `json:"short_label"`
+			LosslessStreaming        bool   `json:"lossless_streaming"`
+			HiresStreaming           bool   `json:"hires_streaming"`
+			LossyStreaming           bool   `json:"lossy_streaming"`
+			HiresPurchasesStreaming  bool   `json:"hires_purchases_streaming"`
+			IncludedFormatGroupIDs   []int  `json:"included_format_group_ids"`
+		} `json:"parameters"`
+	} `json:"credential"`
+	Subscription struct {
+		Offer       string `json:"offer"`
+		Periodicity string `json:"periodicity"`
+		StartDate   string `json:"start_date"`
+		EndDate     string `json:"end_date"`
+		IsCanceled  bool   `json:"is_canceled"`
+	} `json:"subscription"`
+}
+
+// QobuzAccountInfo holds validated metadata about a subscriber account
+type QobuzAccountInfo struct {
+	UserID           string
+	Username         string
+	SubscriptionType string
+	HighestQuality   string
+	QualityTier      int
+	HiresStreaming   bool
+	LosslessStreaming bool
+	RawResponse      *QobuzUserGetResponse
+}
+

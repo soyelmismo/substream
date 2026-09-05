@@ -699,4 +699,108 @@ func (db *DB) DeleteDeezerAccount(id int) error {
 	return db.Where("id = ?", id).Delete(&DeezerAccount{}).Error
 }
 
+// GetQobuzAccounts returns all configured Qobuz accounts
+func (db *DB) GetQobuzAccounts() ([]*QobuzAccount, error) {
+	var accounts []*QobuzAccount
+	err := db.Order("created_at DESC").Find(&accounts).Error
+	return accounts, err
+}
+
+// GetActiveQobuzAccounts returns all active Qobuz accounts ordered by quality tier descending
+func (db *DB) GetActiveQobuzAccounts() ([]*QobuzAccount, error) {
+	var accounts []*QobuzAccount
+	err := db.Where("is_active = ?", true).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
+	return accounts, err
+}
+
+// GetActiveQobuzAccountsForQuality returns active Qobuz accounts meeting minTier
+func (db *DB) GetActiveQobuzAccountsForQuality(minTier int) ([]*QobuzAccount, error) {
+	var accounts []*QobuzAccount
+	err := db.Where("is_active = ? AND quality_tier >= ?", true, minTier).Order("quality_tier DESC, created_at ASC").Find(&accounts).Error
+	return accounts, err
+}
+
+// GetQobuzAccountByID retrieves a single Qobuz account by ID
+func (db *DB) GetQobuzAccountByID(id int) (*QobuzAccount, error) {
+	var acc QobuzAccount
+	err := db.Where("id = ?", id).First(&acc).Error
+	if err != nil {
+		return nil, err
+	}
+	return &acc, nil
+}
+
+// AddQobuzAccount adds a new Qobuz account
+func (db *DB) AddQobuzAccount(token, userID, username, subType, highestQuality string, qualityTier int) (*QobuzAccount, error) {
+	if qualityTier <= 0 {
+		qualityTier = QualityTierLossless
+	}
+	acc := &QobuzAccount{
+		UserAuthToken:    token,
+		UserID:           userID,
+		Username:         username,
+		SubscriptionType: subType,
+		HighestQuality:   highestQuality,
+		QualityTier:      qualityTier,
+		IsActive:         true,
+		LastValidatedAt:  time.Now(),
+	}
+	err := db.Create(acc).Error
+	return acc, err
+}
+
+// UpdateQobuzAccount updates an existing Qobuz account record
+func (db *DB) UpdateQobuzAccount(acc *QobuzAccount) error {
+	acc.UpdatedAt = time.Now()
+	return db.Save(acc).Error
+}
+
+// UpdateQobuzAccountSubscription updates subscription tier and clears/sets last error
+func (db *DB) UpdateQobuzAccountSubscription(id int, subType, highestQuality string, qualityTier int, lastError string) error {
+	return db.Model(&QobuzAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"subscription_type": subType,
+		"highest_quality":   highestQuality,
+		"quality_tier":      qualityTier,
+		"last_error":        lastError,
+		"last_validated_at": time.Now(),
+		"updated_at":        time.Now(),
+	}).Error
+}
+
+// UpdateQobuzAccountError records the last validation or stream error for an account
+func (db *DB) UpdateQobuzAccountError(id int, lastError string) error {
+	return db.Model(&QobuzAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"last_error":        lastError,
+		"last_validated_at": time.Now(),
+		"updated_at":        time.Now(),
+	}).Error
+}
+
+// ToggleQobuzAccount enables or disables an account
+func (db *DB) ToggleQobuzAccount(id int, active bool) error {
+	return db.Model(&QobuzAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"is_active":  active,
+		"updated_at": time.Now(),
+	}).Error
+}
+
+// MarkQobuzAccountAsFree demotes a Qobuz account to the Free tier in the DB,
+// disabling it from the paid/lossless rotation.
+func (db *DB) MarkQobuzAccountAsFree(id int) error {
+	return db.Model(&QobuzAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"subscription_type": "FREE",
+		"highest_quality":   "MP3_320",
+		"quality_tier":      QualityTierFree,
+		"is_active":         false,
+		"last_error":        "Subscription degraded to FREE or Hi-Res/Lossless expired",
+		"last_validated_at": time.Now(),
+		"updated_at":        time.Now(),
+	}).Error
+}
+
+// DeleteQobuzAccount deletes an account by ID
+func (db *DB) DeleteQobuzAccount(id int) error {
+	return db.Where("id = ?", id).Delete(&QobuzAccount{}).Error
+}
+
 

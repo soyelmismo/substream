@@ -7,12 +7,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"go.senan.xyz/gonic/db"
 )
 
 const (
@@ -30,6 +35,8 @@ type Client struct {
 	appSecret     string
 	userAuthToken string
 	customURL     string
+	pool          *AccountPool
+	mu            sync.RWMutex
 }
 
 // ClientOptions configures a Qobuz Client
@@ -39,20 +46,57 @@ type ClientOptions struct {
 	AppSecret     string
 	UserAuthToken string
 	CustomURL     string
+	DB            *db.DB
 	Timeout       time.Duration
+}
+
+var (
+	testAPIBaseURLMu sync.RWMutex
+	testAPIBaseURL   string
+)
+
+// SetAPIBaseURLForTest allows overriding the Qobuz API base URL during unit tests.
+func SetAPIBaseURLForTest(u string) func() {
+	testAPIBaseURLMu.Lock()
+	orig := testAPIBaseURL
+	testAPIBaseURL = u
+	testAPIBaseURLMu.Unlock()
+	return func() {
+		testAPIBaseURLMu.Lock()
+		testAPIBaseURL = orig
+		testAPIBaseURLMu.Unlock()
+	}
 }
 
 // NewClient creates a new Qobuz API client
 func NewClient(opts ClientOptions) *Client {
 	baseURL := opts.BaseURL
 	if baseURL == "" {
-		baseURL = defaultQobuzAPIBaseURL
+		testAPIBaseURLMu.RLock()
+		if testAPIBaseURL != "" {
+			baseURL = testAPIBaseURL
+		} else {
+			baseURL = defaultQobuzAPIBaseURL
+		}
+		testAPIBaseURLMu.RUnlock()
 	}
 	appID := opts.AppID
+	if appID == "" {
+		appID = os.Getenv("SUBSTREAM_QOBUZ_APP_ID")
+	}
+	if appID == "" {
+		appID = os.Getenv("QOBUZ_APP_ID")
+	}
 	if appID == "" {
 		appID = defaultQobuzAppID
 	}
 	appSecret := opts.AppSecret
+	if appSecret == "" {
+		appSecret = os.Getenv("SUBSTREAM_QOBUZ_APP_SECRET")
+	}
+	if appSecret == "" {
+		appSecret = os.Getenv("QOBUZ_APP_SECRET")
+	}
 	if appSecret == "" {
 		appSecret = defaultQobuzAppSecret
 	}
@@ -61,13 +105,69 @@ func NewClient(opts ClientOptions) *Client {
 		timeout = 30 * time.Second
 	}
 
+	pool := NewAccountPool(opts.DB)
+	if opts.DB != nil {
+		if accs, err := opts.DB.GetActiveQobuzAccounts(); err == nil && len(accs) > 0 {
+			pool.SyncAccounts(accs)
+		}
+	}
+
+	token := strings.TrimSpace(opts.UserAuthToken)
+	if token != "" && pool.Count() == 0 {
+		pool.SyncAccounts([]*db.QobuzAccount{
+			{
+				ID:               1,
+				UserAuthToken:    token,
+				Username:         "Default Token",
+				SubscriptionType: "STUDIO",
+				HighestQuality:   "24B192K",
+				QualityTier:      90,
+				IsActive:         true,
+			},
+		})
+	}
+
 	return &Client{
 		httpClient:    &http.Client{Timeout: timeout},
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		appID:         appID,
 		appSecret:     appSecret,
-		userAuthToken: strings.TrimSpace(opts.UserAuthToken),
+		userAuthToken: token,
 		customURL:     strings.TrimRight(strings.TrimSpace(opts.CustomURL), "/"),
+		pool:          pool,
+	}
+}
+
+// Pool returns the underlying AccountPool
+func (c *Client) Pool() *AccountPool {
+	return c.pool
+}
+
+// AppID returns the configured application ID
+func (c *Client) AppID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.appID
+}
+
+// AppSecret returns the configured application secret
+func (c *Client) AppSecret() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.appSecret
+}
+
+// SyncAccounts synchronizes active accounts with the client pool
+func (c *Client) SyncAccounts(accounts []*db.QobuzAccount) {
+	if c.pool != nil {
+		c.pool.SyncAccounts(accounts)
+	}
+}
+
+// SetDB updates the database reference on the pool
+func (c *Client) SetDB(dbc *db.DB) {
+	if c.pool != nil {
+		c.pool.SetDB(dbc)
 	}
 }
 
@@ -246,20 +346,19 @@ func (c *Client) SearchByISRC(ctx context.Context, isrc string) (*QobuzTrack, er
 	return nil, fmt.Errorf("no track found for ISRC %s", isrc)
 }
 
-// GetStreamURL resolves a streaming URL for a track.
+// GetStreamURL resolves a streaming URL for a track using multi-account pool rotation.
 // formatID: 5 = MP3 320, 6 = FLAC 16-bit 44.1kHz, 7 = FLAC 24-bit <= 96kHz, 27 = FLAC 24-bit > 96kHz
 func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality string) (string, error) {
-	// 1. If custom mirror is configured, try it first
-	if c.customURL != "" {
-		customStream, err := c.getCustomStreamURL(ctx, trackID, quality)
-		if err == nil && customStream != "" {
-			return customStream, nil
-		}
+	reqQ := strings.ToUpper(strings.TrimSpace(quality))
+	minTier := db.QualityTierLossless
+	if reqQ == "LOW" || reqQ == "MP3" {
+		minTier = db.QualityTierFree
+	} else if reqQ == "HI_RES" || reqQ == "HI_RES_LOSSLESS" || reqQ == "24" {
+		minTier = 85
 	}
 
-	// 2. Map quality to Qobuz format_id
-	formatID := "6" // Default Lossless CD quality (16-bit / 44.1kHz)
-	switch strings.ToUpper(strings.TrimSpace(quality)) {
+	formatID := "6"
+	switch reqQ {
 	case "LOW", "MP3":
 		formatID = "5"
 	case "LOSSLESS", "16":
@@ -268,19 +367,100 @@ func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality string
 		formatID = "27"
 	}
 
+	// 1. Resolve via multi-account pool with round-robin
+	if c.pool != nil && c.pool.Count() > 0 {
+		totalAccounts := c.pool.Count()
+		var lastErr error
+		for attempt := 0; attempt < totalAccounts; attempt++ {
+			session, err := c.pool.GetNextAccount(minTier)
+			if err != nil {
+				lastErr = err
+				break
+			}
+
+			streamURL, err := c.fetchStreamURLWithToken(ctx, trackID, formatID, session.Account.UserAuthToken)
+			if err == nil && streamURL != "" {
+				log.Printf("[QOBUZ] 🚀 Resolved stream for track %d via account %s (format: %s)", trackID, session.Account.Username, formatID)
+				return streamURL, nil
+			}
+
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+
+			c.pool.MarkError(session.Account.ID, err)
+			lastErr = err
+		}
+
+		if lastErr != nil {
+			log.Printf("[QOBUZ] ⚠️ Account pool failed for track %d: %v", trackID, lastErr)
+		}
+	} else if c.userAuthToken != "" {
+		// Single legacy token fallback
+		if streamURL, err := c.fetchStreamURLWithToken(ctx, trackID, formatID, c.userAuthToken); err == nil && streamURL != "" {
+			return streamURL, nil
+		}
+	}
+
+	// 2. Custom mirror fallback
+	if c.customURL != "" {
+		customStream, err := c.getCustomStreamURL(ctx, trackID, quality)
+		if err == nil && customStream != "" {
+			return customStream, nil
+		}
+	}
+
+	return "", fmt.Errorf("no stream available for Qobuz track %d (configure active subscriber account or token)", trackID)
+}
+
+func (c *Client) fetchStreamURLWithToken(ctx context.Context, trackID int64, formatID string, token string) (string, error) {
 	params := url.Values{
 		"track_id":  {strconv.FormatInt(trackID, 10)},
 		"format_id": {formatID},
 		"intent":    {"stream"},
 	}
 
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := c.qobuzRequestSignature("track/getFileUrl", params, ts)
+
+	params.Set("app_id", c.appID)
+	params.Set("user_auth_token", token)
+	params.Set("request_ts", ts)
+	params.Set("request_sig", sig)
+
+	reqURL := fmt.Sprintf("%s/track/getFileUrl?%s", c.baseURL, params.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-App-Id", c.appID)
+	req.Header.Set("X-User-Auth-Token", token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("qobuz API track/getFileUrl status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
 	var res QobuzFileUrlResponse
-	if err := c.doSignedRequest(ctx, "track/getFileUrl", params, &res); err != nil {
-		return "", err
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
+		return "", fmt.Errorf("decode getFileUrl response: %w", err)
 	}
 
 	if res.URL != "" {
-		if strings.Contains(res.URL, "range=20-30") || strings.Contains(res.URL, "range=0-30") {
+		if strings.Contains(res.URL, "range=20-30") || strings.Contains(res.URL, "range=0-30") || strings.Contains(res.URL, "preview") {
 			return "", fmt.Errorf("qobuz track requires subscription (preview only)")
 		}
 		return res.URL, nil

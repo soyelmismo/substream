@@ -167,6 +167,28 @@ func (DeezerAccount) TableName() string {
 	return "deezer_accounts"
 }
 
+// QobuzAccount represents a subscriber account used by the Qobuz provider to fetch
+// lossless FLAC and Hi-Res 24-bit streams. Authentication is performed via user_auth_token.
+type QobuzAccount struct {
+	ID               int       `gorm:"primary_key"`
+	UserAuthToken    string    `gorm:"not null;unique_index"`
+	UserID           string    `sql:"default: ''"`
+	Username         string    `sql:"default: ''"`
+	SubscriptionType string    `sql:"default: 'FREE'"` // "Studio", "Sublime", "Premium", "FREE"
+	HighestQuality   string    `sql:"default: 'MP3_320'"`
+	QualityTier      int       `sql:"default: 10"` // 90 (24/192), 85 (24/96), 80 (16/44.1 FLAC), 10 (Free)
+	IsActive         bool      `sql:"DEFAULT: true"`
+	LastError        string    `sql:"default: ''"`
+	LastValidatedAt  time.Time `sql:"DEFAULT:current_timestamp"`
+	CreatedAt        time.Time `sql:"DEFAULT:current_timestamp"`
+	UpdatedAt        time.Time `sql:"DEFAULT:current_timestamp"`
+}
+
+// TableName overrides GORM pluralization
+func (QobuzAccount) TableName() string {
+	return "qobuz_accounts"
+}
+
 // TrackMetadata stores the mapping between tracks and their album/artist.
 // This is essential for the virtual library feature - it allows us to infer
 // which artists and albums a user has interacted with based on track plays/stars.

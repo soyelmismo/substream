@@ -24,6 +24,7 @@ import (
 	"go.senan.xyz/gonic/handlerutil"
 	"go.senan.xyz/gonic/listenbrainz"
 	"go.senan.xyz/gonic/provider/deezer"
+	"go.senan.xyz/gonic/provider/qobuz"
 	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/provider/ytmusic"
 )
@@ -1672,17 +1673,33 @@ func (c *Controller) ServeProviders(r *http.Request) *Response {
 	})
 
 	// 4. Qobuz
+	qobuzAccounts, _ := c.dbc.GetQobuzAccounts()
+	activeQobuz := 0
+	qobuzDetails := []string{}
+	for _, acc := range qobuzAccounts {
+		status := "inactive"
+		if acc.IsActive {
+			status = "active"
+			activeQobuz++
+		}
+		qobuzDetails = append(qobuzDetails, fmt.Sprintf("Account #%d: %s [%s] (%s)", acc.ID, acc.Username, acc.HighestQuality, status))
+	}
+	if len(qobuzDetails) == 0 {
+		qobuzDetails = append(qobuzDetails, "No accounts linked. Add via user_auth_token in 'Qobuz Accounts'.")
+	} else {
+		qobuzDetails = append(qobuzDetails, "Rotation: Round-Robin across active Studio/Sublime Hi-Res accounts")
+	}
+	qobuzDetails = append(qobuzDetails, "Direct Studio Master FLAC Delivery (up to 24-bit / 192kHz)")
+
 	providerList = append(providerList, ProviderViewModel{
 		ID:              "qb",
 		Name:            "Qobuz",
 		Badge:           "Hi-Res 24-bit FLAC",
-		TypeDescription: "Studio master lossless audio resolver",
+		TypeDescription: "Official subscriber accounts via user_auth_token with round-robin rotation & Studio Hi-Res FLAC streaming",
 		MetadataEnabled: isMeta("qb"),
 		AudioEnabled:    isAudio("qb"),
-		AccountsCount:   1,
-		Details: []string{
-			"Direct Hi-Res FLAC Stream Resolver",
-		},
+		AccountsCount:   activeQobuz,
+		Details:         qobuzDetails,
 	})
 
 	// 5. Deezer
@@ -2116,4 +2133,239 @@ func (c *Controller) ServeDeezerRefreshAccountDo(r *http.Request) *Response {
 		flashN:   []string{fmt.Sprintf("Deezer account %q successfully re-validated! (Plan: %s, Max: %s)", info.Username, info.SubscriptionType, info.HighestQuality)},
 	}
 }
+
+func (c *Controller) ServeQobuzAccounts(r *http.Request) *Response {
+	accounts, err := c.dbc.GetQobuzAccounts()
+	if err != nil {
+		return &Response{code: 500, err: fmt.Sprintf("get qobuz accounts: %v", err)}
+	}
+
+	data := &templateData{}
+	data.QobuzAccounts = accounts
+
+	return &Response{
+		template: "qobuz_accounts.tmpl",
+		data:     data,
+	}
+}
+
+func (c *Controller) ServeQobuzAddAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	token := strings.TrimSpace(r.FormValue("token"))
+	token = strings.TrimPrefix(token, "token=")
+	token = strings.TrimPrefix(token, "user_auth_token=")
+	token = strings.Trim(token, "\";' ")
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"user_auth_token is required"}}
+	}
+
+	appID := strings.TrimSpace(r.FormValue("app_id"))
+	appSecret := strings.TrimSpace(r.FormValue("app_secret"))
+
+	if appID == "" || appSecret == "" {
+		if c.providers != nil {
+			if p, err := c.providers.Get("qb"); err == nil && p != nil {
+				if qbp, ok := p.(*qobuz.Provider); ok {
+					if appID == "" {
+						appID = qbp.Client().AppID()
+					}
+					if appSecret == "" {
+						appSecret = qbp.Client().AppSecret()
+					}
+				}
+			}
+		}
+	}
+
+	info, err := qobuz.ValidateToken(r.Context(), appID, appSecret, token)
+	if err != nil {
+		log.Printf("[AUDIT] Failed Qobuz token validation: %v", err)
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{fmt.Sprintf("Qobuz token validation failed: %v", err)}}
+	}
+
+	qualityLabel := info.HighestQuality
+	if info.QualityTier >= 90 {
+		qualityLabel = "Studio Hi-Res 24-bit FLAC"
+	} else if info.QualityTier >= db.QualityTierLossless {
+		qualityLabel = "HiFi Lossless 16-bit FLAC"
+	} else if info.QualityTier >= db.QualityTierHigh {
+		qualityLabel = "Premium 320k MP3"
+	}
+
+	// Check if account already exists to prevent duplicate rows
+	existingAccounts, _ := c.dbc.GetQobuzAccounts()
+	var existing *db.QobuzAccount
+	for _, a := range existingAccounts {
+		if a.UserAuthToken == token || (a.UserID != "" && a.UserID == info.UserID) {
+			existing = a
+			break
+		}
+	}
+
+	if existing != nil {
+		existing.UserAuthToken = token
+		existing.UserID = info.UserID
+		existing.Username = info.Username
+		existing.SubscriptionType = info.SubscriptionType
+		existing.HighestQuality = info.HighestQuality
+		existing.QualityTier = info.QualityTier
+		existing.IsActive = true
+		existing.LastError = ""
+		existing.LastValidatedAt = time.Now()
+		_ = c.dbc.UpdateQobuzAccount(existing)
+
+		// Sync active accounts to provider
+		if c.providers != nil {
+			if p, err := c.providers.Get("qb"); err == nil && p != nil {
+				if qbp, ok := p.(*qobuz.Provider); ok {
+					activeAccs, _ := c.dbc.GetActiveQobuzAccounts()
+					qbp.SyncAccounts(activeAccs)
+				}
+			}
+		}
+
+		log.Printf("[AUDIT] Qobuz account updated: %s (User ID: %s, Plan: %s, Max: %s, ID: %d)", info.Username, info.UserID, info.SubscriptionType, qualityLabel, existing.ID)
+		return &Response{
+			redirect: "/admin/qobuz_accounts",
+			flashN:   []string{fmt.Sprintf("Qobuz account %q (User ID: %s) updated and reactivated! (Quality: %s)", info.Username, info.UserID, qualityLabel)},
+		}
+	}
+
+	acc, err := c.dbc.AddQobuzAccount(token, info.UserID, info.Username, info.SubscriptionType, info.HighestQuality, info.QualityTier)
+	if err != nil {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{fmt.Sprintf("could not save account: %v", err)}}
+	}
+
+	// Sync active accounts to provider
+	if c.providers != nil {
+		if p, err := c.providers.Get("qb"); err == nil && p != nil {
+			if qbp, ok := p.(*qobuz.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveQobuzAccounts()
+				qbp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	log.Printf("[AUDIT] Qobuz account added: %s (User ID: %s, Plan: %s, Max: %s, ID: %d)", info.Username, info.UserID, info.SubscriptionType, qualityLabel, acc.ID)
+	return &Response{
+		redirect: "/admin/qobuz_accounts",
+		flashN:   []string{fmt.Sprintf("Qobuz account %q added! (User ID: %s, Quality: %s)", info.Username, info.UserID, qualityLabel)},
+	}
+}
+
+func (c *Controller) ServeQobuzToggleAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	active := r.FormValue("active") == "true"
+	if err := c.dbc.ToggleQobuzAccount(idInt, active); err != nil {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{fmt.Sprintf("update account: %v", err)}}
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("qb"); err == nil && p != nil {
+			if qbp, ok := p.(*qobuz.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveQobuzAccounts()
+				qbp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	return &Response{redirect: "/admin/qobuz_accounts", flashN: []string{"account status updated"}}
+}
+
+func (c *Controller) ServeQobuzDeleteAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	if err := c.dbc.DeleteQobuzAccount(idInt); err != nil {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{fmt.Sprintf("delete account: %v", err)}}
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("qb"); err == nil && p != nil {
+			if qbp, ok := p.(*qobuz.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveQobuzAccounts()
+				qbp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	log.Printf("[AUDIT] Qobuz account deleted (ID: %d)", idInt)
+	return &Response{redirect: "/admin/qobuz_accounts", flashN: []string{"Qobuz account removed"}}
+}
+
+func (c *Controller) ServeQobuzRefreshAccountDo(r *http.Request) *Response {
+	if !validateCSRFToken(r) {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"invalid security token"}}
+	}
+
+	idStr := r.FormValue("id")
+	idInt, err := strconv.Atoi(idStr)
+	if err != nil || idInt <= 0 {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"invalid account ID"}}
+	}
+
+	acc, err := c.dbc.GetQobuzAccountByID(idInt)
+	if err != nil || acc == nil {
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{"account not found"}}
+	}
+
+	appID := ""
+	appSecret := ""
+	if c.providers != nil {
+		if p, err := c.providers.Get("qb"); err == nil && p != nil {
+			if qbp, ok := p.(*qobuz.Provider); ok {
+				appID = qbp.Client().AppID()
+				appSecret = qbp.Client().AppSecret()
+			}
+		}
+	}
+
+	info, valErr := qobuz.ValidateToken(r.Context(), appID, appSecret, acc.UserAuthToken)
+	if valErr != nil {
+		_ = c.dbc.UpdateQobuzAccountError(idInt, valErr.Error())
+		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{fmt.Sprintf("re-validation failed: %v", valErr)}}
+	}
+
+	_ = c.dbc.UpdateQobuzAccountSubscription(idInt, info.SubscriptionType, info.HighestQuality, info.QualityTier, "")
+	if acc.Username != info.Username || acc.UserID != info.UserID {
+		acc.Username = info.Username
+		acc.UserID = info.UserID
+		_ = c.dbc.UpdateQobuzAccount(acc)
+	}
+
+	if c.providers != nil {
+		if p, err := c.providers.Get("qb"); err == nil && p != nil {
+			if qbp, ok := p.(*qobuz.Provider); ok {
+				activeAccs, _ := c.dbc.GetActiveQobuzAccounts()
+				qbp.SyncAccounts(activeAccs)
+			}
+		}
+	}
+
+	return &Response{
+		redirect: "/admin/qobuz_accounts",
+		flashN:   []string{fmt.Sprintf("Qobuz account %q successfully re-validated! (Plan: %s, Max: %s)", info.Username, info.SubscriptionType, info.HighestQuality)},
+	}
+}
+
 

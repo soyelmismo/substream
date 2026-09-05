@@ -352,7 +352,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	needsFallback := urlErr != nil || url == "" || isSamplePreview
 
 	var lastResortAlt *db.TrackSource
-	hasLosslessProviders := c.providers != nil && (c.providers.IsAudioEnabled("td") || c.providers.IsAudioEnabled("dz"))
+	hasLosslessProviders := c.providers != nil && (c.providers.IsAudioEnabled("td") || c.providers.IsAudioEnabled("dz") || c.providers.IsAudioEnabled("qb"))
 
 	// 1. Rescuing via mapped track_sources in local DB (0 ms fast path)
 	if needsFallback && c.dbc != nil {

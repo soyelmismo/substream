@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
@@ -14,6 +16,7 @@ import (
 // Provider implements provider.MusicProvider for Qobuz
 type Provider struct {
 	client *Client
+	worker *BackgroundWorker
 }
 
 // Ensure Provider implements provider.MusicProvider
@@ -21,8 +24,15 @@ var _ provider.MusicProvider = (*Provider)(nil)
 
 // New creates a new Qobuz Provider
 func New(opts ClientOptions) *Provider {
+	client := NewClient(opts)
+	var worker *BackgroundWorker
+	if opts.DB != nil {
+		worker = NewBackgroundWorker(opts.DB, client.Pool(), client.appID, client.appSecret, 1*time.Hour)
+		worker.Start()
+	}
 	return &Provider{
-		client: NewClient(opts),
+		client: client,
+		worker: worker,
 	}
 }
 
@@ -327,3 +337,37 @@ func (p *Provider) GetTrackByISRC(ctx context.Context, isrc string) (*spec.Track
 	}
 	return p.trackToSpec(t), nil
 }
+
+// SyncAccounts synchronizes active accounts with the underlying client
+func (p *Provider) SyncAccounts(accounts []*db.QobuzAccount) {
+	p.client.SyncAccounts(accounts)
+}
+
+// SetDB updates the database reference on the underlying client
+func (p *Provider) SetDB(dbc *db.DB) {
+	p.client.SetDB(dbc)
+}
+
+// StartBackgroundMaintenance starts periodic account validation with a custom interval
+func (p *Provider) StartBackgroundMaintenance(interval time.Duration) {
+	if p.worker != nil {
+		p.worker.Stop()
+	}
+	if p.client != nil && p.client.pool != nil && p.client.pool.db != nil {
+		p.worker = NewBackgroundWorker(p.client.pool.db, p.client.Pool(), p.client.appID, p.client.appSecret, interval)
+		p.worker.Start()
+	}
+}
+
+// Close terminates any background workers
+func (p *Provider) Close() {
+	if p.worker != nil {
+		p.worker.Stop()
+	}
+}
+
+// Client returns the underlying Qobuz client
+func (p *Provider) Client() *Client {
+	return p.client
+}
+

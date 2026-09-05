@@ -88,7 +88,9 @@ func main() {
 
 	// Provider Configuration Flags
 	confTidalToken := flag.String("tidal-token", getEnv("SUBSTREAM_TIDAL_TOKEN", getEnv("SUBSTREAM_TIDAL_TOKENS", "")), "optional Tidal subscriber session token(s), comma-separated for multi-account rotation")
-	confQobuzToken := flag.String("qobuz-token", getEnv("SUBSTREAM_QOBUZ_TOKEN", ""), "optional Qobuz user auth token for full Hi-Res FLAC")
+	confQobuzToken := flag.String("qobuz-token", getEnv("SUBSTREAM_QOBUZ_TOKEN", getEnv("QOBUZ_TOKEN", "")), "optional Qobuz user auth token for full Hi-Res FLAC")
+	confQobuzAppID := flag.String("qobuz-app-id", getEnv("SUBSTREAM_QOBUZ_APP_ID", getEnv("QOBUZ_APP_ID", "")), "optional Qobuz app ID")
+	confQobuzAppSecret := flag.String("qobuz-app-secret", getEnv("SUBSTREAM_QOBUZ_APP_SECRET", getEnv("QOBUZ_APP_SECRET", "")), "optional Qobuz app secret")
 	confQobuzURL := flag.String("qobuz-url", getEnv("SUBSTREAM_QOBUZ_URL", ""), "optional custom Qobuz proxy/mirror URL")
 	confDeezerURL := flag.String("deezer-url", getEnv("SUBSTREAM_DEEZER_URL", "https://dzr.tabs-vs-spaces.wtf"), "Deezer proxy/mirror URL")
 	confDeezerARL := flag.String("deezer-arl", getEnv("SUBSTREAM_DEEZER_ARL", ""), "optional Deezer ARL cookie")
@@ -142,22 +144,54 @@ func main() {
 
 	// 2. Qobuz Provider (Hi-Res Lossless FLAC)
 	qobuzProvider := qobuz.New(qobuz.ClientOptions{
+		AppID:         *confQobuzAppID,
+		AppSecret:     *confQobuzAppSecret,
 		UserAuthToken: *confQobuzToken,
 		CustomURL:     *confQobuzURL,
+		DB:            dbc,
 	})
+	if qbAccounts, err := dbc.GetActiveQobuzAccounts(); err == nil && len(qbAccounts) > 0 {
+		qobuzProvider.SyncAccounts(qbAccounts)
+	} else if *confQobuzToken != "" {
+		allQb, _ := dbc.GetQobuzAccounts()
+		if len(allQb) == 0 {
+			info, err := qobuz.ValidateToken(context.Background(), *confQobuzAppID, *confQobuzAppSecret, *confQobuzToken)
+			if err == nil && info != nil {
+				acc, err := dbc.AddQobuzAccount(*confQobuzToken, info.UserID, info.Username, info.SubscriptionType, info.HighestQuality, info.QualityTier)
+				if err == nil {
+					log.Printf("[QOBUZ] Seeded initial account from environment: %s (Plan: %s, Max: %s)", acc.Username, acc.SubscriptionType, acc.HighestQuality)
+					qobuzProvider.SyncAccounts([]*db.QobuzAccount{acc})
+				}
+			} else {
+				log.Printf("[QOBUZ] ⚠️ Failed to validate initial environment token: %v", err)
+			}
+		}
+	}
 	providers.Register(qobuzProvider)
 	log.Printf("[PROVIDER] Registered Qobuz provider (qb)")
 
 	// 3. Deezer Provider (Lossless FLAC)
 	deezerProvider := deezer.New(deezer.ClientOptions{
-		CustomURL: *confDeezerURL,
-		ARL:       *confDeezerARL,
+		CustomURL:    *confDeezerURL,
+		ARL:          *confDeezerARL,
 		StreamFilter: *confDeezerStreamFilter,
-		CacheDir:  filepath.Join(*confCachePath, "deezer"),
-		DB:        dbc,
+		CacheDir:     filepath.Join(*confCachePath, "deezer"),
+		DB:           dbc,
 	})
 	if dzAccounts, err := dbc.GetActiveDeezerAccounts(); err == nil && len(dzAccounts) > 0 {
 		deezerProvider.SyncAccounts(dzAccounts)
+	} else if *confDeezerARL != "" {
+		allDz, _ := dbc.GetDeezerAccounts()
+		if len(allDz) == 0 {
+			info, err := deezer.ValidateARL(context.Background(), *confDeezerARL)
+			if err == nil && info != nil {
+				acc, err := dbc.AddDeezerAccount(*confDeezerARL, info.UserID, info.Username, info.SubscriptionType, info.HighestQuality, info.QualityTier)
+				if err == nil {
+					log.Printf("[DEEZER] Seeded initial account from environment: %s (Plan: %s, Max: %s)", acc.Username, acc.SubscriptionType, acc.HighestQuality)
+					deezerProvider.SyncAccounts([]*db.DeezerAccount{acc})
+				}
+			}
+		}
 	}
 	providers.Register(deezerProvider)
 	log.Printf("[PROVIDER] Registered Deezer provider (dz) -> URL: %s", *confDeezerURL)

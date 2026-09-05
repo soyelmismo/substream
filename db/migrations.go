@@ -734,6 +734,7 @@ func (db *DB) Migrate() error {
 		&TrackSource{},
 		&YTMusicAccount{},
 		&DeezerAccount{},
+		&QobuzAccount{},
 	).Error
 }
 

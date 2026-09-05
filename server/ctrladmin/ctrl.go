@@ -262,6 +262,13 @@ func New(dbc *db.DB, sessDB *gormstore.Store, proxy tidal.TidalProxy, resolvePro
 	c.Handle("/deezer_delete_account_do", adminChain(resp(c.ServeDeezerDeleteAccountDo)))
 	c.Handle("/deezer_refresh_account_do", adminChain(resp(c.ServeDeezerRefreshAccountDo)))
 
+	// admin qobuz accounts
+	c.Handle("/qobuz_accounts", adminChain(resp(c.ServeQobuzAccounts)))
+	c.Handle("/qobuz_add_account_do", adminChain(resp(c.ServeQobuzAddAccountDo)))
+	c.Handle("/qobuz_toggle_account_do", adminChain(resp(c.ServeQobuzToggleAccountDo)))
+	c.Handle("/qobuz_delete_account_do", adminChain(resp(c.ServeQobuzDeleteAccountDo)))
+	c.Handle("/qobuz_refresh_account_do", adminChain(resp(c.ServeQobuzRefreshAccountDo)))
+
 	// admin providers manager
 	c.Handle("/providers", adminChain(resp(c.ServeProviders)))
 	c.Handle("/providers_toggle_do", adminChain(resp(c.ServeToggleProviderDo)))
@@ -605,6 +612,9 @@ type templateData struct {
 
 	// deezer accounts
 	DeezerAccounts []*db.DeezerAccount
+
+	// qobuz accounts
+	QobuzAccounts []*db.QobuzAccount
 
 	// providers
 	Providers []ProviderViewModel
