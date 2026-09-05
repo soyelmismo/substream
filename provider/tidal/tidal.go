@@ -68,7 +68,7 @@ type Provider struct {
 	proxy TidalProxy
 }
 
-// New creates a new Tidal music provider wrapping 
+// New creates a new Tidal music provider wrapping
 func New(proxy TidalProxy) *Provider {
 	return &Provider{proxy: proxy}
 }
@@ -611,6 +611,13 @@ func setupTokenManager(dbc *db.DB, pool *Pool) {
 			refreshMu.Unlock()
 		}
 
+		// Make sure the pool's token→accountID map is up-to-date so the
+		// subscription-degraded handler in client.go can pass an
+		// authoritative accountID instead of a (possibly stale) token.
+		if acc.AccessToken != "" {
+			pool.RegisterTokenAccountID(acc.AccessToken, acc.ID)
+		}
+
 		return acc.AccessToken
 	}
 
@@ -642,8 +649,87 @@ func setupTokenManager(dbc *db.DB, pool *Pool) {
 		return getTokenForAccounts(accounts)
 	})
 
+	// [FIX C] Register a snapshot lister so GetStreamURL can iterate
+	// every active account before giving up on paid quality. Mirrors the
+	// same account selection as SetQualityTokenGetter (Lossless-priority
+	// for paid qualities, all-active for lossy).
+	pool.SetQualityTokenLister(func(quality string) []string {
+		var accounts []*db.TidalAccount
+		var err error
+
+		if strings.ToUpper(quality) == "LOSSLESS" || strings.ToUpper(quality) == "HI_RES_LOSSLESS" || strings.ToUpper(quality) == "HI_RES" {
+			accounts, err = dbc.GetActiveTidalAccountsForQuality(db.QualityTierLossless)
+			if err != nil || len(accounts) == 0 {
+				accounts, err = dbc.GetActiveTidalAccounts()
+			}
+		} else {
+			accounts, err = dbc.GetActiveTidalAccounts()
+		}
+		if err != nil || len(accounts) == 0 {
+			return nil
+		}
+
+		out := make([]string, 0, len(accounts))
+		seen := make(map[string]bool)
+		for _, acc := range accounts {
+			tok := getTokenForAccounts([]*db.TidalAccount{acc})
+			if tok == "" || seen[tok] {
+				continue
+			}
+			seen[tok] = true
+			out = append(out, tok)
+		}
+		return out
+	})
+
 	// Background worker: proactively auto-refreshes all active Tidal accounts
 	// before they expire (every 5 minutes, refreshes anything expiring in < 30 minutes)
+	//
+	// Also wires the subscription-degraded handler: when the Tidal API
+	// rejects a token with subStatus 5003 ("Requested quality is not
+	// allowed in user's subscription") or returns a PREVIEW-only asset,
+	// the corresponding account row in the DB is demoted to FREE so
+	// future requests naturally rotate to the next paid account. This
+	// fixes the "Supersonic hears Opus instead of FLAC" symptom caused
+	// by an account flagged HI_RES in the DB that Tidal actually treats
+	// as FREE.
+	pool.SetAccountDegradedHandler(func(accountID int, reason string) {
+		// Look up the DB row by its authoritative accountID. This is
+		// race-free: the pool knows which account the failed token
+		// came from at registration time, so we don't depend on the
+		// (possibly stale) access_token still being present in the DB.
+		allAccs, err := dbc.GetTidalAccounts()
+		if err != nil {
+			log.Printf("[TIDAL-OAUTH] ⚠️ Degraded handler could not load accounts: %v", err)
+			return
+		}
+		var matchedID int
+		var matchedUser string
+		for _, a := range allAccs {
+			if a.ID == accountID {
+				matchedID = a.ID
+				matchedUser = a.Username
+				if matchedUser == "" {
+					matchedUser = a.UserID
+				}
+				if matchedUser == "" {
+					matchedUser = fmt.Sprintf("id=%d", matchedID)
+				}
+				break
+			}
+		}
+		if matchedID == 0 {
+			log.Printf("[TIDAL-OAUTH] ⚠️ Degraded handler: no DB row matches accountID=%d (reason: %s)", accountID, reason)
+			return
+		}
+		log.Printf("[TIDAL-OAUTH] ⛔ Demoting Tidal account %s (id=%d) to FREE — reason: %s", matchedUser, matchedID, reason)
+		if err := dbc.MarkTidalAccountAsFree(matchedID); err != nil {
+			log.Printf("[TIDAL-OAUTH] ❌ Failed to persist FREE demotion for account %d: %v", matchedID, err)
+			return
+		}
+		log.Printf("[TIDAL-OAUTH] ✅ Account %s (id=%d) is now FREE and will be skipped in paid-quality rotation", matchedUser, matchedID)
+	})
+
 	go func() {
 		time.Sleep(3 * time.Second)
 		ticker := time.NewTicker(5 * time.Minute)

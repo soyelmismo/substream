@@ -26,3 +26,6 @@ config
 genre-tree
 substream_linux.*
 substream.*
+*.wvd
+*.sqlite
+*.sqlite3

@@ -152,6 +152,25 @@ func (db *DB) UpdateTidalAccountSubscription(id int, subType, highestQuality str
 	}).Error
 }
 
+// MarkTidalAccountAsFree demotes a Tidal account to the Free tier in the DB,
+// disabling it from the paid-quality rotation. Called when Tidal rejects a
+// playback request with subStatus 5003 ("quality not allowed in user's
+// subscription") or returns a PREVIEW-only asset — i.e. the account is
+// actually FREE despite being flagged otherwise.
+//
+// The change is persistent: the row is no longer picked up by
+// GetActiveTidalAccounts (which requires quality_tier >= 50), so subsequent
+// requests naturally rotate to the next valid account.
+func (db *DB) MarkTidalAccountAsFree(id int) error {
+	return db.Model(&TidalAccount{}).Where("id=?", id).Updates(map[string]interface{}{
+		"subscription_type": "FREE",
+		"highest_quality":   "LOW",
+		"quality_tier":      QualityTierFree,
+		"is_active":         false,
+		"updated_at":        time.Now(),
+	}).Error
+}
+
 func (db *DB) DeleteTidalAccount(id int) error {
 	return db.Where("id=?", id).Delete(&TidalAccount{}).Error
 }
@@ -575,4 +594,3 @@ func (db *DB) DeleteYTMusicAccount(id int) error {
 func (db *DB) ToggleYTMusicAccount(id int, active bool) error {
 	return db.Model(&YTMusicAccount{}).Where("id = ?", id).Update("is_active", active).Error
 }
-

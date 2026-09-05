@@ -176,16 +176,17 @@ const (
 	QualityTierLossless = 80  // CD Lossless (16-bit / 44.1kHz FLAC - Tidal HiFi, Deezer)
 	QualityTierHigh     = 50  // High Quality Lossy (320kbps MP3 / 256kbps AAC)
 	QualityTierStandard = 30  // Standard Streaming (160kbps Opus - YouTube Music)
+	QualityTierFree     = 10  // Free / Preview-only account (no full-track playback)
 )
 
 // TrackSource represents a specific provider audio source for a canonical song cluster.
 // Enables infinite provider scalability, zero-migration additions, and dynamic quality fallback.
 type TrackSource struct {
 	ID          int       `gorm:"primary_key"`
-	ClusterKey  string    `gorm:"not null; index:idx_track_sources_cluster"`   // "isrc:..." or "text:artist:title"
-	Provider    string    `gorm:"not null; index:idx_track_sources_provider"`  // "td", "yt", "dz", "qb", etc.
+	ClusterKey  string    `gorm:"not null; index:idx_track_sources_cluster"`    // "isrc:..." or "text:artist:title"
+	Provider    string    `gorm:"not null; index:idx_track_sources_provider"`   // "td", "yt", "dz", "qb", etc.
 	URI         string    `gorm:"not null; unique_index:idx_track_sources_uri"` // "td:tr:123", "yt:tr:xyz"
-	QualityTier int       `gorm:"not null"`                                    // 100 (HiRes), 80 (FLAC), 50 (320k), 30 (Opus)
+	QualityTier int       `gorm:"not null"`                                     // 100 (HiRes), 80 (FLAC), 50 (320k), 30 (Opus)
 	IsAvailable bool      `gorm:"not null; default:true"`
 	UpdatedAt   time.Time `sql:"DEFAULT:current_timestamp"`
 }
@@ -212,4 +213,3 @@ type YTMusicAccount struct {
 func (YTMusicAccount) TableName() string {
 	return "ytmusic_accounts"
 }
-

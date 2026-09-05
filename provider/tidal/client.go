@@ -43,15 +43,36 @@ type instance struct {
 
 // Pool implements TidalProxy with multi-instance failover and multi-account token rotation
 type Pool struct {
-	instances   []*instance
-	client      *http.Client
-	quality     string
-	userTokens  []string
+	instances          []*instance
+	client             *http.Client
+	quality            string
+	userTokens         []string
 	tokenGetter        func() string
 	qualityTokenGetter func(quality string) string
+	qualityTokenLister func(quality string) []string
 	tokenIdx           uint64
 	tokenMu            sync.RWMutex
 	mu                 sync.RWMutex
+
+	// onAccountDegraded is invoked when a token is rejected with a
+	// subscription-quality error (Tidal subStatus 5003, or PREVIEW asset).
+	// The handler (wired in tidal.go setupTokenManager) is expected to
+	// persist the demotion in the DB so the account is removed from the
+	// active rotation. The accountID (not the access_token) is passed so
+	// the handler is not racy with the 5-minute background refresh.
+	onAccountDegraded func(accountID int, reason string)
+
+	// tokenToAccountID maps an access_token (as stored in userTokens) back
+	// to the DB row id it came from. Used so demotion can pass an
+	// authoritative accountID to the handler, instead of a token string
+	// that may have been refreshed in the meantime.
+	tokenToAccountID map[string]int
+
+	// demotedAccountIDs tracks accounts that have already been reported as
+	// subscription-degraded. The handler must not be fired twice for the
+	// same account (idempotency). The set is monotonic: demoted accounts
+	// never re-enter the pool.
+	demotedAccountIDs map[int]bool
 
 	// New mirror manager for intelligent selection
 	mirrorMgr *MirrorManager
@@ -71,6 +92,50 @@ func (p *Pool) SetQualityTokenGetter(fn func(quality string) string) {
 	p.tokenMu.Lock()
 	defer p.tokenMu.Unlock()
 	p.qualityTokenGetter = fn
+}
+
+// SetQualityTokenLister registers a callback that returns a fresh
+// snapshot of all currently active Tidal access tokens appropriate for
+// the requested quality. Used by GetStreamURL to iterate through every
+// account in the pool before giving up on paid quality (FIX C).
+//
+// The list should be ordered by preference (best account first) and
+// is allowed to include duplicates of access_tokens the caller may
+// already hold in p.userTokens; deduplication is handled in the caller.
+// Returning an empty slice means "no paid accounts available" and
+// GetStreamURL will error for paid quality or fall through to the
+// mirror pool for lossy quality.
+func (p *Pool) SetQualityTokenLister(fn func(quality string) []string) {
+	p.tokenMu.Lock()
+	defer p.tokenMu.Unlock()
+	p.qualityTokenLister = fn
+}
+
+// RegisterTokenAccountID associates an access_token in the in-memory pool
+// with the DB account id it came from. This lets the subscription-degraded
+// handler receive an authoritative accountID instead of a token string
+// (the token may have been refreshed in the meantime by the 5-minute
+// background worker, so matching by token at demotion time is racy).
+func (p *Pool) RegisterTokenAccountID(token string, accountID int) {
+	if token == "" {
+		return
+	}
+	p.tokenMu.Lock()
+	defer p.tokenMu.Unlock()
+	if p.tokenToAccountID == nil {
+		p.tokenToAccountID = make(map[string]int)
+	}
+	p.tokenToAccountID[token] = accountID
+}
+
+// SetAccountDegradedHandler registers a callback that fires when a Tidal
+// account is found to be subscription-degraded (FREE while marked otherwise,
+// or returning PREVIEW-only assets). The handler is expected to persist the
+// demotion in the DB so the account drops out of the active rotation.
+func (p *Pool) SetAccountDegradedHandler(fn func(accountID int, reason string)) {
+	p.tokenMu.Lock()
+	defer p.tokenMu.Unlock()
+	p.onAccountDegraded = fn
 }
 
 func (p *Pool) getUserToken() string {
@@ -122,6 +187,69 @@ func (p *Pool) reportTokenAuthFailure(token string) {
 	}
 }
 
+// reportTokenSubscriptionFailure is called when Tidal explicitly tells us
+// the account is not allowed to stream at the requested quality
+// (subStatus 5003, "Requested quality is not allowed in user's subscription")
+// or returns a PREVIEW-only asset. In both cases the account is effectively
+// FREE despite whatever the DB says, so we:
+//
+//  1. Drop the token from the in-memory pool so the next request rotates.
+//  2. Look up the accountID the token belongs to via the parallel map
+//     (this is authoritative and not racy with the 5-min background
+//     refresh — see tokenToAccountID comments).
+//  3. Fire the onAccountDegraded callback so the DB row is demoted
+//     (subscription_type=FREE, quality_tier=10, is_active=false) and
+//     future requests from the round-robin skip it.
+//
+// This is what fixes the "Supersonic is hearing Opus" symptom: the bad
+// account was being preferred by GetActiveTidalAccountsForQuality because
+// it was mis-marked as HI_RES, and Tidal was returning an empty/garbage
+// manifest that fell through to the YouTube fallback. Demoting the row
+// forces the next account in the pool (the real HiFi one) to be picked.
+func (p *Pool) reportTokenSubscriptionFailure(token string, reason string) {
+	previewLen := 10
+	if len(token) < previewLen {
+		previewLen = len(token)
+	}
+	tokPreview := ""
+	if previewLen > 0 {
+		tokPreview = token[:previewLen] + "..."
+	}
+
+	p.tokenMu.Lock()
+	var accountID int
+	for i, t := range p.userTokens {
+		if t == token {
+			accountID = p.tokenToAccountID[token]
+			log.Printf("[TIDAL] ⛔ Token %s subscription-degraded (%s); removing from rotation pool and demoting account", tokPreview, reason)
+			p.userTokens = append(p.userTokens[:i], p.userTokens[i+1:]...)
+			delete(p.tokenToAccountID, token)
+			break
+		}
+	}
+	if accountID == 0 {
+		p.tokenMu.Unlock()
+		return
+	}
+	if p.demotedAccountIDs == nil {
+		p.demotedAccountIDs = make(map[int]bool)
+	}
+	alreadyReported := p.demotedAccountIDs[accountID]
+	p.demotedAccountIDs[accountID] = true
+	handler := p.onAccountDegraded
+	p.tokenMu.Unlock()
+
+	if alreadyReported || handler == nil {
+		return
+	}
+
+	// Run off the request path; this hits SQLite and shouldn't block streaming.
+	// Fired even when the pool becomes empty (FIX A): a single-account pool
+	// must still land its demotion, or the account is re-added on the next
+	// request and the PREVIEW loop repeats forever.
+	go handler(accountID, reason)
+}
+
 // NewPool creates a proxy pool from a list of hifi-api base URLs
 func NewPool(urls []string, cfg PoolConfig) *Pool {
 	if cfg.Timeout == 0 {
@@ -161,9 +289,11 @@ func NewPool(urls []string, cfg PoolConfig) *Pool {
 		client: &http.Client{
 			Timeout: cfg.Timeout,
 		},
-		quality:     cfg.Quality,
-		userTokens:  allTokens,
-		streamCache: make(map[int]streamCacheEntry),
+		quality:           cfg.Quality,
+		userTokens:        allTokens,
+		tokenToAccountID:  make(map[string]int),
+		demotedAccountIDs: make(map[int]bool),
+		streamCache:       make(map[int]streamCacheEntry),
 	}
 
 	if len(allTokens) > 0 {
@@ -1543,7 +1673,13 @@ func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality 
 			resp, err := p.client.Do(req)
 			if err == nil {
 				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
+				// Read the body once and reuse it for both the JSON decode and the
+				// subscription-degraded check. Do NOT return early on degraded — let
+				// V1 try, because V2 may have been a transient hiccup. The demotion
+				// should still happen so the rotation skips the bad account next time.
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				switch resp.StatusCode {
+				case http.StatusOK:
 					var v2Resp struct {
 						Data struct {
 							Attributes struct {
@@ -1553,14 +1689,30 @@ func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality 
 							} `json:"attributes"`
 						} `json:"data"`
 					}
-					if err := json.NewDecoder(resp.Body).Decode(&v2Resp); err == nil {
+					if err := json.Unmarshal(bodyBytes, &v2Resp); err == nil {
 						if v2Resp.Data.Attributes.TrackPresentation == "FULL" && v2Resp.Data.Attributes.URI != "" {
 							log.Printf("[TIDAL] 🚀 Official OpenAPI v2 resolved LOSSLESS stream for track %d: Formats=%v", trackID, v2Resp.Data.Attributes.Formats)
 							return v2Resp.Data.Attributes.URI, nil
 						}
+						// Non-FULL (e.g. PREVIEW) means the account is degraded. Demote
+						// and fall through to V1.
+						p.reportTokenSubscriptionFailure(token, "v2 trackPresentation="+v2Resp.Data.Attributes.TrackPresentation)
+						log.Printf("[TIDAL] ⚠️ V2 returned non-FULL trackPresentation=%q for track %d; demoting account and falling back to V1", v2Resp.Data.Attributes.TrackPresentation, trackID)
 					}
-				} else if resp.StatusCode == http.StatusUnauthorized {
-					p.reportTokenAuthFailure(token)
+				case http.StatusUnauthorized:
+					if isTidalSubscriptionDegraded(string(bodyBytes)) {
+						p.reportTokenSubscriptionFailure(token, fmt.Sprintf("v2 401 subscription-degraded: %s", truncate(string(bodyBytes), 200)))
+					} else {
+						p.reportTokenAuthFailure(token)
+					}
+					// Fall through to V1 either way.
+				case http.StatusForbidden:
+					// 403 is region-lock / rights restriction, not account quality.
+					// Do NOT demote; just log and fall through.
+					log.Printf("[TIDAL] ℹ️ V2 returned 403 for track %d (region-lock or rights); falling back to V1", trackID)
+				default:
+					// Any other 4xx/5xx: log and fall through.
+					log.Printf("[TIDAL] ⚠️ V2 returned status %d for track %d; falling back to V1", resp.StatusCode, trackID)
 				}
 			}
 		}
@@ -1593,9 +1745,22 @@ func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality 
 	}
 	defer resp.Body.Close()
 
+	// Subscription-quality rejection: Tidal returns 401 with a JSON body
+	// like {"status":401,"subStatus":5003,"userMessage":"Requested quality
+	// is not allowed in user's subscription"}. This is the "FREE account
+	// pretending to be HiFi" failure mode. Detect it, log loudly, and
+	// demote the account in the DB so we rotate to a paid one.
+	// Note: 403 is intentionally NOT included — 403 is for region-locked
+	// tracks / rights restrictions and is NOT an account-quality signal.
 	if resp.StatusCode == http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		bodyStr := string(body)
+		if isTidalSubscriptionDegraded(bodyStr) {
+			p.reportTokenSubscriptionFailure(token, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, truncate(bodyStr, 200)))
+			return "", fmt.Errorf("tidal account subscription-degraded: %s", truncate(bodyStr, 200))
+		}
 		p.reportTokenAuthFailure(token)
-		return "", fmt.Errorf("tidal token unauthorized or expired (401)")
+		return "", fmt.Errorf("api.tidal.com returned status 401: %s", bodyStr)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -1615,6 +1780,11 @@ func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality 
 	}
 
 	if playInfo.AssetPresentation == "PREVIEW" {
+		// Same failure mode as above, but Tidal returns 200 with a
+		// PREVIEW asset because the track is on-demand in the user's
+		// region but their tier doesn't include full playback. Demote
+		// the account so the rotation skips it next time.
+		p.reportTokenSubscriptionFailure(token, "assetPresentation=PREVIEW")
 		return "", fmt.Errorf("track requires subscription (preview only)")
 	}
 
@@ -1631,6 +1801,22 @@ func (p *Pool) fetchDirectTidalStream(ctx context.Context, trackID int, quality 
 	actualQuality := playInfo.AudioQuality
 	if actualQuality == "" {
 		actualQuality = quality
+	}
+
+	// Detect silent quality downgrade: Tidal returned 200 but delivered
+	// a LOWER quality than requested. The account is mis-marked in the DB
+	// (e.g. flagged HI_RES but actually Premium 320k), and this is the
+	// same failure mode as subStatus 5003 — demote the account so future
+	// rotation picks a paid one. Allow LOSSLESS to satisfy an HI_RES
+	// request (some tracks don't have HI_RES masters), but anything
+	// lower than LOSSLESS is a real downgrade.
+	requestedQ := strings.ToUpper(quality)
+	actualQ := strings.ToUpper(actualQuality)
+	if (requestedQ == "HI_RES_LOSSLESS" || requestedQ == "LOSSLESS") &&
+		actualQ != "" && actualQ != requestedQ &&
+		actualQ != "LOSSLESS" {
+		p.reportTokenSubscriptionFailure(token, fmt.Sprintf("quality downgraded: requested=%s actual=%s", requestedQ, actualQ))
+		return "", fmt.Errorf("tidal account returned degraded quality: requested=%s actual=%s", requestedQ, actualQ)
 	}
 
 	if (quality == "LOSSLESS" || quality == "HI_RES_LOSSLESS") && (actualQuality == "HIGH" || actualQuality == "LOW") {
@@ -1665,8 +1851,67 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 	}
 	p.streamCacheMu.RUnlock()
 
-	// [DIRECT-TIDAL] If user subscriber tokens are configured, attempt direct playback from Tidal official API with quality-aware token
-	if tok := p.getUserTokenForQuality(requestedQuality); tok != "" {
+	up := strings.ToUpper(requestedQuality)
+	paidQuality := up == "LOSSLESS" || up == "HI_RES_LOSSLESS" || up == "HI_RES"
+
+	// [FIX C] Build a snapshot of Tidal account tokens to iterate. We
+	// prefer the live lister (DB-backed, refresh-aware) so a new account
+	// added after startup is visible to the rotation; fall back to the
+	// in-memory seed list for callers that don't wire a lister.
+	var tokens []string
+	p.tokenMu.RLock()
+	lister := p.qualityTokenLister
+	seedTokens := append([]string(nil), p.userTokens...)
+	p.tokenMu.RUnlock()
+	if lister != nil {
+		tokens = lister(requestedQuality)
+	} else {
+		tokens = seedTokens
+	}
+
+	// [FIX C] For paid quality, iterate every pool token before giving up.
+	// The mirror pool is NOT a paid-quality fallback — it can only serve
+	// lossy (LOW/HIGH), so using it for LOSSLESS / HI_RES_LOSSLESS / HI_RES
+	// would silently deliver a degraded stream. We try each Tidal account
+	// in turn; fetchDirectTidalStream internally demotes degraded accounts
+	// so the next call to GetStreamURL rotates naturally.
+	if paidQuality {
+		var lastErr error
+		for _, tok := range tokens {
+			if tok == "" {
+				continue
+			}
+			directURL, err := p.fetchDirectTidalStream(ctx, trackID, requestedQuality, clientIP, tok)
+			if err == nil && directURL != "" {
+				p.streamCacheMu.Lock()
+				p.streamCache[trackID] = streamCacheEntry{
+					URL:       directURL,
+					Timestamp: time.Now(),
+					Quality:   requestedQuality,
+				}
+				p.streamCacheMu.Unlock()
+				return directURL, nil
+			}
+			lastErr = err
+			log.Printf("[TIDAL] ⚠️ account attempt failed for track %d (quality %s): %v (trying next account)",
+				trackID, requestedQuality, err)
+		}
+		if len(tokens) == 0 {
+			return "", fmt.Errorf("no active Tidal subscription available for requested quality %s", requestedQuality)
+		}
+		return "", fmt.Errorf("all %d Tidal account(s) failed for track %d quality %s: %v",
+			len(tokens), trackID, requestedQuality, lastErr)
+	}
+
+	// [FIX C] Lossy quality (LOW/HIGH): try each paid token once as a
+	// quality match attempt, then fall through to the mirror pool as a
+	// last resort (mirrors can serve lossy reliably without a paid Tidal
+	// account). We only attempt the mirror pool after exhausting the
+	// direct-Tidal rotation.
+	for _, tok := range tokens {
+		if tok == "" {
+			continue
+		}
 		directURL, err := p.fetchDirectTidalStream(ctx, trackID, requestedQuality, clientIP, tok)
 		if err == nil && directURL != "" {
 			p.streamCacheMu.Lock()
@@ -1678,10 +1923,18 @@ func (p *Pool) GetStreamURL(ctx context.Context, trackID int, requestedQuality s
 			p.streamCacheMu.Unlock()
 			return directURL, nil
 		}
-		log.Printf("[TIDAL] Direct official API attempt failed for track %d: %v (falling back to mirror pool)", trackID, err)
+		log.Printf("[TIDAL] ⚠️ account attempt failed for lossy track %d: %v (falling back to mirror pool)", trackID, err)
 	}
 
-	// Obtener TODOS los mirrors sanos sin importar el Tier
+	// Mirror pool fallback for lossy quality (preserved from pre-FIX-C behavior).
+	return p.getStreamURLFromMirrorPool(ctx, trackID, requestedQuality, clientIP)
+}
+
+// getStreamURLFromMirrorPool runs the shotgun / fast-path mirror-pool
+// routing that used to live inline in GetStreamURL. Extracted as part of
+// FIX C so GetStreamURL can iterate direct-Tidal accounts first and only
+// fall through to mirrors for lossy quality. Behavior is unchanged.
+func (p *Pool) getStreamURLFromMirrorPool(ctx context.Context, trackID int, requestedQuality string, clientIP string) (string, error) {
 	var mirrors []*Mirror
 	p.mu.RLock()
 	if p.mirrorMgr != nil {
