@@ -241,6 +241,17 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							url = fbURL
 						}
 					}
+					if url == "" && c.providers.IsAudioEnabled("td") && fallbackProvID != "td" {
+						if tdProv, err := c.providers.Get("td"); err == nil && tdProv != nil {
+							if matcher, ok := tdProv.(interface {
+								MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+							}); ok {
+								if matched, mErr := matcher.MatchTrackByMetadata(ctx, t.Artist, t.Title, t.Duration); mErr == nil && matched != nil && matched.ID != nil {
+									url, urlErr = tdProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP)
+								}
+							}
+						}
+					}
 					if url == "" && c.providers.IsAudioEnabled("dz") && fallbackProvID != "dz" {
 						if dzProv, err := c.providers.Get("dz"); err == nil && dzProv != nil {
 							if matcher, ok := dzProv.(interface {
@@ -336,9 +347,9 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 	wg.Wait()
 
 	// Cross-Provider Fallback:
-	// If primary provider stream failed or returned a preview sample for a longer track:
+	// If primary provider stream failed or returned a preview sample for a track:
 	isSamplePreview := strings.Contains(url, "range=20-30") || strings.Contains(url, "range=0-30") || strings.Contains(url, "preview")
-	needsFallback := urlErr != nil || url == "" || (isSamplePreview && track != nil && track.Duration > 45)
+	needsFallback := urlErr != nil || url == "" || isSamplePreview
 
 	// 1. Rescuing via mapped track_sources in local DB (0 ms fast path)
 	if needsFallback && c.dbc != nil {
@@ -397,7 +408,42 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		}
 	}
 
-	// 3. Universal Fallback to Deezer if stream still failed or missing (Priority: Lossless FLAC)
+	// 3. Universal Fallback to Tidal if stream still failed or missing (Priority: Hi-Res / Lossless FLAC)
+	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("td") && track != nil && id.Provider() != "td" {
+		if tdProv, err := c.providers.Get("td"); err == nil && tdProv != nil {
+			if matcher, ok := tdProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if matched, mErr := matcher.MatchTrackByMetadata(ctx, track.Artist.Name, track.Title, track.Duration); mErr == nil && matched != nil && matched.ID != nil {
+					log.Printf("[STREAM] 🚀 Universal fallback to Tidal for %s (%s - %s) -> %s", id.String(), track.Artist.Name, track.Title, matched.ID.RawID())
+					if tdURL, tdErr := tdProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP); tdErr == nil && tdURL != "" {
+						tdIsPreview := strings.Contains(tdURL, "range=20-30") || strings.Contains(tdURL, "range=0-30") || strings.Contains(tdURL, "preview")
+						if !tdIsPreview {
+							url = tdURL
+							urlErr = nil
+							isSamplePreview = false
+							needsFallback = false
+							if matched.Duration > 0 && (track.Duration <= 35 || matched.Duration > track.Duration) {
+								track.Duration = matched.Duration
+							}
+
+							// Memorize cross-provider link in track_sources
+							if c.dbc != nil && track != nil {
+								clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+								tdURI := fmt.Sprintf("td:tr:%s", matched.ID.RawID())
+								_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: "td", URI: tdURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+								)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Universal Fallback to Deezer if stream still failed or missing (Priority: Lossless FLAC)
 	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("dz") && track != nil && id.Provider() != "dz" {
 		if dzProv, err := c.providers.Get("dz"); err == nil && dzProv != nil {
 			if matcher, ok := dzProv.(interface {
@@ -412,6 +458,9 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							urlErr = nil
 							isSamplePreview = false
 							needsFallback = false
+							if matched.Duration > 0 && (track.Duration <= 35 || matched.Duration > track.Duration) {
+								track.Duration = matched.Duration
+							}
 
 							// Memorize cross-provider link in track_sources
 							if c.dbc != nil && track != nil {
@@ -916,3 +965,134 @@ func (c *Controller) unwrapTidalManifest(ctx context.Context, manifestURL string
 
 	return ""
 }
+
+func cleanMatchString(s string) string {
+	s = strings.ToLower(s)
+	var out strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == ' ' {
+			out.WriteRune(r)
+		} else {
+			out.WriteRune(' ')
+		}
+	}
+	return strings.Join(strings.Fields(out.String()), " ")
+}
+
+func (c *Controller) enrichSnippetAlbum(ctx context.Context, a *spec.Album) {
+	if a == nil || len(a.Tracks) == 0 {
+		return
+	}
+	// Check if album tracks are snippet previews (e.g. 30s clips from SoundCloud Go+)
+	snippetCount := 0
+	for _, t := range a.Tracks {
+		if t != nil && t.Duration > 0 && t.Duration <= 35 {
+			snippetCount++
+		}
+	}
+	// If at least half the tracks (or all tracks when >= 3) are 30-sec snippets:
+	if snippetCount == 0 || (len(a.Tracks) >= 3 && snippetCount < len(a.Tracks)/2) {
+		return
+	}
+
+	albumQuery := strings.TrimSpace(fmt.Sprintf("%s %s", a.Artist, a.Title))
+	if albumQuery == "" {
+		return
+	}
+
+	// 1. Try to find the full album on Deezer
+	if c.providers != nil && c.providers.IsAudioEnabled("dz") {
+		if dzProv, err := c.providers.Get("dz"); err == nil && dzProv != nil {
+			albums, _ := dzProv.SearchAlbums(ctx, albumQuery, 3, 0)
+			for _, dzAlb := range albums {
+				if dzAlb == nil || dzAlb.ID == nil {
+					continue
+				}
+				fullDzAlb, err := dzProv.GetAlbum(ctx, dzAlb.ID.RawID())
+				if err == nil && fullDzAlb != nil && len(fullDzAlb.Tracks) > 0 {
+					c.enrichTracksFromFullAlbum(a, fullDzAlb)
+					return
+				}
+			}
+		}
+	}
+
+	// 2. Try to find the full album on Tidal
+	if c.providers != nil && c.providers.IsAudioEnabled("td") {
+		if tdProv, err := c.providers.Get("td"); err == nil && tdProv != nil {
+			albums, _ := tdProv.SearchAlbums(ctx, albumQuery, 3, 0)
+			for _, tdAlb := range albums {
+				if tdAlb == nil || tdAlb.ID == nil {
+					continue
+				}
+				fullTdAlb, err := tdProv.GetAlbum(ctx, tdAlb.ID.RawID())
+				if err == nil && fullTdAlb != nil && len(fullTdAlb.Tracks) > 0 {
+					c.enrichTracksFromFullAlbum(a, fullTdAlb)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (c *Controller) enrichTracksFromFullAlbum(targetAlbum, fullAlbum *spec.Album) {
+	log.Printf("[METADATA] ⚡ Enriching snippet album %q (%d tracks) from %s (%d tracks)",
+		targetAlbum.Title, len(targetAlbum.Tracks), fullAlbum.ID.String(), len(fullAlbum.Tracks))
+
+	if len(targetAlbum.Tracks) == len(fullAlbum.Tracks) {
+		totalDur := 0
+		for i := range targetAlbum.Tracks {
+			if targetAlbum.Tracks[i] != nil && fullAlbum.Tracks[i] != nil {
+				if fullAlbum.Tracks[i].Duration > 0 {
+					targetAlbum.Tracks[i].Duration = fullAlbum.Tracks[i].Duration
+				}
+				if c.dbc != nil && targetAlbum.Tracks[i].ID != nil && fullAlbum.Tracks[i].ID != nil {
+					clusterKey := db.MakeClusterKey("", targetAlbum.Tracks[i].Artist, targetAlbum.Tracks[i].Title)
+					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+						db.TrackSource{ClusterKey: clusterKey, Provider: targetAlbum.Tracks[i].ID.Provider(), URI: targetAlbum.Tracks[i].ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: fullAlbum.Tracks[i].ID.Provider(), URI: fullAlbum.Tracks[i].ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+					)
+				}
+			}
+			if targetAlbum.Tracks[i] != nil {
+				totalDur += targetAlbum.Tracks[i].Duration
+			}
+		}
+		if totalDur > 0 {
+			targetAlbum.Duration = totalDur
+		}
+		return
+	}
+
+	totalDur := 0
+	for _, targetTrack := range targetAlbum.Tracks {
+		if targetTrack == nil {
+			continue
+		}
+		normTarget := cleanMatchString(targetTrack.Title)
+		for _, fullTrack := range fullAlbum.Tracks {
+			if fullTrack == nil {
+				continue
+			}
+			normFull := cleanMatchString(fullTrack.Title)
+			if normTarget != "" && (normTarget == normFull || strings.Contains(normFull, normTarget) || strings.Contains(normTarget, normFull)) {
+				if fullTrack.Duration > targetTrack.Duration {
+					targetTrack.Duration = fullTrack.Duration
+				}
+				if c.dbc != nil && targetTrack.ID != nil && fullTrack.ID != nil {
+					clusterKey := db.MakeClusterKey("", targetTrack.Artist, targetTrack.Title)
+					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+						db.TrackSource{ClusterKey: clusterKey, Provider: targetTrack.ID.Provider(), URI: targetTrack.ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: fullTrack.ID.Provider(), URI: fullTrack.ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+					)
+				}
+				break
+			}
+		}
+		totalDur += targetTrack.Duration
+	}
+	if totalDur > 0 {
+		targetAlbum.Duration = totalDur
+	}
+}
+

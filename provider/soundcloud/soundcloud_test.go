@@ -59,6 +59,17 @@ func TestSoundCloudProvider(t *testing.T) {
 	}
 	t.Logf("GetAlbum: Title=%q Artist=%q Tracks=%d", album.Name, album.Artist, len(album.Tracks))
 
+	// 1b. Test GetAlbum with playlist exceeding 5 tracks (tests stub hydration)
+	plAlbum, err := prov.GetAlbum(ctx, "2169850013")
+	if err == nil && plAlbum != nil && len(plAlbum.Tracks) > 5 {
+		for idx, tr := range plAlbum.Tracks {
+			if tr.Title == "Untitled" || tr.Artist == "Unknown Artist" {
+				t.Errorf("track %d (ID: %s) was not hydrated: Title=%q Artist=%q", idx+1, tr.ID.String(), tr.Title, tr.Artist)
+			}
+		}
+		t.Logf("Playlist 2169850013 hydrated successfully: %d tracks, all with non-empty titles!", len(plAlbum.Tracks))
+	}
+
 	// 2. Test GetCoverURL on cold cache
 	coverURL := prov.GetCoverURL("sc:tr:238289066", 500)
 	if coverURL == "" {
@@ -123,5 +134,20 @@ func TestSoundCloudArtistAche(t *testing.T) {
 		t.Fatalf("expected at least 1 top track for ache")
 	}
 	t.Logf("ache first top track: Title=%q, Artist=%q", top[0].Title, top[0].Artist)
+}
+
+func TestSoundCloudTrackStream(t *testing.T) {
+	client := NewClient(ClientOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	track, err := client.GetTrack(ctx, "2238515288")
+	if err != nil {
+		t.Fatalf("GetTrack failed: %v", err)
+	}
+	t.Logf("Track: %+v, policy=%s, media=%+v", track.Title, track.Policy, track.Media)
+
+	streamURL, err := client.GetStreamURL(ctx, "2238515288")
+	t.Logf("GetStreamURL result: url=%s, err=%v", streamURL, err)
 }
 

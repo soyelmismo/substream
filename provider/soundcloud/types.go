@@ -36,6 +36,7 @@ type SoundCloudTrack struct {
 	ReleaseDate   string         `json:"release_date"`
 	PlaybackCount int            `json:"playback_count"`
 	LikesCount    int            `json:"likes_count"`
+	Policy        string         `json:"policy"`
 	User          SoundCloudUser `json:"user"`
 	Media         struct {
 		Transcodings []SoundCloudTranscoding `json:"transcodings"`

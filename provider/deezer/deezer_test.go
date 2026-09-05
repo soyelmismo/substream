@@ -187,3 +187,29 @@ func TestDeezerMatchTrackByMetadata(t *testing.T) {
 		t.Errorf("expected duration around 320s, got %d", matched.Duration)
 	}
 }
+
+func TestDeezerMatchTrackByMetadataSnippet(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live test in short mode")
+	}
+
+	prov := New(ClientOptions{})
+	ctx := t.Context()
+
+	// "onderwaterwereld (Z1)" has 30s preview on SoundCloud, but is 73s on Deezer
+	matched, err := prov.MatchTrackByMetadata(ctx, "gladde paling", "onderwaterwereld (Z1)", 30)
+	if err != nil {
+		t.Fatalf("MatchTrackByMetadata snippet failed: %v", err)
+	}
+	if matched == nil {
+		t.Fatalf("expected matched track, got nil")
+	}
+	t.Logf("Matched track: ID=%s Title=%q Artist=%q Duration=%ds", matched.ID.String(), matched.Title, matched.Artist, matched.Duration)
+	if !strings.Contains(strings.ToLower(matched.Title), "onderwaterwereld") {
+		t.Errorf("expected 'onderwaterwereld', got %s", matched.Title)
+	}
+	if matched.Duration < 60 {
+		t.Errorf("expected full duration (>60s), got %d", matched.Duration)
+	}
+}
+

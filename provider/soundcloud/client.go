@@ -326,12 +326,72 @@ func (c *Client) GetUserAlbums(ctx context.Context, userID string, limit int) ([
 	return resp.Collection, nil
 }
 
-// GetPlaylist fetches a playlist/album with its tracks
+// GetTracksBatch fetches full metadata for multiple track IDs in batch
+func (c *Client) GetTracksBatch(ctx context.Context, trackIDs []int64) ([]SoundCloudTrack, error) {
+	if len(trackIDs) == 0 {
+		return nil, nil
+	}
+
+	var allTracks []SoundCloudTrack
+	chunkSize := 50
+	for i := 0; i < len(trackIDs); i += chunkSize {
+		end := i + chunkSize
+		if end > len(trackIDs) {
+			end = len(trackIDs)
+		}
+		chunk := trackIDs[i:end]
+
+		idStrs := make([]string, len(chunk))
+		for j, id := range chunk {
+			idStrs[j] = strconv.FormatInt(id, 10)
+		}
+
+		q := url.Values{}
+		q.Set("ids", strings.Join(idStrs, ","))
+
+		var batch []SoundCloudTrack
+		if err := c.get(ctx, "/tracks", q, &batch); err != nil {
+			return nil, fmt.Errorf("fetch batch tracks: %w", err)
+		}
+		allTracks = append(allTracks, batch...)
+	}
+
+	return allTracks, nil
+}
+
+// GetPlaylist fetches a playlist/album with its tracks, hydrating incomplete track stubs
 func (c *Client) GetPlaylist(ctx context.Context, playlistID string) (*SoundCloudPlaylist, error) {
 	var pl SoundCloudPlaylist
 	if err := c.get(ctx, fmt.Sprintf("/playlists/%s", playlistID), nil, &pl); err != nil {
 		return nil, err
 	}
+
+	// SoundCloud v2 only returns full metadata for the first 5 tracks in playlists.
+	// Subsequent tracks are stubs ({id: ...}) missing title, user, and duration.
+	var missingIDs []int64
+	for _, t := range pl.Tracks {
+		if t.Title == "" && t.ID > 0 {
+			missingIDs = append(missingIDs, t.ID)
+		}
+	}
+
+	if len(missingIDs) > 0 {
+		hydrated, err := c.GetTracksBatch(ctx, missingIDs)
+		if err == nil && len(hydrated) > 0 {
+			trackMap := make(map[int64]SoundCloudTrack, len(hydrated))
+			for _, t := range hydrated {
+				trackMap[t.ID] = t
+			}
+			for i, t := range pl.Tracks {
+				if full, ok := trackMap[t.ID]; ok {
+					pl.Tracks[i] = full
+				}
+			}
+		} else if err != nil {
+			log.Printf("[SOUNDCLOUD] ⚠️ Failed to hydrate %d stub tracks in playlist %s: %v", len(missingIDs), playlistID, err)
+		}
+	}
+
 	return &pl, nil
 }
 

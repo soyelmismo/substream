@@ -183,6 +183,9 @@ func (c *Controller) ServeGetAlbum(r *http.Request) *spec.Response {
 		a.Name = a.Title
 	}
 
+	// Enrich durations and track sources if album is a snippet/preview release (e.g. SoundCloud Go+)
+	c.enrichSnippetAlbum(r.Context(), a)
+
 	// Batch apply user metadata (stars, ratings, play counts) in 3 queries instead of 3*N
 	c.applyTrackStarsBatch(user.ID, a.Tracks)
 	c.applyTrackRatingsBatch(user.ID, a.Tracks)

@@ -383,33 +383,102 @@ func (p *Provider) GetTrackByISRC(ctx context.Context, isrc string) (*spec.Track
 	return p.trackToSpec(t), nil
 }
 
+func cleanMatchString(s string) string {
+	s = strings.ToLower(s)
+	var out strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == ' ' {
+			out.WriteRune(r)
+		} else {
+			out.WriteRune(' ')
+		}
+	}
+	return strings.Join(strings.Fields(out.String()), " ")
+}
+
 // MatchTrackByMetadata matches a track by artist, title, and duration for cross-provider fallback
 func (p *Provider) MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error) {
-	q := fmt.Sprintf("%s %s", strings.TrimSpace(artist), strings.TrimSpace(title))
-	tracks, err := p.SearchTracks(ctx, q, 10, 0)
+	q := strings.TrimSpace(fmt.Sprintf("%s %s", artist, title))
+	tracks, err := p.SearchTracks(ctx, q, 15, 0)
+	if (err != nil || len(tracks) == 0) && title != "" {
+		tracks, err = p.SearchTracks(ctx, title, 15, 0)
+	}
 	if err != nil || len(tracks) == 0 {
 		return nil, fmt.Errorf("no deezer tracks found for %q: %v", q, err)
 	}
 
+	normTargetArtist := cleanMatchString(artist)
+	normTargetTitle := cleanMatchString(title)
+	isSnippet := expectedDuration > 0 && expectedDuration <= 35
+
 	var bestTrack *spec.TrackChild
-	minDiff := 999999
+	bestScore := -1
 
 	for _, t := range tracks {
 		if t == nil {
 			continue
 		}
-		diff := int(math.Abs(float64(t.Duration - expectedDuration)))
-		if expectedDuration == 0 || diff <= 5 {
-			return t, nil
+		normCandArtist := cleanMatchString(t.Artist)
+		normCandTitle := cleanMatchString(t.Title)
+
+		titleMatches := normCandTitle == normTargetTitle ||
+			(normTargetTitle != "" && strings.Contains(normCandTitle, normTargetTitle)) ||
+			(normCandTitle != "" && strings.Contains(normTargetTitle, normCandTitle))
+
+		artistMatches := normCandArtist == normTargetArtist ||
+			(normTargetArtist != "" && strings.Contains(normCandArtist, normTargetArtist)) ||
+			(normCandArtist != "" && strings.Contains(normTargetArtist, normCandArtist)) ||
+			normTargetArtist == ""
+
+		score := 0
+		if titleMatches {
+			score += 50
+			if normCandTitle == normTargetTitle {
+				score += 20
+			}
 		}
-		if diff < minDiff {
-			minDiff = diff
+		if artistMatches {
+			score += 30
+		}
+
+		if isSnippet {
+			// Expected duration is a preview/snippet (e.g. 30s). Full audio (>40s) is desired.
+			if t.Duration >= expectedDuration && titleMatches {
+				score += 40
+				if t.Duration > 40 {
+					score += 10
+				}
+			}
+		} else if expectedDuration > 0 {
+			diff := int(math.Abs(float64(t.Duration - expectedDuration)))
+			if diff <= 5 {
+				score += 40
+			} else if diff <= 12 {
+				score += 25
+			} else if diff <= 25 {
+				score += 10
+			} else if !titleMatches {
+				score -= 20
+			}
+		} else {
+			score += 20 // duration ignored
+		}
+
+		if score > bestScore {
+			bestScore = score
 			bestTrack = t
 		}
 	}
 
-	if minDiff <= 10 && bestTrack != nil {
+	if bestScore >= 50 && bestTrack != nil {
 		return bestTrack, nil
+	}
+
+	if len(tracks) > 0 && tracks[0] != nil {
+		normFirstTitle := cleanMatchString(tracks[0].Title)
+		if normFirstTitle == normTargetTitle || strings.Contains(normFirstTitle, normTargetTitle) {
+			return tracks[0], nil
+		}
 	}
 
 	return nil, fmt.Errorf("no matching Deezer track found for %q with duration %d", q, expectedDuration)
