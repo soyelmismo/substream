@@ -680,8 +680,23 @@ func (db *DB) ToggleDeezerAccount(id int, active bool) error {
 	}).Error
 }
 
+// MarkDeezerAccountAsFree demotes a Deezer account to the Free tier in the DB,
+// disabling it from the paid/lossless rotation.
+func (db *DB) MarkDeezerAccountAsFree(id int) error {
+	return db.Model(&DeezerAccount{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"subscription_type": "FREE",
+		"highest_quality":   "MP3_128",
+		"quality_tier":      QualityTierFree,
+		"is_active":         false,
+		"last_error":        "Subscription degraded to FREE or Lossless expired",
+		"last_validated_at": time.Now(),
+		"updated_at":        time.Now(),
+	}).Error
+}
+
 // DeleteDeezerAccount deletes an account by ID
 func (db *DB) DeleteDeezerAccount(id int) error {
 	return db.Where("id = ?", id).Delete(&DeezerAccount{}).Error
 }
+
 

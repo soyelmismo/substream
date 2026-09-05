@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.senan.xyz/gonic/db"
 	"go.senan.xyz/gonic/internal/media/streamer"
@@ -21,6 +22,7 @@ import (
 // Provider implements provider.MusicProvider for Deezer
 type Provider struct {
 	client *Client
+	worker *BackgroundWorker
 }
 
 // Ensure Provider implements interfaces
@@ -32,8 +34,15 @@ var (
 
 // New creates a new Deezer Provider
 func New(opts ClientOptions) *Provider {
+	client := NewClient(opts)
+	var worker *BackgroundWorker
+	if opts.DB != nil {
+		worker = NewBackgroundWorker(opts.DB, client.Pool(), 1*time.Hour)
+		worker.Start()
+	}
 	return &Provider{
-		client: NewClient(opts),
+		client: client,
+		worker: worker,
 	}
 }
 
@@ -525,4 +534,23 @@ func (p *Provider) SetCacheDir(dir string) {
 func (p *Provider) Client() *Client {
 	return p.client
 }
+
+// StartBackgroundMaintenance starts the periodic account validation worker with a custom interval
+func (p *Provider) StartBackgroundMaintenance(interval time.Duration) {
+	if p.worker != nil {
+		p.worker.Stop()
+	}
+	if p.client != nil && p.client.pool != nil && p.client.pool.db != nil {
+		p.worker = NewBackgroundWorker(p.client.pool.db, p.client.Pool(), interval)
+		p.worker.Start()
+	}
+}
+
+// Close terminates any background workers
+func (p *Provider) Close() {
+	if p.worker != nil {
+		p.worker.Stop()
+	}
+}
+
 

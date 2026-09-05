@@ -270,6 +270,10 @@ func (s *AccountSession) EnsureSession(ctx context.Context) error {
 	}
 	s.Account.UserID = userID
 
+	if s.Account != nil && s.Account.QualityTier >= db.QualityTierLossless && !s.webLossless {
+		return fmt.Errorf("account degraded: WebLossless=false for user %s", s.Account.Username)
+	}
+
 	return nil
 }
 
@@ -454,10 +458,11 @@ func (s *AccountSession) getMediaURLInternal(ctx context.Context, trackToken str
 
 // AccountPool maintains active Deezer subscriber accounts and performs round-robin rotation.
 type AccountPool struct {
-	mu       sync.RWMutex
-	sessions []*AccountSession
-	rrIndex  uint64
-	db       *db.DB
+	mu                sync.RWMutex
+	sessions          []*AccountSession
+	rrIndex           uint64
+	db                *db.DB
+	onAccountDegraded func(accountID int, reason string)
 }
 
 // NewAccountPool creates an empty AccountPool.
@@ -472,6 +477,13 @@ func (p *AccountPool) SetDB(dbc *db.DB) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.db = dbc
+}
+
+// SetAccountDegradedHandler sets a callback invoked when an account is demoted due to degraded subscription.
+func (p *AccountPool) SetAccountDegradedHandler(fn func(accountID int, reason string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onAccountDegraded = fn
 }
 
 // SyncAccounts synchronizes active accounts with the database, preserving alive sessions where possible.
@@ -548,17 +560,25 @@ func (p *AccountPool) MarkError(accountID int, err error) {
 		return
 	}
 	errStr := err.Error()
-	deactivated := false
+	degraded, isFatalAuth, reason := isDeezerSubscriptionDegraded(err, "")
+
+	var degradedHandler func(int, string)
+	deactivated := isFatalAuth
+	demoted := degraded
 
 	p.mu.Lock()
+	degradedHandler = p.onAccountDegraded
 	for _, s := range p.sessions {
 		if s.Account != nil && s.Account.ID == accountID {
 			s.Account.LastError = errStr
 			s.Account.LastValidatedAt = time.Now()
-			// If session permanently expired, deactivate
-			if strings.Contains(errStr, "invalid ARL") || strings.Contains(errStr, "expired") {
+			if isFatalAuth {
 				s.Account.IsActive = false
-				deactivated = true
+			} else if degraded {
+				s.Account.QualityTier = db.QualityTierFree
+				s.Account.SubscriptionType = "FREE"
+				s.Account.HighestQuality = "MP3_128"
+				s.Account.IsActive = false
 			}
 			break
 		}
@@ -567,9 +587,17 @@ func (p *AccountPool) MarkError(accountID int, err error) {
 
 	if p.db != nil {
 		_ = p.db.UpdateDeezerAccountError(accountID, errStr)
-		if deactivated {
+		if demoted {
+			log.Printf("[DEEZER] ⛔ Demoting account id=%d to FREE — reason: %s", accountID, reason)
+			_ = p.db.MarkDeezerAccountAsFree(accountID)
+		} else if deactivated {
+			log.Printf("[DEEZER] ⛔ Deactivating account id=%d — reason: %s", accountID, reason)
 			_ = p.db.ToggleDeezerAccount(accountID, false)
 		}
+	}
+
+	if demoted && degradedHandler != nil {
+		degradedHandler(accountID, reason)
 	}
 }
 

@@ -147,9 +147,8 @@ func (p *StreamFilterProfile) DeriveKey(trackID string) ([]byte, error) {
 // DecryptStream decrypts an encrypted stream according to the profile's parameters.
 // If no profile is configured or block dimensions are zero, it returns ErrStreamFilterNotConfigured.
 func (p *StreamFilterProfile) DecryptStream(dst io.Writer, src io.Reader, trackID string) error {
-	// En el repo público: si no hay perfil configurado en la base de datos, no hace nada:
 	if p == nil || p.ChunkSize == 0 || p.Stride == 0 {
-		return ErrStreamFilterNotConfigured // La lógica está inactiva/neutra
+		return ErrStreamFilterNotConfigured
 	}
 
 	key, err := p.DeriveKey(trackID)
