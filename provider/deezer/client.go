@@ -470,6 +470,9 @@ func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality s
 				// Step A: Get track token via song.getData
 				tokenRes, err := session.GetTrackToken(ctx, track.ID)
 				if err != nil {
+					if ctx.Err() != nil {
+						return "", ctx.Err()
+					}
 					c.pool.MarkError(session.Account.ID, fmt.Errorf("get track token: %w", err))
 					lastErr = err
 					continue
@@ -478,6 +481,9 @@ func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality s
 				// Step B: Get CDN stream URL and format via media.deezer.com/v1/get_url
 				cdnURL, chosenFormat, err := session.GetMediaURL(ctx, tokenRes.Results.TrackToken, quality)
 				if err != nil {
+					if ctx.Err() != nil {
+						return "", ctx.Err()
+					}
 					c.pool.MarkError(session.Account.ID, err)
 					lastErr = fmt.Errorf("account %s get_url: %w", session.Account.Username, err)
 					continue
@@ -498,6 +504,9 @@ func (c *Client) GetStreamURL(ctx context.Context, track *DeezerTrack, quality s
 
 				resp, err := c.httpClient.Do(req)
 				if err != nil {
+					if ctx.Err() != nil {
+						return "", ctx.Err()
+					}
 					c.pool.MarkError(session.Account.ID, fmt.Errorf("fetch CDN: %w", err))
 					lastErr = err
 					continue

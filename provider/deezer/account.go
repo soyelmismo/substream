@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -540,6 +541,10 @@ func (p *AccountPool) GetNextAccount(minTier int) (*AccountSession, error) {
 // MarkError records an error on an account and persists it to the database if available.
 func (p *AccountPool) MarkError(accountID int, err error) {
 	if err == nil {
+		return
+	}
+	// Ignore client-side cancellations (e.g. user skipped song or closed player)
+	if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled") {
 		return
 	}
 	errStr := err.Error()
