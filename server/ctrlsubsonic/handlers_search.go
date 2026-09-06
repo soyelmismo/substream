@@ -62,6 +62,35 @@ func IsMassSyncActive(userID int) bool {
 	return time.Since(session.lastActivity) < syncSessionTimeout
 }
 
+// getProviderPriority returns a quality/reliability weight for a provider.
+// Primary provider always gets top priority (+1000).
+// Lossless Hi-Res providers (Tidal, Qobuz, Deezer) are strictly prioritized over lossy (YT, SC).
+func getProviderPriority(providerID string, isPrimary bool) int {
+	pri := 0
+	if isPrimary {
+		pri += 1000
+	}
+	switch providerID {
+	case "td":
+		pri += 900 // Tidal (Hi-Res / Master FLAC)
+	case "qb":
+		pri += 800 // Qobuz (Studio Hi-Res 24-bit FLAC)
+	case "dz":
+		pri += 700 // Deezer (16-bit Lossless FLAC)
+	case "sp":
+		pri += 500 // Spotify (Standard AAC)
+	case "am":
+		pri += 400 // Amazon
+	case "yt":
+		pri += 200 // YouTube Music (Opus 160k)
+	case "sc":
+		pri += 100 // SoundCloud (MP3 128k)
+	default:
+		pri += 50
+	}
+	return pri
+}
+
 func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 	p := r.Context().Value(CtxParams).(params.Params)
 
@@ -169,7 +198,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 
 		var additionalProvs []provider.MusicProvider
 		if !hasPrefix && c.providers != nil {
-			for _, extraID := range []string{"yt", "sc"} {
+			for _, extraID := range []string{"qb", "dz", "sp", "yt", "sc"} {
 				if c.providers.IsMetadataEnabled(extraID) && (prov == nil || prov.ID() != extraID) {
 					if p, err := c.providers.Get(extraID); err == nil && p != nil {
 						additionalProvs = append(additionalProvs, p)
@@ -205,8 +234,9 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			}
 
 			type fetchedList struct {
-				tracks    []*spec.TrackChild
-				isPrimary bool
+				tracks     []*spec.TrackChild
+				isPrimary  bool
+				providerID string
 			}
 			var listsMu sync.Mutex
 			var fetched []fetchedList
@@ -224,7 +254,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					tData, err := prov.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
 					if err == nil && len(tData) > 0 {
 						listsMu.Lock()
-						fetched = append(fetched, fetchedList{tracks: tData, isPrimary: true})
+						fetched = append(fetched, fetchedList{tracks: tData, isPrimary: true, providerID: prov.ID()})
 						listsMu.Unlock()
 					}
 				}()
@@ -243,7 +273,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					tData, err := p.SearchTracks(r.Context(), searchQuery, songCount, songOffset)
 					if err == nil && len(tData) > 0 {
 						listsMu.Lock()
-						fetched = append(fetched, fetchedList{tracks: tData, isPrimary: false})
+						fetched = append(fetched, fetchedList{tracks: tData, isPrimary: false, providerID: p.ID()})
 						listsMu.Unlock()
 					}
 				}()
@@ -300,6 +330,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				track     *spec.TrackChild
 				score     int
 				isPrimary bool
+				priority  int
 			}
 
 			var allScored []scoredTrack
@@ -311,25 +342,39 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				return t + "|||" + a
 			}
 
+			// Sort fetched lists by provider priority so higher quality sources (Lossless/Primary)
+			// process first into seenKeys, preventing lossy sources from claiming the track key.
+			sort.SliceStable(fetched, func(i, j int) bool {
+				priI := getProviderPriority(fetched[i].providerID, fetched[i].isPrimary)
+				priJ := getProviderPriority(fetched[j].providerID, fetched[j].isPrimary)
+				return priI > priJ
+			})
+
 			for _, fl := range fetched {
+				pri := getProviderPriority(fl.providerID, fl.isPrimary)
 				for _, t := range fl.tracks {
 					if t != nil {
 						k := cleanKey(t.Title, t.Artist)
 						if !seenKeys[k] {
 							seenKeys[k] = true
-							allScored = append(allScored, scoredTrack{track: t, score: scoreTrack(t), isPrimary: fl.isPrimary})
+							allScored = append(allScored, scoredTrack{
+								track:     t,
+								score:     scoreTrack(t),
+								isPrimary: fl.isPrimary,
+								priority:  pri,
+							})
 						}
 					}
 				}
 			}
 
-			// Sort stable: higher score first, if score equal, primary first
+			// Sort stable: higher score first, if score equal, higher provider priority first
 			sort.SliceStable(allScored, func(i, j int) bool {
 				if allScored[i].score != allScored[j].score {
 					return allScored[i].score > allScored[j].score
 				}
-				if allScored[i].isPrimary != allScored[j].isPrimary {
-					return allScored[i].isPrimary
+				if allScored[i].priority != allScored[j].priority {
+					return allScored[i].priority > allScored[j].priority
 				}
 				return false
 			})
@@ -356,7 +401,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				artistsCh <- nil
 				return
 			}
-			var allArtists []*spec.Artist
+			type artistEntry struct {
+				artist   *spec.Artist
+				priority int
+			}
+			var allArtists []artistEntry
 			var aMu sync.Mutex
 			var aWg sync.WaitGroup
 
@@ -366,7 +415,12 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					defer aWg.Done()
 					if aData, err := prov.SearchArtists(r.Context(), searchQuery, artistCount, artistOffset); err == nil {
 						aMu.Lock()
-						allArtists = append(allArtists, aData...)
+						pri := getProviderPriority(prov.ID(), true)
+						for _, a := range aData {
+							if a != nil {
+								allArtists = append(allArtists, artistEntry{artist: a, priority: pri})
+							}
+						}
 						aMu.Unlock()
 					}
 				}()
@@ -379,7 +433,12 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					defer aWg.Done()
 					if aData, err := p.SearchArtists(r.Context(), searchQuery, artistCount, artistOffset); err == nil {
 						aMu.Lock()
-						allArtists = append(allArtists, aData...)
+						pri := getProviderPriority(p.ID(), false)
+						for _, a := range aData {
+							if a != nil {
+								allArtists = append(allArtists, artistEntry{artist: a, priority: pri})
+							}
+						}
 						aMu.Unlock()
 					}
 				}()
@@ -387,14 +446,19 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 
 			aWg.Wait()
 
+			// Sort by provider priority (Lossless / Primary first) so deduplication prefers higher quality
+			sort.SliceStable(allArtists, func(i, j int) bool {
+				return allArtists[i].priority > allArtists[j].priority
+			})
+
 			seenArtists := make(map[string]bool)
 			var out []spec.Artist
-			for _, a := range allArtists {
-				if a != nil {
-					normName := strings.ToLower(strings.TrimSpace(a.Name))
+			for _, ae := range allArtists {
+				if ae.artist != nil {
+					normName := strings.ToLower(strings.TrimSpace(ae.artist.Name))
 					if !seenArtists[normName] {
 						seenArtists[normName] = true
-						out = append(out, *a)
+						out = append(out, *ae.artist)
 						if len(out) >= artistCount {
 							break
 						}
@@ -415,7 +479,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 				albumsCh <- nil
 				return
 			}
-			var allAlbums []*spec.Album
+			type albumEntry struct {
+				album    *spec.Album
+				priority int
+			}
+			var allAlbums []albumEntry
 			var alMu sync.Mutex
 			var alWg sync.WaitGroup
 
@@ -425,7 +493,12 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					defer alWg.Done()
 					if alData, err := prov.SearchAlbums(r.Context(), searchQuery, albumCount, albumOffset); err == nil {
 						alMu.Lock()
-						allAlbums = append(allAlbums, alData...)
+						pri := getProviderPriority(prov.ID(), true)
+						for _, al := range alData {
+							if al != nil {
+								allAlbums = append(allAlbums, albumEntry{album: al, priority: pri})
+							}
+						}
 						alMu.Unlock()
 					}
 				}()
@@ -438,7 +511,12 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 					defer alWg.Done()
 					if alData, err := p.SearchAlbums(r.Context(), searchQuery, albumCount, albumOffset); err == nil {
 						alMu.Lock()
-						allAlbums = append(allAlbums, alData...)
+						pri := getProviderPriority(p.ID(), false)
+						for _, al := range alData {
+							if al != nil {
+								allAlbums = append(allAlbums, albumEntry{album: al, priority: pri})
+							}
+						}
 						alMu.Unlock()
 					}
 				}()
@@ -446,14 +524,19 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 
 			alWg.Wait()
 
+			// Sort by provider priority (Lossless / Primary first) so deduplication prefers higher quality
+			sort.SliceStable(allAlbums, func(i, j int) bool {
+				return allAlbums[i].priority > allAlbums[j].priority
+			})
+
 			seenAlbums := make(map[string]bool)
 			var out []spec.Album
-			for _, al := range allAlbums {
-				if al != nil {
-					normKey := strings.ToLower(strings.TrimSpace(al.Name)) + "|||" + strings.ToLower(strings.TrimSpace(al.Artist))
+			for _, ae := range allAlbums {
+				if ae.album != nil {
+					normKey := strings.ToLower(strings.TrimSpace(ae.album.Name)) + "|||" + strings.ToLower(strings.TrimSpace(ae.album.Artist))
 					if !seenAlbums[normKey] {
 						seenAlbums[normKey] = true
-						out = append(out, *al)
+						out = append(out, *ae.album)
 						if len(out) >= albumCount {
 							break
 						}
