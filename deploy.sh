@@ -52,8 +52,12 @@ if [ -z "${REMOTE_ARCH}" ]; then
 fi
 
 # 1. Local Build
-echo -e "\n${BLUE}[1/4] Building for Linux ${REMOTE_ARCH}...${NC}"
-GOOS=linux GOARCH="${REMOTE_ARCH}" go build -o substream_linux ./cmd/substream
+echo -e "\n${BLUE}[1/4] Building for Linux ${REMOTE_ARCH} (with CGO SQLite support)...${NC}"
+if [ "${REMOTE_ARCH}" == "arm64" ]; then
+    CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 go build -o substream_linux ./cmd/substream
+else
+    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o substream_linux ./cmd/substream
+fi
 echo -e "${GREEN}✅ Build successful (${REMOTE_ARCH})!${NC}"
 
 # 2. Prepare Remote Server

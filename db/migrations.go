@@ -179,14 +179,14 @@ func migratePlaysTable(tx *gorm.DB) error {
 // This is necessary because SQLite doesn't support DROP COLUMN
 func dropPlaysTidalIDColumn(tx *gorm.DB) error {
 	// Check if tidal_id column exists
-	var count int
-	err := tx.Raw(`
-		SELECT COUNT(*) FROM pragma_table_info('plays') WHERE name = 'tidal_id'
-	`).Scan(&count).Error
+	var cols []struct {
+		Name string
+	}
+	err := tx.Raw(`SELECT name FROM pragma_table_info('plays') WHERE name = 'tidal_id'`).Scan(&cols).Error
 	if err != nil {
 		return fmt.Errorf("check tidal_id column exists: %w", err)
 	}
-	if count == 0 {
+	if len(cols) == 0 {
 		// Column doesn't exist, nothing to do
 		return nil
 	}
@@ -265,9 +265,11 @@ func migrateBookmarksTable(tx *gorm.DB) error {
 
 // dropBookmarksTidalIDColumn recreates the bookmarks table without tidal_id
 func dropBookmarksTidalIDColumn(tx *gorm.DB) error {
-	var count int
-	err := tx.Raw(`SELECT COUNT(*) FROM pragma_table_info('bookmarks') WHERE name = 'tidal_id'`).Scan(&count).Error
-	if err != nil || count == 0 {
+	var cols []struct {
+		Name string
+	}
+	err := tx.Raw(`SELECT name FROM pragma_table_info('bookmarks') WHERE name = 'tidal_id'`).Scan(&cols).Error
+	if err != nil || len(cols) == 0 {
 		return nil
 	}
 
