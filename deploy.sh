@@ -40,10 +40,21 @@ echo -e "${GREEN}#################################################${NC}"
 echo -e "${GREEN}#      Substream 🌊 Automatic Deploy System     #${NC}"
 echo -e "${GREEN}#################################################${NC}"
 
+# Detect target architecture
+REMOTE_ARCH="${TARGET_ARCH:-}"
+if [ -z "${REMOTE_ARCH}" ]; then
+    DETECTED=$(ssh -o ConnectTimeout=3 -p "${SSH_PORT}" "${REMOTE}" "uname -m" 2>/dev/null || echo "")
+    if [[ "${DETECTED}" == "aarch64" || "${DETECTED}" == "arm64" ]]; then
+        REMOTE_ARCH="arm64"
+    else
+        REMOTE_ARCH="amd64"
+    fi
+fi
+
 # 1. Local Build
-echo -e "\n${BLUE}[1/4] Building for Linux amd64...${NC}"
-GOOS=linux GOARCH=amd64 go build -o substream_linux ./cmd/substream
-echo -e "${GREEN}✅ Build successful!${NC}"
+echo -e "\n${BLUE}[1/4] Building for Linux ${REMOTE_ARCH}...${NC}"
+GOOS=linux GOARCH="${REMOTE_ARCH}" go build -o substream_linux ./cmd/substream
+echo -e "${GREEN}✅ Build successful (${REMOTE_ARCH})!${NC}"
 
 # 2. Prepare Remote Server
 echo -e "\n${BLUE}[2/4] Preparing Remote Server...${NC}"
