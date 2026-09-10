@@ -163,6 +163,8 @@ func (c *Controller) ServeScrobble(r *http.Request) *spec.Response {
 				log.Printf("[SCROBBLE] Updated album %d stats: play_count=%d", track.Album.ID, albumStar.PlayCount)
 			}
 		}
+
+		c.invalidateUserPreferences(user.ID)
 	}
 
 	// fetch track info for scrobbling across all providers (fire and forget if fails)

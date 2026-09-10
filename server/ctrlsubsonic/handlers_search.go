@@ -556,11 +556,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			var stars []db.TrackStar
 			c.dbc.Where("user_id = ? AND (fallback_title LIKE ? OR fallback_artist LIKE ?)", user.ID, q, q).Limit(20).Find(&stars)
 			if len(stars) > 0 {
-				ids := make([]int, len(stars))
+				uris := make([]string, len(stars))
 				for i, s := range stars {
-					ids[i] = extractIDFromURI(s.URI)
+					uris[i] = s.URI
 				}
-				favTracks = c.batchFetchTracks(r, ids)
+				favTracks = c.batchFetchTracksByURIs(r, uris)
 			}
 		}
 
@@ -752,8 +752,7 @@ func (c *Controller) searchVirtualLibrary(r *http.Request) *spec.Response {
 		if end > len(trackURIs) {
 			end = len(trackURIs)
 		}
-		trackIDs := extractIDsFromURIs(trackURIs[songOffset:end])
-		tracks := c.batchFetchTracks(r, trackIDs)
+		tracks := c.batchFetchTracksByURIs(r, trackURIs[songOffset:end])
 		for _, t := range tracks {
 			results.Tracks = append(results.Tracks, t)
 		}
@@ -1000,43 +999,77 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 
 	starFn := func(id specid.ID) {
 		uri := id.String()
+		provID := id.Provider()
+		if provID == "" {
+			provID = "td"
+		}
+
 		switch id.Type() {
 		case specid.Track:
 			var s db.TrackStar
 			if c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&s).RecordNotFound() {
-				if t, err := c.proxy.GetTrackInfo(r.Context(), id.Value()); err == nil {
-					s = db.TrackStar{UserID: user.ID, URI: uri, Provider: "tidal", FallbackArtist: t.Artist.Name, FallbackTitle: t.Title}
-				} else {
-					s = db.TrackStar{UserID: user.ID, URI: uri, Provider: "tidal"}
+				s = db.TrackStar{UserID: user.ID, URI: uri, Provider: provID}
+				if prov, err := c.providers.Get(provID); err == nil && prov != nil {
+					if t, err := prov.GetTrack(r.Context(), id.RawID()); err == nil && t != nil {
+						s.FallbackArtist = t.Artist
+						s.FallbackTitle = t.Title
+						if len(t.ISRC) > 0 {
+							s.ISRC = t.ISRC[0]
+						}
+					}
+				} else if provID == "td" {
+					if t, err := c.proxy.GetTrackInfo(r.Context(), id.Value()); err == nil && t != nil {
+						s.FallbackArtist = t.Artist.Name
+						s.FallbackTitle = t.Title
+						s.ISRC = t.ISRC
+					}
 				}
 				c.dbc.Create(&s)
-				c.hydrateTrackBackground(id.Value())
+				if provID == "td" && id.Value() > 0 {
+					c.hydrateTrackBackground(id.Value())
+				}
 			}
 		case specid.Album:
 			var s db.AlbumStar
 			if c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&s).RecordNotFound() {
-				if t, err := c.proxy.GetAlbumInfo(r.Context(), id.Value()); err == nil {
-					artistName := ""
-					if len(t.Artists) > 0 {
-						artistName = t.Artists[0].Name
+				s = db.AlbumStar{UserID: user.ID, URI: uri}
+				if prov, err := c.providers.Get(provID); err == nil && prov != nil {
+					if a, err := prov.GetAlbum(r.Context(), id.RawID()); err == nil && a != nil {
+						s.FallbackArtist = a.Artist
+						s.FallbackTitle = a.Title
 					}
-					s = db.AlbumStar{UserID: user.ID, URI: uri, FallbackArtist: artistName, FallbackTitle: t.Title}
-				} else {
-					s = db.AlbumStar{UserID: user.ID, URI: uri}
+				} else if provID == "td" {
+					if t, err := c.proxy.GetAlbumInfo(r.Context(), id.Value()); err == nil && t != nil {
+						artistName := ""
+						if len(t.Artists) > 0 {
+							artistName = t.Artists[0].Name
+						}
+						s.FallbackArtist = artistName
+						s.FallbackTitle = t.Title
+					}
 				}
 				c.dbc.Create(&s)
-				c.hydrateAlbumBackground(id.Value())
+				if provID == "td" && id.Value() > 0 {
+					c.hydrateAlbumBackground(id.Value())
+				}
 			}
 		case specid.Artist:
 			var s db.ArtistStar
 			if c.dbc.Where("user_id=? AND uri=?", user.ID, uri).First(&s).RecordNotFound() {
-				if t, err := c.proxy.GetArtistInfo(r.Context(), id.Value()); err == nil {
-					s = db.ArtistStar{UserID: user.ID, URI: uri, FallbackName: t.Artist.Name}
-				} else {
-					s = db.ArtistStar{UserID: user.ID, URI: uri}
+				s = db.ArtistStar{UserID: user.ID, URI: uri}
+				if prov, err := c.providers.Get(provID); err == nil && prov != nil {
+					if a, err := prov.GetArtist(r.Context(), id.RawID()); err == nil && a != nil {
+						s.FallbackName = a.Name
+					}
+				} else if provID == "td" {
+					if t, err := c.proxy.GetArtistInfo(r.Context(), id.Value()); err == nil && t != nil {
+						s.FallbackName = t.Artist.Name
+					}
 				}
 				c.dbc.Create(&s)
-				c.hydrateArtistBackground(id.Value())
+				if provID == "td" && id.Value() > 0 {
+					c.hydrateArtistBackground(id.Value())
+				}
 			}
 		}
 	}
@@ -1056,6 +1089,8 @@ func (c *Controller) ServeStar(r *http.Request) *spec.Response {
 			starFn(id)
 		}
 	}
+
+	c.invalidateUserPreferences(user.ID)
 
 	return spec.NewResponse()
 }
@@ -1089,6 +1124,8 @@ func (c *Controller) ServeUnstar(r *http.Request) *spec.Response {
 			c.dbc.Where("user_id=? AND uri=?", user.ID, uri).Delete(&db.ArtistStar{})
 		}
 	}
+
+	c.invalidateUserPreferences(user.ID)
 
 	return spec.NewResponse()
 }
@@ -1132,6 +1169,8 @@ func (c *Controller) ServeSetRating(r *http.Request) *spec.Response {
 		}
 	}
 
+	c.invalidateUserPreferences(user.ID)
+
 	return spec.NewResponse()
 }
 
@@ -1144,36 +1183,83 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	var trackStars []db.TrackStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&trackStars)
 
-	trackIDs := make([]int, len(trackStars))
+	uris := make([]string, len(trackStars))
 	for i, s := range trackStars {
-		trackIDs[i] = extractIDFromURI(s.URI)
+		uris[i] = s.URI
 	}
-	tracks := c.batchFetchTracks(r, trackIDs)
+	tracks := c.batchFetchTracksByURIs(r, uris)
 
+	fetchedURIs := make(map[string]bool, len(tracks))
 	for _, tc := range tracks {
-		results.Tracks = append(results.Tracks, tc)
+		if tc != nil && tc.ID != nil {
+			fetchedURIs[tc.ID.String()] = true
+			results.Tracks = append(results.Tracks, tc)
+		}
+	}
+
+	// Fallback: If any starred tracks failed to fetch from upstream provider,
+	// synthesize a fallback track so user never loses their starred list
+	for _, s := range trackStars {
+		if !fetchedURIs[s.URI] && s.FallbackTitle != "" {
+			trackID, err := specid.New(s.URI)
+			if err == nil {
+				date := s.StarDate
+				results.Tracks = append(results.Tracks, &spec.TrackChild{
+					ID:      &trackID,
+					Title:   s.FallbackTitle,
+					Artist:  s.FallbackArtist,
+					Starred: &date,
+				})
+			}
+		}
 	}
 
 	// starred albums
 	var albumStars []db.AlbumStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&albumStars)
-	albumIDs := make([]int, len(albumStars))
-	for i, s := range albumStars {
-		albumIDs[i] = extractIDFromURI(s.URI)
+	var tidalAlbumIDs []int
+	for _, s := range albumStars {
+		id, err := specid.New(s.URI)
+		if err == nil && (id.Provider() == "td" || id.Provider() == "") {
+			tidalAlbumIDs = append(tidalAlbumIDs, id.Value())
+		} else if err == nil && id.Provider() != "" {
+			if prov, errProv := c.providers.Get(id.Provider()); errProv == nil && prov != nil {
+				if a, errA := prov.GetAlbum(r.Context(), id.RawID()); errA == nil && a != nil {
+					c.applyAlbumStar(user.ID, a)
+					results.Albums = append(results.Albums, a)
+				}
+			}
+		}
 	}
-	results.Albums = c.batchFetchAlbums(r, albumIDs)
+	if len(tidalAlbumIDs) > 0 {
+		results.Albums = append(results.Albums, c.batchFetchAlbums(r, tidalAlbumIDs)...)
+	}
 
 	// starred artists
 	var artistStars []db.ArtistStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&artistStars)
-	artistIDs := make([]int, len(artistStars))
-	for i, s := range artistStars {
-		artistIDs[i] = extractIDFromURI(s.URI)
+	var tidalArtistIDs []int
+	for _, s := range artistStars {
+		id, err := specid.New(s.URI)
+		if err == nil && (id.Provider() == "td" || id.Provider() == "") {
+			tidalArtistIDs = append(tidalArtistIDs, id.Value())
+		} else if err == nil && id.Provider() != "" {
+			if prov, errProv := c.providers.Get(id.Provider()); errProv == nil && prov != nil {
+				if a, errA := prov.GetArtist(r.Context(), id.RawID()); errA == nil && a != nil {
+					c.applyArtistStar(user.ID, a)
+					if a.AlbumCount > 0 {
+						results.Artists = append(results.Artists, a)
+					}
+				}
+			}
+		}
 	}
-	artists := c.batchFetchArtists(r, artistIDs)
-	for _, a := range artists {
-		if a.AlbumCount > 0 {
-			results.Artists = append(results.Artists, a)
+	if len(tidalArtistIDs) > 0 {
+		artists := c.batchFetchArtists(r, tidalArtistIDs)
+		for _, a := range artists {
+			if a.AlbumCount > 0 {
+				results.Artists = append(results.Artists, a)
+			}
 		}
 	}
 

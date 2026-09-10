@@ -705,6 +705,12 @@ func (c *Controller) getUserPreferences(userID int) *userPreferences {
 	return c.userPrefsCache.Get(key)
 }
 
+// invalidateUserPreferences clears the cached preferences for a user, forcing a reload on next access
+func (c *Controller) invalidateUserPreferences(userID int) {
+	key := fmt.Sprintf("%d", userID)
+	c.userPrefsCache.Delete(key)
+}
+
 // withWarmUserPrefs is a middleware that warms user preferences after authentication
 // This ensures any authenticated endpoint gets snappy L3 cache performance
 func (c *Controller) withWarmUserPrefs() handlerutil.Middleware {

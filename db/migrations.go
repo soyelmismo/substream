@@ -667,6 +667,106 @@ func MigrateSubsonicPassword(db *gorm.DB) error {
 	return nil
 }
 
+// MigrateFixStarTables ensures star tables have (user_id, uri) primary key without old tidal_id column
+func MigrateFixStarTables(db *gorm.DB) error {
+	var setting Setting
+	err := db.Where("key = ?", "fix_star_tables_pk_completed").First(&setting).Error
+	if err == nil && setting.Value == "true" {
+		return nil
+	}
+
+	// Check if tidal_id column exists in track_stars table
+	var cols []struct {
+		Name string
+	}
+	err = db.Raw(`SELECT name FROM pragma_table_info('track_stars') WHERE name = 'tidal_id'`).Scan(&cols).Error
+	if err != nil || len(cols) == 0 {
+		_ = db.Exec(`INSERT INTO settings (key, value) VALUES ('fix_star_tables_pk_completed', 'true') ON CONFLICT(key) DO UPDATE SET value = 'true'`).Error
+		return nil
+	}
+
+	log.Printf("[MIGRATION] Recreating star tables with (user_id, uri) PRIMARY KEY...")
+
+	if err := db.Exec(`PRAGMA foreign_keys = OFF`).Error; err != nil {
+		return err
+	}
+	defer db.Exec(`PRAGMA foreign_keys = ON`)
+
+	steps := []string{
+		// 1. track_stars
+		`CREATE TABLE track_stars_new (
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			uri TEXT NOT NULL,
+			provider VARCHAR(255) DEFAULT 'tidal',
+			isrc VARCHAR(255),
+			fallback_artist VARCHAR(255),
+			fallback_title VARCHAR(255),
+			star_date DATETIME DEFAULT current_timestamp,
+			PRIMARY KEY (user_id, uri)
+		)`,
+		`INSERT OR IGNORE INTO track_stars_new (user_id, uri, provider, isrc, fallback_artist, fallback_title, star_date)
+		 SELECT user_id, uri, 
+		   CASE 
+		     WHEN uri LIKE 'sc:%' THEN 'soundcloud'
+		     WHEN uri LIKE 'sp:%' THEN 'spotify'
+		     WHEN uri LIKE 'dz:%' THEN 'deezer'
+		     WHEN uri LIKE 'qb:%' THEN 'qobuz'
+		     WHEN uri LIKE 'yt:%' THEN 'ytmusic'
+		     ELSE COALESCE(provider, 'tidal')
+		   END,
+		   isrc, fallback_artist, fallback_title, star_date 
+		 FROM track_stars WHERE uri IS NOT NULL AND uri != ''`,
+		`DROP TABLE track_stars`,
+		`ALTER TABLE track_stars_new RENAME TO track_stars`,
+		`CREATE INDEX idx_track_star_uri ON track_stars(uri)`,
+		`CREATE INDEX idx_track_star_isrc ON track_stars(isrc)`,
+		`CREATE INDEX idx_track_star_provider ON track_stars(provider)`,
+
+		// 2. album_stars
+		`CREATE TABLE album_stars_new (
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			uri TEXT NOT NULL,
+			fallback_artist TEXT,
+			fallback_title TEXT,
+			star_date DATETIME DEFAULT current_timestamp,
+			last_played DATETIME DEFAULT NULL,
+			play_count INTEGER DEFAULT 0,
+			PRIMARY KEY (user_id, uri)
+		)`,
+		`INSERT OR IGNORE INTO album_stars_new (user_id, uri, fallback_artist, fallback_title, star_date, last_played, play_count)
+		 SELECT user_id, uri, fallback_artist, fallback_title, star_date, last_played, play_count 
+		 FROM album_stars WHERE uri IS NOT NULL AND uri != ''`,
+		`DROP TABLE album_stars`,
+		`ALTER TABLE album_stars_new RENAME TO album_stars`,
+		`CREATE INDEX idx_album_star_uri ON album_stars(uri)`,
+
+		// 3. artist_stars
+		`CREATE TABLE artist_stars_new (
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			uri TEXT NOT NULL,
+			fallback_name TEXT,
+			star_date DATETIME DEFAULT current_timestamp,
+			PRIMARY KEY (user_id, uri)
+		)`,
+		`INSERT OR IGNORE INTO artist_stars_new (user_id, uri, fallback_name, star_date)
+		 SELECT user_id, uri, fallback_name, star_date 
+		 FROM artist_stars WHERE uri IS NOT NULL AND uri != ''`,
+		`DROP TABLE artist_stars`,
+		`ALTER TABLE artist_stars_new RENAME TO artist_stars`,
+		`CREATE INDEX idx_artist_star_uri ON artist_stars(uri)`,
+	}
+
+	for _, step := range steps {
+		if err := db.Exec(step).Error; err != nil {
+			return fmt.Errorf("recreate star tables step failed: %w (SQL: %s)", err, step)
+		}
+	}
+
+	_ = db.Exec(`INSERT INTO settings (key, value) VALUES ('fix_star_tables_pk_completed', 'true') ON CONFLICT(key) DO UPDATE SET value = 'true'`).Error
+	log.Printf("[MIGRATION] Successfully recreated star tables with (user_id, uri) PRIMARY KEY")
+	return nil
+}
+
 func (db *DB) Migrate() error {
 	// Ensure settings table exists for storing migration flags
 	_ = db.Exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").Error
@@ -714,6 +814,11 @@ func (db *DB) Migrate() error {
 	// Add fallback columns to stars for search optimization
 	if err := MigrateAddFallbackColumnsToStars(db.DB); err != nil {
 		log.Printf("[MIGRATION] Fallback columns migration warning: %v", err)
+	}
+
+	// Fix star tables primary key to (user_id, uri) and drop legacy tidal_id column
+	if err := MigrateFixStarTables(db.DB); err != nil {
+		log.Printf("[MIGRATION] Star tables PK fix warning: %v", err)
 	}
 
 	return db.AutoMigrate(
