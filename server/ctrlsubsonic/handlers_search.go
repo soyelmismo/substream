@@ -568,11 +568,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			var stars []db.AlbumStar
 			c.dbc.Where("user_id = ? AND (fallback_title LIKE ? OR fallback_artist LIKE ?)", user.ID, q, q).Limit(20).Find(&stars)
 			if len(stars) > 0 {
-				ids := make([]int, len(stars))
+				uris := make([]string, len(stars))
 				for i, s := range stars {
-					ids[i] = extractIDFromURI(s.URI)
+					uris[i] = s.URI
 				}
-				favAlbums = c.batchFetchAlbums(r, ids)
+				favAlbums = c.batchFetchAlbumsByURIs(r, uris)
 			}
 		}
 
@@ -580,11 +580,11 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 			var stars []db.ArtistStar
 			c.dbc.Where("user_id = ? AND fallback_name LIKE ?", user.ID, q).Limit(20).Find(&stars)
 			if len(stars) > 0 {
-				ids := make([]int, len(stars))
+				uris := make([]string, len(stars))
 				for i, s := range stars {
-					ids[i] = extractIDFromURI(s.URI)
+					uris[i] = s.URI
 				}
-				favArtists = c.batchFetchArtists(r, ids)
+				favArtists = c.batchFetchArtistsByURIs(r, uris)
 			}
 		}
 	}
@@ -726,8 +726,7 @@ func (c *Controller) searchVirtualLibrary(r *http.Request) *spec.Response {
 		if end > len(artistURIs) {
 			end = len(artistURIs)
 		}
-		artistIDs := extractIDsFromURIs(artistURIs[artistOffset:end])
-		artists := c.batchFetchArtists(r, artistIDs)
+		artists := c.batchFetchArtistsByURIs(r, artistURIs[artistOffset:end])
 		for _, a := range artists {
 			results.Artists = append(results.Artists, a)
 		}
@@ -739,8 +738,7 @@ func (c *Controller) searchVirtualLibrary(r *http.Request) *spec.Response {
 		if end > len(albumURIs) {
 			end = len(albumURIs)
 		}
-		albumIDs := extractIDsFromURIs(albumURIs[albumOffset:end])
-		albums := c.batchFetchAlbums(r, albumIDs)
+		albums := c.batchFetchAlbumsByURIs(r, albumURIs[albumOffset:end])
 		for _, a := range albums {
 			results.Albums = append(results.Albums, a)
 		}
@@ -1217,51 +1215,20 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	// starred albums
 	var albumStars []db.AlbumStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&albumStars)
-	var tidalAlbumIDs []int
-	for _, s := range albumStars {
-		id, err := specid.New(s.URI)
-		if err == nil && (id.Provider() == "td" || id.Provider() == "") {
-			tidalAlbumIDs = append(tidalAlbumIDs, id.Value())
-		} else if err == nil && id.Provider() != "" {
-			if prov, errProv := c.providers.Get(id.Provider()); errProv == nil && prov != nil {
-				if a, errA := prov.GetAlbum(r.Context(), id.RawID()); errA == nil && a != nil {
-					c.applyAlbumStar(user.ID, a)
-					results.Albums = append(results.Albums, a)
-				}
-			}
-		}
+	albumURIs := make([]string, len(albumStars))
+	for i, s := range albumStars {
+		albumURIs[i] = s.URI
 	}
-	if len(tidalAlbumIDs) > 0 {
-		results.Albums = append(results.Albums, c.batchFetchAlbums(r, tidalAlbumIDs)...)
-	}
+	results.Albums = c.batchFetchAlbumsByURIs(r, albumURIs)
 
 	// starred artists
 	var artistStars []db.ArtistStar
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&artistStars)
-	var tidalArtistIDs []int
-	for _, s := range artistStars {
-		id, err := specid.New(s.URI)
-		if err == nil && (id.Provider() == "td" || id.Provider() == "") {
-			tidalArtistIDs = append(tidalArtistIDs, id.Value())
-		} else if err == nil && id.Provider() != "" {
-			if prov, errProv := c.providers.Get(id.Provider()); errProv == nil && prov != nil {
-				if a, errA := prov.GetArtist(r.Context(), id.RawID()); errA == nil && a != nil {
-					c.applyArtistStar(user.ID, a)
-					if a.AlbumCount > 0 {
-						results.Artists = append(results.Artists, a)
-					}
-				}
-			}
-		}
+	artistURIs := make([]string, len(artistStars))
+	for i, s := range artistStars {
+		artistURIs[i] = s.URI
 	}
-	if len(tidalArtistIDs) > 0 {
-		artists := c.batchFetchArtists(r, tidalArtistIDs)
-		for _, a := range artists {
-			if a.AlbumCount > 0 {
-				results.Artists = append(results.Artists, a)
-			}
-		}
-	}
+	results.Artists = c.batchFetchArtistsByURIs(r, artistURIs)
 
 	sub := spec.NewResponse()
 	sub.StarredTwo = results

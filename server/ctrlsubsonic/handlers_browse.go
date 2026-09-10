@@ -27,9 +27,7 @@ func (c *Controller) ServeGetIndexes(r *http.Request) *spec.Response {
 
 	// Use virtual library: artists from stars + inferred from plays/playlist_tracks
 	artistURIs := c.dbc.GetVirtualLibraryArtistIDs(user.ID)
-	artistIDs := extractIDsFromURIs(artistURIs)
-
-	artists := c.batchFetchArtists(r, artistIDs)
+	artists := c.batchFetchArtistsByURIs(r, artistURIs)
 
 	// Filter out artists with 0 albums to avoid showing empty entries
 	filtered := make([]*spec.Artist, 0, len(artists))
@@ -78,14 +76,12 @@ func (c *Controller) ServeGetArtists(r *http.Request) *spec.Response {
 
 	// Use virtual library: artists from stars + inferred from plays/playlist_tracks
 	artistURIs := c.dbc.GetVirtualLibraryArtistIDs(user.ID)
-	artistIDs := extractIDsFromURIs(artistURIs)
-
-	artists := c.batchFetchArtists(r, artistIDs)
+	artists := c.batchFetchArtistsByURIs(r, artistURIs)
 
 	// [Hydrate] Trigger background hydration for any starred artists found here.
 	// This ensures that even if an artist was just added via cache, their discography is fetched.
 	for _, a := range artists {
-		if a.Starred != nil && a.ID != nil {
+		if a.Starred != nil && a.ID != nil && (a.ID.Provider() == "td" || a.ID.Provider() == "") {
 			c.hydrateArtistBackground(a.ID.Value())
 		}
 	}
@@ -234,7 +230,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		return sub
 	}
 
-	var albumIDs []int
+	var albumURIs []string
 
 	switch listType {
 	case "starred", "newest":
@@ -244,7 +240,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
+			albumURIs = append(albumURIs, s.URI)
 		}
 
 	case "recent":
@@ -255,11 +251,14 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
+			albumURIs = append(albumURIs, s.URI)
 		}
 		// Fallback to hot new releases if less than threshold local albums
-		if len(albumIDs) < hotFallbackThresholdRecent {
-			albumIDs = c.fetchHotFallback(r.Context(), albumIDs, size-len(albumIDs), "new", "recent")
+		if len(albumURIs) < hotFallbackThresholdRecent {
+			fallbackIDs := c.fetchHotFallback(r.Context(), nil, size-len(albumURIs), "new", "recent")
+			for _, id := range fallbackIDs {
+				albumURIs = append(albumURIs, fmt.Sprintf("td:al:%d", id))
+			}
 		}
 
 	case "frequent":
@@ -270,28 +269,26 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
+			albumURIs = append(albumURIs, s.URI)
 		}
 		// Fallback to hot trending if less than threshold local albums
-		if len(albumIDs) < hotFallbackThresholdRecent {
-			albumIDs = c.fetchHotFallback(r.Context(), albumIDs, size-len(albumIDs), "trending", "frequent")
+		if len(albumURIs) < hotFallbackThresholdRecent {
+			fallbackIDs := c.fetchHotFallback(r.Context(), nil, size-len(albumURIs), "trending", "frequent")
+			for _, id := range fallbackIDs {
+				albumURIs = append(albumURIs, fmt.Sprintf("td:al:%d", id))
+			}
 		}
 
 	case "alphabeticalByName", "alphabeticalByArtist":
 		// Use virtual library: albums from stars + inferred from plays/playlist_tracks
-		albumURIs := c.dbc.GetVirtualLibraryAlbumIDs(user.ID)
+		albumURIsList := c.dbc.GetVirtualLibraryAlbumIDs(user.ID)
 
-		if len(albumURIs) == 0 {
+		if len(albumURIsList) == 0 {
 			break
 		}
 
 		// Fetch all album metadata to sort properly
-		allAlbumIDs := extractIDsFromURIs(albumURIs)
-
-		// Use fast fetch with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), hotFetchTimeout)
-		allAlbums := c.batchFetchAlbumsWithContext(ctx, allAlbumIDs)
-		cancel()
+		allAlbums := c.batchFetchAlbumsByURIs(r, albumURIsList)
 
 		// Sort by name or artist
 		if listType == "alphabeticalByName" {
@@ -307,7 +304,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		// Apply offset/limit
 		start := offset
 		if start >= len(allAlbums) {
-			albumIDs = nil
+			albumURIs = nil
 		} else {
 			end := start + size
 			if end > len(allAlbums) {
@@ -315,7 +312,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			}
 			for _, a := range allAlbums[start:end] {
 				if a.ID != nil {
-					albumIDs = append(albumIDs, a.ID.Value())
+					albumURIs = append(albumURIs, a.ID.String())
 				}
 			}
 		}
@@ -328,11 +325,14 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
+			albumURIs = append(albumURIs, s.URI)
 		}
 		// Fallback to hot popular albums if less than threshold local albums
-		if len(albumIDs) < hotFallbackThresholdRandom {
-			albumIDs = c.fetchHotFallback(r.Context(), albumIDs, size-len(albumIDs), "popular", "random")
+		if len(albumURIs) < hotFallbackThresholdRandom {
+			fallbackIDs := c.fetchHotFallback(r.Context(), nil, size-len(albumURIs), "popular", "random")
+			for _, id := range fallbackIDs {
+				albumURIs = append(albumURIs, fmt.Sprintf("td:al:%d", id))
+			}
 		}
 
 	case "highest":
@@ -342,7 +342,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&ratings)
 		for _, r := range ratings {
-			albumIDs = append(albumIDs, extractIDFromURI(r.URI))
+			albumURIs = append(albumURIs, r.URI)
 		}
 
 	case "byYear":
@@ -362,13 +362,11 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		}
 
 		// Fetch album metadata to get years
-		allAlbumIDs := make([]int, len(stars))
+		allURIs := make([]string, len(stars))
 		for i, s := range stars {
-			allAlbumIDs[i] = extractIDFromURI(s.URI)
+			allURIs[i] = s.URI
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), hotFetchTimeout)
-		allAlbums := c.batchFetchAlbumsWithContext(ctx, allAlbumIDs)
-		cancel()
+		allAlbums := c.batchFetchAlbumsByURIs(r, allURIs)
 
 		// Filter by year range
 		var filtered []*spec.Album
@@ -396,7 +394,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			}
 			for _, a := range filtered[start:end] {
 				if a.ID != nil {
-					albumIDs = append(albumIDs, a.ID.Value())
+					albumURIs = append(albumURIs, a.ID.String())
 				}
 			}
 		}
@@ -462,7 +460,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 				// Convert to album IDs
 				for _, a := range albums {
 					if a.ID != 0 {
-						albumIDs = append(albumIDs, a.ID)
+						albumURIs = append(albumURIs, fmt.Sprintf("td:al:%d", a.ID))
 					}
 				}
 			}
@@ -473,7 +471,7 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			if err == nil {
 				for _, a := range albums {
 					if a.ID != 0 {
-						albumIDs = append(albumIDs, a.ID)
+						albumURIs = append(albumURIs, fmt.Sprintf("td:al:%d", a.ID))
 					}
 				}
 			}
@@ -486,12 +484,12 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 			Offset(offset).Limit(size).
 			Find(&stars)
 		for _, s := range stars {
-			albumIDs = append(albumIDs, extractIDFromURI(s.URI))
+			albumURIs = append(albumURIs, s.URI)
 		}
 	}
 
 	// batch fetch album metadata
-	albums := c.batchFetchAlbums(r, albumIDs)
+	albums := c.batchFetchAlbumsByURIs(r, albumURIs)
 
 	sub := spec.NewResponse()
 	sub.AlbumsTwo = &spec.Albums{List: albums}

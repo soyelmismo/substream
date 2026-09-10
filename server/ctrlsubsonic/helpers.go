@@ -121,29 +121,141 @@ func (c *Controller) batchFetchTracksByURIs(r *http.Request, uris []string) []*s
 }
 
 // batchFetchAlbums fetches metadata for multiple tidal album IDs efficiently
-// Uses batch SQLite query (1 query) instead of N individual queries
 func (c *Controller) batchFetchAlbums(r *http.Request, tidalIDs []int) []*spec.Album {
+	uris := make([]string, len(tidalIDs))
+	for i, id := range tidalIDs {
+		uris[i] = fmt.Sprintf("td:al:%d", id)
+	}
+	return c.batchFetchAlbumsByURIs(r, uris)
+}
+
+// batchFetchAlbumsByURIs fetches metadata for multiple album URIs across all providers concurrently
+func (c *Controller) batchFetchAlbumsByURIs(r *http.Request, uris []string) []*spec.Album {
+	if len(uris) == 0 {
+		return nil
+	}
 	user := r.Context().Value(CtxUser).(*db.User)
 	ctx := r.Context()
 
-	// Use batch method: single SQL query + parallel API fallback
-	albumMap := c.proxy.GetAlbumsInfoBatch(ctx, tidalIDs)
-	if albumMap == nil {
-		return nil
-	}
+	results := make([]*spec.Album, len(uris))
 
-	// Convert map to ordered slice
-	results := make([]*spec.Album, 0, len(albumMap))
-	for _, id := range tidalIDs {
-		if info, ok := albumMap[id]; ok {
-			a := NewAlbumFromTidal(info)
-			c.applyAlbumStar(user.ID, a)
-			a.UserRating = c.getAlbumRating(user.ID, fmt.Sprintf("td:al:%d", id))
-			results = append(results, a)
+	type extReq struct {
+		idx    int
+		provID string
+		rawID  string
+		uri    string
+	}
+	var extReqs []extReq
+	var tidalIDs []int
+	tidalIndexMap := make(map[int][]int)
+
+	for i, uri := range uris {
+		id, err := specid.New(uri)
+		if err == nil && (id.Provider() == "td" || id.Provider() == "") && id.Value() > 0 {
+			tid := id.Value()
+			tidalIDs = append(tidalIDs, tid)
+			tidalIndexMap[tid] = append(tidalIndexMap[tid], i)
+		} else if err == nil && id.Provider() != "" {
+			extReqs = append(extReqs, extReq{
+				idx:    i,
+				provID: id.Provider(),
+				rawID:  id.RawID(),
+				uri:    uri,
+			})
 		}
 	}
 
-	return results
+	var wg sync.WaitGroup
+
+	// Fetch Tidal albums in batch (single SQLite query + parallel API fallback)
+	if len(tidalIDs) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			albumMap := c.proxy.GetAlbumsInfoBatch(ctx, tidalIDs)
+			if albumMap != nil {
+				for tid, indices := range tidalIndexMap {
+					if info, ok := albumMap[tid]; ok {
+						for _, idx := range indices {
+							results[idx] = NewAlbumFromTidal(info)
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	// Fetch external provider albums concurrently with semaphore
+	if len(extReqs) > 0 {
+		sem := make(chan struct{}, 10)
+		for _, req := range extReqs {
+			wg.Add(1)
+			go func(item extReq) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				prov, err := c.providers.Get(item.provID)
+				if err == nil && prov != nil {
+					if a, errAlbum := prov.GetAlbum(ctx, item.rawID); errAlbum == nil && a != nil {
+						results[item.idx] = a
+					}
+				}
+			}(req)
+		}
+	}
+
+	wg.Wait()
+
+	// Batch lookup album stars and ratings to avoid N+1 queries
+	var stars []db.AlbumStar
+	c.dbc.Where("user_id = ? AND uri IN (?)", user.ID, uris).Find(&stars)
+	starMap := make(map[string]time.Time, len(stars))
+	starFallbackMap := make(map[string]db.AlbumStar, len(stars))
+	for _, s := range stars {
+		starMap[s.URI] = s.StarDate
+		starFallbackMap[s.URI] = s
+	}
+
+	var ratings []db.AlbumRating
+	c.dbc.Where("user_id = ? AND uri IN (?)", user.ID, uris).Find(&ratings)
+	ratingMap := make(map[string]int, len(ratings))
+	for _, r := range ratings {
+		ratingMap[r.URI] = r.Rating
+	}
+
+	var final []*spec.Album
+	for i, a := range results {
+		uri := uris[i]
+		if a == nil {
+			if fb, ok := starFallbackMap[uri]; ok && fb.FallbackTitle != "" {
+				if id, errID := specid.New(uri); errID == nil {
+					date := fb.StarDate
+					a = &spec.Album{
+						ID:      &id,
+						Name:    fb.FallbackTitle,
+						Title:   fb.FallbackTitle,
+						Album:   fb.FallbackTitle,
+						Artist:  fb.FallbackArtist,
+						Starred: &date,
+					}
+				}
+			}
+		}
+		if a != nil {
+			if a.ID != nil {
+				if starDate, ok := starMap[a.ID.String()]; ok {
+					a.Starred = &starDate
+				}
+				if rVal, ok := ratingMap[a.ID.String()]; ok {
+					a.UserRating = rVal
+				}
+			}
+			final = append(final, a)
+		}
+	}
+
+	return final
 }
 
 // prepareStream centralizes the logic for preparing a stream (quality, IP, URL, meta)
@@ -642,15 +754,135 @@ func (c *Controller) batchFetchAlbumsWithContext(ctx context.Context, tidalIDs [
 
 // batchFetchArtists fetches metadata for multiple tidal artist IDs concurrently
 func (c *Controller) batchFetchArtists(r *http.Request, tidalIDs []int) []*spec.Artist {
+	uris := make([]string, len(tidalIDs))
+	for i, id := range tidalIDs {
+		uris[i] = fmt.Sprintf("td:ar:%d", id)
+	}
+	return c.batchFetchArtistsByURIs(r, uris)
+}
+
+// batchFetchArtistsByURIs fetches metadata for multiple artist URIs across all providers concurrently
+func (c *Controller) batchFetchArtistsByURIs(r *http.Request, uris []string) []*spec.Artist {
+	if len(uris) == 0 {
+		return nil
+	}
 	user := r.Context().Value(CtxUser).(*db.User)
-	return batchFetch(r.Context(), c.proxySem, tidalIDs, func(ctx context.Context, id int) (*tidal.TidalArtistDetail, error) {
-		return c.proxy.GetArtistInfo(ctx, id)
-	}, func(info *tidal.TidalArtistDetail, tid int) *spec.Artist {
-		a := NewArtistFromTidal(&info.Artist)
-		a.AlbumCount = c.proxy.GetArtistAlbumCount(r.Context(), tid)
-		c.applyArtistStar(user.ID, a)
-		return a
-	})
+	ctx := r.Context()
+
+	results := make([]*spec.Artist, len(uris))
+
+	type extReq struct {
+		idx    int
+		provID string
+		rawID  string
+		uri    string
+	}
+	var extReqs []extReq
+	var tidalIDs []int
+	tidalIndexMap := make(map[int][]int)
+
+	for i, uri := range uris {
+		id, err := specid.New(uri)
+		if err == nil && (id.Provider() == "td" || id.Provider() == "") && id.Value() > 0 {
+			tid := id.Value()
+			tidalIDs = append(tidalIDs, tid)
+			tidalIndexMap[tid] = append(tidalIndexMap[tid], i)
+		} else if err == nil && id.Provider() != "" {
+			extReqs = append(extReqs, extReq{
+				idx:    i,
+				provID: id.Provider(),
+				rawID:  id.RawID(),
+				uri:    uri,
+			})
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	// Fetch Tidal artists in batch
+	if len(tidalIDs) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			artists := batchFetch(ctx, c.proxySem, tidalIDs, func(fctx context.Context, id int) (*tidal.TidalArtistDetail, error) {
+				return c.proxy.GetArtistInfo(fctx, id)
+			}, func(info *tidal.TidalArtistDetail, tid int) *spec.Artist {
+				a := NewArtistFromTidal(&info.Artist)
+				a.AlbumCount = c.proxy.GetArtistAlbumCount(ctx, tid)
+				return a
+			})
+			for _, a := range artists {
+				if a != nil && a.ID != nil {
+					for _, idx := range tidalIndexMap[a.ID.Value()] {
+						results[idx] = a
+					}
+				}
+			}
+		}()
+	}
+
+	// Fetch external provider artists concurrently with semaphore
+	if len(extReqs) > 0 {
+		sem := make(chan struct{}, 10)
+		for _, req := range extReqs {
+			wg.Add(1)
+			go func(item extReq) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				prov, err := c.providers.Get(item.provID)
+				if err == nil && prov != nil {
+					if a, errArtist := prov.GetArtist(ctx, item.rawID); errArtist == nil && a != nil {
+						results[item.idx] = a
+					}
+				}
+			}(req)
+		}
+	}
+
+	wg.Wait()
+
+	// Batch lookup artist stars to avoid N+1 queries
+	var stars []db.ArtistStar
+	c.dbc.Where("user_id = ? AND uri IN (?)", user.ID, uris).Find(&stars)
+	starMap := make(map[string]time.Time, len(stars))
+	starFallbackMap := make(map[string]db.ArtistStar, len(stars))
+	for _, s := range stars {
+		starMap[s.URI] = s.StarDate
+		starFallbackMap[s.URI] = s
+	}
+
+	var final []*spec.Artist
+	for i, a := range results {
+		uri := uris[i]
+		if a == nil {
+			if fb, ok := starFallbackMap[uri]; ok && fb.FallbackName != "" {
+				if id, errID := specid.New(uri); errID == nil {
+					date := fb.StarDate
+					a = &spec.Artist{
+						ID:         &id,
+						Name:       fb.FallbackName,
+						Starred:    &date,
+						AlbumCount: 1,
+					}
+				}
+			}
+		}
+		if a != nil {
+			if a.ID != nil {
+				if starDate, ok := starMap[a.ID.String()]; ok {
+					a.Starred = &starDate
+				}
+			}
+			if a.Starred != nil && a.AlbumCount == 0 {
+				a.AlbumCount = 1
+			}
+			final = append(final, a)
+		}
+	}
+
+	return final
 }
 
 // scrobbleTrackFromTidal converts a TidalTrack to a scrobble.Track
