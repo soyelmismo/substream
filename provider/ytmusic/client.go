@@ -32,7 +32,9 @@ ydl_free = yt_dlp.YoutubeDL({
     'quiet': True,
     'no_warnings': True,
     'format': 'ba/b',
-    'extractor_args': {'youtube': {'player_client': ['android_music']}}
+    'remote_components': ['ejs:github'],
+    'js_runtimes': {'node': {}},
+    'extractor_args': {'youtube': {'player_client': ['web_creator', 'web']}}
 })
 print('READY', flush=True)
 
@@ -50,7 +52,10 @@ for line in sys.stdin:
                 'quiet': True,
                 'no_warnings': True,
                 'format': '141/ba/b',
-                'cookiefile': cookie_file
+                'cookiefile': cookie_file,
+                'remote_components': ['ejs:github'],
+                'js_runtimes': {'node': {}},
+                'extractor_args': {'youtube': {'player_client': ['web_creator', 'web']}}
             })
             info = ydl_auth.extract_info(f'https://www.youtube.com/watch?v={vid}', download=False)
             url = info.get('url') or ''
@@ -125,21 +130,29 @@ func NewClient() *Client {
 // SetActiveAccount updates the active cookie file and header for streaming & InnerTube
 func (c *Client) SetActiveAccount(cookieFileContent, cookieHeader string) {
 	c.activeAccountMu.Lock()
-	defer c.activeAccountMu.Unlock()
-
 	c.activeCookieHeader = strings.TrimSpace(cookieHeader)
 
 	if strings.TrimSpace(cookieFileContent) == "" {
 		c.activeCookieFile = ""
-		return
-	}
-
-	tmpFile := "/tmp/substream_yt_active_cookies.txt"
-	if err := os.WriteFile(tmpFile, []byte(cookieFileContent), 0600); err == nil {
-		c.activeCookieFile = tmpFile
 	} else {
-		log.Printf("[YTMUSIC] Failed to write cookie file %s: %v", tmpFile, err)
+		tmpFile := "/tmp/substream_yt_active_cookies.txt"
+		if err := os.WriteFile(tmpFile, []byte(cookieFileContent), 0600); err == nil {
+			c.activeCookieFile = tmpFile
+		} else {
+			log.Printf("[YTMUSIC] Failed to write cookie file %s: %v", tmpFile, err)
+		}
 	}
+	c.activeAccountMu.Unlock()
+
+	// Recycle resident python worker so it picks up the new cookie file cleanly
+	c.workerMu.Lock()
+	if c.workerCmd != nil && c.workerCmd.Process != nil {
+		_ = c.workerCmd.Process.Kill()
+		c.workerCmd = nil
+		c.workerStdin = nil
+		c.workerReader = nil
+	}
+	c.workerMu.Unlock()
 }
 
 func (c *Client) prepareRequest(req *http.Request) {
@@ -1007,12 +1020,15 @@ func (c *Client) resolveViaCLI(ctx context.Context, videoID string) (string, err
 	args := []string{
 		"--no-warnings",
 		"--no-playlist",
+		"--remote-components", "ejs:github",
+		"--js-runtimes", "node",
+		"--extractor-args", "youtube:player_client=web_creator,web",
 	}
 
 	if cookieFile != "" {
 		args = append(args, "--cookies", cookieFile, "-f", "141/ba/b")
 	} else {
-		args = append(args, "--extractor-args", "youtube:player_client=android_music", "-f", "ba/b")
+		args = append(args, "-f", "ba/b")
 	}
 	args = append(args, "-g", targetURL)
 
@@ -1023,7 +1039,9 @@ func (c *Client) resolveViaCLI(ctx context.Context, videoID string) (string, err
 		cmdFree := exec.CommandContext(ctx, "yt-dlp",
 			"--no-warnings",
 			"--no-playlist",
-			"--extractor-args", "youtube:player_client=android_music",
+			"--remote-components", "ejs:github",
+			"--js-runtimes", "node",
+			"--extractor-args", "youtube:player_client=web_creator,web",
 			"-f", "ba/b",
 			"-g", targetURL,
 		)
