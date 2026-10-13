@@ -14,11 +14,11 @@ import (
 	"time"
 
 	"go.senan.xyz/gonic/db"
+	"go.senan.xyz/gonic/provider/tidal"
 	"go.senan.xyz/gonic/scrobble"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
-	"go.senan.xyz/gonic/provider/tidal"
 )
 
 // streamRequest bundle for unified stream preparation
@@ -353,6 +353,17 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							url = fbURL
 						}
 					}
+					if url == "" && c.providers.IsAudioEnabled("qb") && fallbackProvID != "qb" {
+						if qbProv, err := c.providers.Get("qb"); err == nil && qbProv != nil {
+							if matcher, ok := qbProv.(interface {
+								MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+							}); ok {
+								if matched, mErr := matcher.MatchTrackByMetadata(ctx, t.Artist, t.Title, t.Duration); mErr == nil && matched != nil && matched.ID != nil {
+									url, urlErr = qbProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP)
+								}
+							}
+						}
+					}
 					if url == "" && c.providers.IsAudioEnabled("td") && fallbackProvID != "td" {
 						if tdProv, err := c.providers.Get("td"); err == nil && tdProv != nil {
 							if matcher, ok := tdProv.(interface {
@@ -480,12 +491,16 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 						continue
 					}
 					if altProv := c.getProvider(altID.Provider()); altProv != nil {
+						// Clamp the memorized tier to what the provider can actually deliver: a lossy
+						// source (YouTube/SoundCloud/Spotify) must never be trusted as lossless just
+						// because a past fallback stored it that way, or it pre-empts Qobuz/Tidal.
+						altTier := db.EffectiveQualityTier(alt.Provider, alt.QualityTier)
 						// If this alternative source is Lossless (or no lossless providers are active), resolve and use immediately
-						if alt.QualityTier >= db.QualityTierLossless || !hasLosslessProviders {
+						if altTier >= db.QualityTierLossless || !hasLosslessProviders {
 							if altURL, altErr := altProv.GetStreamURL(ctx, altID.RawID(), quality, clientIP); altErr == nil && altURL != "" {
 								altIsPreview := strings.Contains(altURL, "range=20-30") || strings.Contains(altURL, "range=0-30") || strings.Contains(altURL, "preview")
 								if !altIsPreview {
-									log.Printf("[STREAM] 🔄 Rescuing stream via mapped lossless track_source %s (Quality: %d)", alt.URI, alt.QualityTier)
+									log.Printf("[STREAM] 🔄 Rescuing stream via mapped lossless track_source %s (Quality: %d)", alt.URI, altTier)
 									url = altURL
 									urlErr = nil
 									isSamplePreview = false
@@ -495,7 +510,7 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							}
 						} else if lastResortAlt == nil {
 							// If it's lossy (e.g. YouTube tier 30), save as last resort WITHOUT wasting seconds resolving upfront!
-							log.Printf("[STREAM] 💡 Saved lossy mapped track_source %s (Quality: %d) as last resort to prioritize Lossless FLAC", alt.URI, alt.QualityTier)
+							log.Printf("[STREAM] 💡 Saved lossy mapped track_source %s (Quality: %d) as last resort to prioritize Lossless FLAC", alt.URI, altTier)
 							altCopy := alt
 							lastResortAlt = &altCopy
 						}
@@ -521,13 +536,54 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 				if c.dbc != nil && track != nil && fallbackID != nil {
 					clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
 					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-						db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
-						db.TrackSource{ClusterKey: clusterKey, Provider: fallbackProv.ID(), URI: fallbackID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierLossless), IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: fallbackProv.ID(), URI: fallbackID.String(), QualityTier: db.EffectiveQualityTier(fallbackProv.ID(), db.QualityTierLossless), IsAvailable: true},
 					)
 				}
 			}
 		} else {
 			log.Printf("[STREAM] Cross-provider ISRC fallback failed for %s (ISRC: %s): %v", id.String(), track.ISRC, err)
+		}
+	}
+
+	// 2.5. Universal Fallback to Qobuz if stream still failed or missing (Priority: Hi-Res 24-bit / Lossless FLAC)
+	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("qb") && track != nil && id.Provider() != "qb" {
+		if qbProv, err := c.providers.Get("qb"); err == nil && qbProv != nil {
+			if matcher, ok := qbProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if matched, mErr := matcher.MatchTrackByMetadata(ctx, track.Artist.Name, track.Title, track.Duration); mErr == nil && matched != nil && matched.ID != nil {
+					log.Printf("[STREAM] 🚀 Universal fallback to Qobuz for %s (%s - %s) -> %s", id.String(), track.Artist.Name, track.Title, matched.ID.RawID())
+					if qbURL, qbErr := qbProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP); qbErr == nil && qbURL != "" {
+						qbIsPreview := strings.Contains(qbURL, "range=20-30") || strings.Contains(qbURL, "range=0-30") || strings.Contains(qbURL, "preview")
+						if !qbIsPreview {
+							url = qbURL
+							urlErr = nil
+							isSamplePreview = false
+							needsFallback = false
+							if matched.Duration > 0 && (track.Duration <= 35 || matched.Duration > track.Duration) {
+								track.Duration = matched.Duration
+							}
+
+							// Memorize cross-provider link in track_sources
+							if c.dbc != nil && track != nil {
+								clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+								qbURI := fmt.Sprintf("qb:tr:%s", matched.ID.RawID())
+								_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierHiRes), IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: "qb", URI: qbURI, QualityTier: db.QualityTierHiRes, IsAvailable: true},
+								)
+							}
+						} else {
+							log.Printf("[STREAM] ⚠️ Qobuz returned preview snippet for %s (check account subscription status)", matched.ID.RawID())
+						}
+					} else if qbErr != nil {
+						log.Printf("[STREAM] ⚠️ Qobuz GetStreamURL failed for %s: %v", matched.ID.RawID(), qbErr)
+					}
+				} else if mErr != nil {
+					log.Printf("[STREAM] ⚠️ Qobuz metadata match failed for %s (%s - %s): %v", id.String(), track.Artist.Name, track.Title, mErr)
+				}
+			}
 		}
 	}
 
@@ -555,8 +611,8 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 								clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
 								tdURI := fmt.Sprintf("td:tr:%s", matched.ID.RawID())
 								_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
-									db.TrackSource{ClusterKey: clusterKey, Provider: "td", URI: tdURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierLossless), IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: "td", URI: tdURI, QualityTier: db.EffectiveQualityTier("td", db.QualityTierLossless), IsAvailable: true},
 								)
 							}
 						}
@@ -590,8 +646,8 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 								clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
 								dzURI := fmt.Sprintf("dz:tr:%s", matched.ID.RawID())
 								_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
-									db.TrackSource{ClusterKey: clusterKey, Provider: "dz", URI: dzURI, QualityTier: db.QualityTierLossless, IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierLossless), IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: "dz", URI: dzURI, QualityTier: db.EffectiveQualityTier("dz", db.QualityTierLossless), IsAvailable: true},
 								)
 							}
 						}
@@ -621,8 +677,8 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 								clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
 								spURI := fmt.Sprintf("sp:tr:%s", matched.ID.RawID())
 								_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
-									db.TrackSource{ClusterKey: clusterKey, Provider: "sp", URI: spURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierLossless), IsAvailable: true},
+									db.TrackSource{ClusterKey: clusterKey, Provider: "sp", URI: spURI, QualityTier: db.EffectiveQualityTier("sp", db.QualityTierLossless), IsAvailable: true},
 								)
 							}
 						}
@@ -650,8 +706,8 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
 							ytURI := fmt.Sprintf("yt:tr:%s", matched.ID.RawID())
 							_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-								db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
-								db.TrackSource{ClusterKey: clusterKey, Provider: "yt", URI: ytURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+								db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierLossless), IsAvailable: true},
+								db.TrackSource{ClusterKey: clusterKey, Provider: "yt", URI: ytURI, QualityTier: db.EffectiveQualityTier("yt", db.QualityTierLossless), IsAvailable: true},
 							)
 						}
 					}
@@ -678,8 +734,8 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 							clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
 							scURI := fmt.Sprintf("sc:tr:%s", matched.ID.RawID())
 							_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
-								db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
-								db.TrackSource{ClusterKey: clusterKey, Provider: "sc", URI: scURI, QualityTier: db.QualityTierStandard, IsAvailable: true},
+								db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierLossless), IsAvailable: true},
+								db.TrackSource{ClusterKey: clusterKey, Provider: "sc", URI: scURI, QualityTier: db.EffectiveQualityTier("sc", db.QualityTierLossless), IsAvailable: true},
 							)
 						}
 					}
@@ -1313,7 +1369,7 @@ func (c *Controller) enrichTracksFromFullAlbum(targetAlbum, fullAlbum *spec.Albu
 					clusterKey := db.MakeClusterKey("", targetAlbum.Tracks[i].Artist, targetAlbum.Tracks[i].Title)
 					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
 						db.TrackSource{ClusterKey: clusterKey, Provider: targetProv, URI: targetAlbum.Tracks[i].ID.String(), QualityTier: targetTier, IsAvailable: true},
-						db.TrackSource{ClusterKey: clusterKey, Provider: fullAlbum.Tracks[i].ID.Provider(), URI: fullAlbum.Tracks[i].ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: fullAlbum.Tracks[i].ID.Provider(), URI: fullAlbum.Tracks[i].ID.String(), QualityTier: db.EffectiveQualityTier(fullAlbum.Tracks[i].ID.Provider(), db.QualityTierLossless), IsAvailable: true},
 					)
 				}
 			}
@@ -1351,7 +1407,7 @@ func (c *Controller) enrichTracksFromFullAlbum(targetAlbum, fullAlbum *spec.Albu
 					clusterKey := db.MakeClusterKey("", targetTrack.Artist, targetTrack.Title)
 					_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
 						db.TrackSource{ClusterKey: clusterKey, Provider: targetProv, URI: targetTrack.ID.String(), QualityTier: targetTier, IsAvailable: true},
-						db.TrackSource{ClusterKey: clusterKey, Provider: fullTrack.ID.Provider(), URI: fullTrack.ID.String(), QualityTier: db.QualityTierLossless, IsAvailable: true},
+						db.TrackSource{ClusterKey: clusterKey, Provider: fullTrack.ID.Provider(), URI: fullTrack.ID.String(), QualityTier: db.EffectiveQualityTier(fullTrack.ID.Provider(), db.QualityTierLossless), IsAvailable: true},
 					)
 				}
 				break
@@ -1363,4 +1419,3 @@ func (c *Controller) enrichTracksFromFullAlbum(targetAlbum, fullAlbum *spec.Albu
 		targetAlbum.Duration = totalDur
 	}
 }
-

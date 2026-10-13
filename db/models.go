@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"time"
 )
 
@@ -226,6 +227,33 @@ const (
 	QualityTierStandard = 30  // Standard Streaming (160kbps Opus - YouTube Music)
 	QualityTierFree     = 10  // Free / Preview-only account (no full-track playback)
 )
+
+// MaxQualityTierForProvider returns the best fidelity a provider can physically deliver.
+// Cross-provider fallbacks used to memorize every mapped source as QualityTierLossless,
+// which made lossy sources (YouTube, SoundCloud, Spotify) look like FLAC and let the
+// 0 ms mapped-source fast path serve them forever, skipping Qobuz/Tidal/Deezer entirely.
+func MaxQualityTierForProvider(provider string) int {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "qb", "td", "dz", "am":
+		return QualityTierHiRes
+	case "sp":
+		return QualityTierHigh
+	case "yt", "sc":
+		return QualityTierStandard
+	default:
+		return QualityTierStandard
+	}
+}
+
+// EffectiveQualityTier clamps a stored quality tier to what its provider can deliver.
+// Read track_sources tiers through this helper: rows written by older versions (or by a
+// mis-matched fallback) can claim lossless for a lossy provider.
+func EffectiveQualityTier(provider string, storedTier int) int {
+	if maxTier := MaxQualityTierForProvider(provider); storedTier > maxTier {
+		return maxTier
+	}
+	return storedTier
+}
 
 // TrackSource represents a specific provider audio source for a canonical song cluster.
 // Enables infinite provider scalability, zero-migration additions, and dynamic quality fallback.

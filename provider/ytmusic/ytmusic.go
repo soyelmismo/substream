@@ -14,14 +14,18 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
 
-// Provider implements provider.MusicProvider and provider.ISRCResolver for YouTube Music
+// Provider implements provider.MusicProvider for YouTube Music.
+// NOTE: it deliberately does NOT implement provider.ISRCResolver. YouTube Music's search
+// engine does not index ISRCs: querying it with a bare ISRC returns an arbitrary list of
+// unrelated popular songs, and taking the first one poisoned track_sources with unrelated
+// videos (e.g. a 3-hour live stream memorized as the "lossless" source of another track).
+// Cross-provider matching for YouTube must always go through MatchTrackByMetadata.
 type Provider struct {
 	client *Client
 }
 
-// Ensure Provider implements provider.MusicProvider and provider.ISRCResolver
+// Ensure Provider implements provider.MusicProvider
 var _ provider.MusicProvider = (*Provider)(nil)
-var _ provider.ISRCResolver = (*Provider)(nil)
 
 // New creates a new YouTube Music Provider
 func New() *Provider {
@@ -441,22 +445,16 @@ func (p *Provider) GetRecommendations(ctx context.Context, trackRawID string) ([
 	return res, nil
 }
 
-// GetTrackByISRC attempts to find an official track on YouTube Music using ISRC or metadata
-func (p *Provider) GetTrackByISRC(ctx context.Context, isrc string) (*spec.TrackChild, error) {
-	if strings.TrimSpace(isrc) == "" {
-		return nil, fmt.Errorf("empty isrc")
-	}
+// ytDurationToleranceSeconds is the maximum allowed difference between the requested track
+// duration and a YouTube Music candidate for it to be considered the same recording.
+const ytDurationToleranceSeconds = 4
 
-	// Search by ISRC
-	tracks, err := p.client.SearchTracks(ctx, isrc, 5)
-	if err == nil && len(tracks) > 0 {
-		return p.trackToSpec(tracks[0]), nil
-	}
-
-	return nil, fmt.Errorf("no track found on YouTube Music for ISRC %s", isrc)
-}
-
-// MatchTrackByMetadata searches YouTube Music for "{artist} {title}" and validates duration match
+// MatchTrackByMetadata searches YouTube Music for "{artist} {title}" and only accepts a
+// candidate that plausibly IS the requested track: artist/title must match and, when the
+// candidate exposes a duration, it must be within ytDurationToleranceSeconds.
+// Candidates with a known-but-mismatching duration (1-hour loops, 10-hour versions, slowed
+// re-uploads, live streams) are rejected. When nothing is trustworthy we return an error
+// instead of guessing, so the caller can try another provider rather than play wrong audio.
 func (p *Provider) MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error) {
 	query := fmt.Sprintf("%s %s", strings.TrimSpace(artist), strings.TrimSpace(title))
 	tracks, err := p.client.SearchTracks(ctx, query, 5)
@@ -468,22 +466,108 @@ func (p *Provider) MatchTrackByMetadata(ctx context.Context, artist, title strin
 		return nil, fmt.Errorf("no tracks found on YouTube Music for %q", query)
 	}
 
-	// Select best candidate matching duration (within +- 4 seconds)
+	var best *YTTrack // metadata match + duration verified
+	bestDiff := 0
+	var unverified *YTTrack // metadata match, duration not exposed by the search result
+
 	for _, t := range tracks {
-		if expectedDuration <= 0 {
-			return p.trackToSpec(t), nil
+		if t == nil || t.VideoID == "" {
+			continue
+		}
+		if !sameTrackMetadata(artist, title, t) {
+			log.Printf("[YTMUSIC] ⚠️ Ignoring unrelated result for %q by %q: %q by %q (%s)",
+				title, artist, t.Title, t.Artist, t.VideoID)
+			continue
+		}
+		if expectedDuration <= 0 || t.Duration <= 0 {
+			if unverified == nil {
+				unverified = t
+			}
+			continue
 		}
 		diff := t.Duration - expectedDuration
 		if diff < 0 {
 			diff = -diff
 		}
-		if diff <= 4 {
-			log.Printf("[YTMUSIC] ✅ Matched track %q by %q with YouTube Music video %s (duration diff: %ds)", title, artist, t.VideoID, diff)
-			return p.trackToSpec(t), nil
+		if diff > ytDurationToleranceSeconds {
+			log.Printf("[YTMUSIC] ⚠️ Rejecting %s for %q by %q: duration %ds does not match expected %ds",
+				t.VideoID, title, artist, t.Duration, expectedDuration)
+			continue
+		}
+		if best == nil || diff < bestDiff {
+			best, bestDiff = t, diff
 		}
 	}
 
-	// If no exact duration match, return the top candidate
-	log.Printf("[YTMUSIC] ⚠️ Fallback to top YouTube Music result for %q by %q: %s", title, artist, tracks[0].VideoID)
-	return p.trackToSpec(tracks[0]), nil
+	if best != nil {
+		log.Printf("[YTMUSIC] ✅ Matched track %q by %q with YouTube Music video %s (duration diff: %ds)",
+			title, artist, best.VideoID, bestDiff)
+		return p.trackToSpec(best), nil
+	}
+
+	// Song results often omit the duration, so accept a metadata match - but verify the real
+	// duration first, otherwise a 1-hour loop with a matching title slips through.
+	if unverified != nil && expectedDuration > 0 {
+		if enriched, err := p.client.GetTrack(ctx, unverified.VideoID); err == nil && enriched != nil && enriched.Duration > 0 {
+			diff := enriched.Duration - expectedDuration
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > ytDurationToleranceSeconds {
+				log.Printf("[YTMUSIC] ⚠️ Rejecting %s for %q by %q: real duration %ds does not match expected %ds",
+					unverified.VideoID, title, artist, enriched.Duration, expectedDuration)
+				unverified = nil
+			}
+		}
+	}
+
+	if unverified != nil {
+		log.Printf("[YTMUSIC] ✅ Matched track %q by %q with YouTube Music video %s (metadata match)",
+			title, artist, unverified.VideoID)
+		return p.trackToSpec(unverified), nil
+	}
+
+	log.Printf("[YTMUSIC] ❌ No trustworthy YouTube Music match for %q by %q (expected %ds); refusing to guess",
+		title, artist, expectedDuration)
+	return nil, fmt.Errorf("no trustworthy YouTube Music match for %q by %q", title, artist)
+}
+
+// sameTrackMetadata reports whether a YouTube Music candidate is plausibly the requested
+// recording. YouTube search returns unrelated songs for weak queries, so this gate is what
+// keeps wrong audio out of the cross-provider fallback chain.
+func sameTrackMetadata(artist, title string, t *YTTrack) bool {
+	wantTitle := normalizeMatchText(title)
+	gotTitle := normalizeMatchText(t.Title)
+	if wantTitle == "" || gotTitle == "" {
+		return false
+	}
+	if !strings.Contains(gotTitle, wantTitle) && !strings.Contains(wantTitle, gotTitle) {
+		return false
+	}
+
+	wantArtist := normalizeMatchText(artist)
+	gotArtist := normalizeMatchText(t.Artist)
+	// Placeholders the parser leaves behind when YouTube exposes no real artist.
+	switch gotArtist {
+	case "song", "video", "topic", "unknownartist":
+		return false
+	}
+	// Names that normalize to nothing (non-Latin scripts, missing metadata) can't be
+	// compared: fall back to requiring an exact title match instead of a loose one.
+	if wantArtist == "" || gotArtist == "" {
+		return gotTitle == wantTitle
+	}
+	return strings.Contains(gotArtist, wantArtist) || strings.Contains(wantArtist, gotArtist)
+}
+
+// normalizeMatchText lowercases and strips everything but [a-z0-9] so that
+// "HOME - Resonance", "Home-Resonance" and "home resonance" compare equal.
+func normalizeMatchText(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
