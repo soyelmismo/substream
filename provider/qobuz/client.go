@@ -164,6 +164,18 @@ func (c *Client) SyncAccounts(accounts []*db.QobuzAccount) {
 	}
 }
 
+// SetCredentials updates the application ID and application secret dynamically
+func (c *Client) SetCredentials(appID, appSecret string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if appID != "" {
+		c.appID = appID
+	}
+	if appSecret != "" {
+		c.appSecret = appSecret
+	}
+}
+
 // SetDB updates the database reference on the pool
 func (c *Client) SetDB(dbc *db.DB) {
 	if c.pool != nil {
@@ -173,6 +185,10 @@ func (c *Client) SetDB(dbc *db.DB) {
 
 // qobuzRequestSignature computes the MD5 request signature expected by Qobuz API
 func (c *Client) qobuzRequestSignature(endpoint string, params url.Values, ts string) string {
+	c.mu.RLock()
+	secret := c.appSecret
+	c.mu.RUnlock()
+
 	normalizedPath := strings.ReplaceAll(strings.TrimPrefix(endpoint, "/"), "/", "")
 	var keys []string
 	for k := range params {
@@ -191,7 +207,7 @@ func (c *Client) qobuzRequestSignature(endpoint string, params url.Values, ts st
 		}
 	}
 	sb.WriteString(ts)
-	sb.WriteString(c.appSecret)
+	sb.WriteString(secret)
 
 	hash := md5.Sum([]byte(sb.String()))
 	return hex.EncodeToString(hash[:])
@@ -206,11 +222,24 @@ func (c *Client) doSignedRequest(ctx context.Context, endpoint string, params ur
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := c.qobuzRequestSignature(endpoint, params, ts)
 
-	params.Set("app_id", c.appID)
+	c.mu.RLock()
+	appID := c.appID
+	var token string
+	if c.pool != nil && c.pool.Count() > 0 {
+		if session, err := c.pool.GetNextAccount(db.QualityTierFree); err == nil && session != nil && session.Account != nil {
+			token = session.Account.UserAuthToken
+		}
+	}
+	if token == "" {
+		token = c.userAuthToken
+	}
+	c.mu.RUnlock()
+
+	params.Set("app_id", appID)
 	params.Set("request_ts", ts)
 	params.Set("request_sig", sig)
-	if c.userAuthToken != "" {
-		params.Set("user_auth_token", c.userAuthToken)
+	if token != "" {
+		params.Set("user_auth_token", token)
 	}
 
 	reqURL := fmt.Sprintf("%s/%s?%s", c.baseURL, strings.TrimPrefix(endpoint, "/"), params.Encode())
@@ -221,9 +250,9 @@ func (c *Client) doSignedRequest(ctx context.Context, endpoint string, params ur
 
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-App-Id", c.appID)
-	if c.userAuthToken != "" {
-		req.Header.Set("X-User-Auth-Token", c.userAuthToken)
+	req.Header.Set("X-App-Id", appID)
+	if token != "" {
+		req.Header.Set("X-User-Auth-Token", token)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -335,9 +364,9 @@ func (c *Client) SearchByISRC(ctx context.Context, isrc string) (*QobuzTrack, er
 	if err != nil {
 		return nil, err
 	}
-	for _, t := range tracks {
-		if strings.EqualFold(t.ISRC, isrc) {
-			return &t, nil
+	for i := range tracks {
+		if strings.EqualFold(tracks[i].ISRC, isrc) {
+			return &tracks[i], nil
 		}
 	}
 	if len(tracks) > 0 {
@@ -423,7 +452,11 @@ func (c *Client) fetchStreamURLWithToken(ctx context.Context, trackID int64, for
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := c.qobuzRequestSignature("track/getFileUrl", params, ts)
 
-	params.Set("app_id", c.appID)
+	c.mu.RLock()
+	appID := c.appID
+	c.mu.RUnlock()
+
+	params.Set("app_id", appID)
 	params.Set("user_auth_token", token)
 	params.Set("request_ts", ts)
 	params.Set("request_sig", sig)
@@ -436,7 +469,7 @@ func (c *Client) fetchStreamURLWithToken(ctx context.Context, trackID int64, for
 
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-App-Id", c.appID)
+	req.Header.Set("X-App-Id", appID)
 	req.Header.Set("X-User-Auth-Token", token)
 
 	resp, err := c.httpClient.Do(req)

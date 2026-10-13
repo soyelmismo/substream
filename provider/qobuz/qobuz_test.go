@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -113,3 +114,21 @@ func TestLiveQobuzGetStreamURL(t *testing.T) {
 	}
 	t.Logf("Successfully acquired raw FLAC stream URL: %s", url)
 }
+
+func TestQobuzMatchTrackByMetadataSweetTrip(t *testing.T) {
+	prov := New(ClientOptions{})
+	ctx := context.Background()
+
+	matched, err := prov.MatchTrackByMetadata(ctx, "Sweet Trip", "Conservation of Two", 180)
+	if err != nil {
+		t.Fatalf("MatchTrackByMetadata failed: %v", err)
+	}
+	if matched == nil {
+		t.Fatalf("expected matched track, got nil")
+	}
+	t.Logf("Matched track: Title=%q, Artist=%q, ID=%s", matched.Title, matched.Artist, matched.ID.String())
+	if !strings.EqualFold(matched.Title, "Conservation of Two") {
+		t.Errorf("expected title 'Conservation of Two', got %q", matched.Title)
+	}
+}
+

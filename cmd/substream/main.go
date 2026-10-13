@@ -143,9 +143,17 @@ func main() {
 	providers.Register(tidalProvider)
 
 	// 2. Qobuz Provider (Hi-Res Lossless FLAC)
+	qobuzAppID := *confQobuzAppID
+	if qobuzAppID == "" {
+		qobuzAppID = dbc.GetSetting("qobuz.app_id", "")
+	}
+	qobuzAppSecret := *confQobuzAppSecret
+	if qobuzAppSecret == "" {
+		qobuzAppSecret = dbc.GetSetting("qobuz.app_secret", "")
+	}
 	qobuzProvider := qobuz.New(qobuz.ClientOptions{
-		AppID:         *confQobuzAppID,
-		AppSecret:     *confQobuzAppSecret,
+		AppID:         qobuzAppID,
+		AppSecret:     qobuzAppSecret,
 		UserAuthToken: *confQobuzToken,
 		CustomURL:     *confQobuzURL,
 		DB:            dbc,

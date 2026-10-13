@@ -2166,6 +2166,13 @@ func (c *Controller) ServeQobuzAddAccountDo(r *http.Request) *Response {
 	appID := strings.TrimSpace(r.FormValue("app_id"))
 	appSecret := strings.TrimSpace(r.FormValue("app_secret"))
 
+	if appID == "" {
+		appID = c.dbc.GetSetting("qobuz.app_id", "")
+	}
+	if appSecret == "" {
+		appSecret = c.dbc.GetSetting("qobuz.app_secret", "")
+	}
+
 	if appID == "" || appSecret == "" {
 		if c.providers != nil {
 			if p, err := c.providers.Get("qb"); err == nil && p != nil {
@@ -2185,6 +2192,25 @@ func (c *Controller) ServeQobuzAddAccountDo(r *http.Request) *Response {
 	if err != nil {
 		log.Printf("[AUDIT] Failed Qobuz token validation: %v", err)
 		return &Response{redirect: "/admin/qobuz_accounts", flashW: []string{fmt.Sprintf("Qobuz token validation failed: %v", err)}}
+	}
+
+	// Persist and apply dynamic App ID / App Secret if explicitly provided in this form
+	customAppID := strings.TrimSpace(r.FormValue("app_id"))
+	customAppSecret := strings.TrimSpace(r.FormValue("app_secret"))
+	if customAppID != "" {
+		_ = c.dbc.SetSetting("qobuz.app_id", customAppID)
+	}
+	if customAppSecret != "" {
+		_ = c.dbc.SetSetting("qobuz.app_secret", customAppSecret)
+	}
+	if customAppID != "" || customAppSecret != "" {
+		if c.providers != nil {
+			if p, err := c.providers.Get("qb"); err == nil && p != nil {
+				if qbp, ok := p.(*qobuz.Provider); ok {
+					qbp.SetCredentials(customAppID, customAppSecret)
+				}
+			}
+		}
 	}
 
 	qualityLabel := info.HighestQuality

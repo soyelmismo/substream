@@ -3,6 +3,7 @@ package qobuz
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -19,8 +20,11 @@ type Provider struct {
 	worker *BackgroundWorker
 }
 
-// Ensure Provider implements provider.MusicProvider
-var _ provider.MusicProvider = (*Provider)(nil)
+// Ensure Provider implements provider.MusicProvider and provider.ISRCResolver
+var (
+	_ provider.MusicProvider = (*Provider)(nil)
+	_ provider.ISRCResolver  = (*Provider)(nil)
+)
 
 // New creates a new Qobuz Provider
 func New(opts ClientOptions) *Provider {
@@ -236,8 +240,8 @@ func (p *Provider) SearchTracks(ctx context.Context, query string, limit, offset
 		return nil, err
 	}
 	res := make([]*spec.TrackChild, 0, len(items))
-	for _, t := range items {
-		res = append(res, p.trackToSpec(&t))
+	for i := range items {
+		res = append(res, p.trackToSpec(&items[i]))
 	}
 	return res, nil
 }
@@ -366,8 +370,110 @@ func (p *Provider) Close() {
 	}
 }
 
+// SetCredentials updates the application ID and application secret dynamically
+func (p *Provider) SetCredentials(appID, appSecret string) {
+	if p.client != nil {
+		p.client.SetCredentials(appID, appSecret)
+	}
+	if p.worker != nil {
+		p.worker.appID = appID
+		p.worker.appSecret = appSecret
+	}
+}
+
 // Client returns the underlying Qobuz client
 func (p *Provider) Client() *Client {
 	return p.client
 }
+
+func cleanMatchString(s string) string {
+	s = strings.ToLower(s)
+	var out strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == ' ' {
+			out.WriteRune(r)
+		} else {
+			out.WriteRune(' ')
+		}
+	}
+	return strings.Join(strings.Fields(out.String()), " ")
+}
+
+// MatchTrackByMetadata matches a track by artist, title, and duration for cross-provider fallback
+func (p *Provider) MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error) {
+	q := strings.TrimSpace(fmt.Sprintf("%s %s", artist, title))
+	tracks, err := p.SearchTracks(ctx, q, 15, 0)
+	if (err != nil || len(tracks) == 0) && title != "" {
+		tracks, err = p.SearchTracks(ctx, title, 15, 0)
+	}
+	if err != nil || len(tracks) == 0 {
+		return nil, fmt.Errorf("no qobuz tracks found for %q: %v", q, err)
+	}
+
+	normTargetArtist := cleanMatchString(artist)
+	normTargetTitle := cleanMatchString(title)
+	isSnippet := expectedDuration > 0 && expectedDuration <= 35
+
+	var bestTrack *spec.TrackChild
+	bestScore := -1
+
+	for _, t := range tracks {
+		if t == nil {
+			continue
+		}
+		normCandArtist := cleanMatchString(t.Artist)
+		normCandTitle := cleanMatchString(t.Title)
+
+		titleMatches := normCandTitle == normTargetTitle ||
+			(normTargetTitle != "" && strings.Contains(normCandTitle, normTargetTitle)) ||
+			(normCandTitle != "" && strings.Contains(normTargetTitle, normCandTitle))
+
+		artistMatches := normCandArtist == normTargetArtist ||
+			(normTargetArtist != "" && strings.Contains(normCandArtist, normTargetArtist)) ||
+			(normCandArtist != "" && strings.Contains(normTargetArtist, normCandArtist)) ||
+			normTargetArtist == ""
+
+		score := 0
+		if titleMatches {
+			score += 50
+			if normCandTitle == normTargetTitle {
+				score += 20
+			}
+		}
+		if artistMatches {
+			score += 30
+		}
+
+		if expectedDuration > 0 && t.Duration > 0 {
+			diff := t.Duration - expectedDuration
+			if diff < 0 {
+				diff = -diff
+			}
+			if isSnippet {
+				score += 20
+			} else if diff <= 3 {
+				score += 40
+			} else if diff <= 8 {
+				score += 25
+			} else if diff <= 15 {
+				score += 10
+			} else if diff > 30 {
+				score -= 30
+			}
+		}
+
+		if score > bestScore {
+			bestScore = score
+			bestTrack = t
+		}
+	}
+
+	if bestTrack == nil || bestScore < 40 {
+		return nil, fmt.Errorf("no suitable qobuz match for %q by %q (best score %d)", title, artist, bestScore)
+	}
+
+	log.Printf("[QOBUZ] ✅ Matched track %q by %q with Qobuz track %s (score %d)", title, artist, bestTrack.ID.RawID(), bestScore)
+	return bestTrack, nil
+}
+
 
