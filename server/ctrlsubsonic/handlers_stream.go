@@ -19,6 +19,8 @@ import (
 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
 )
 
+const defaultStreamUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
 // isExoPlayerClient returns true for Android ExoPlayer-based clients (Tempus, Symfonium, DSub)
 // that require a synthesized sidx box and byte ranges to enable and operate the seek bar.
 func isExoPlayerClient(clientName string) bool {
@@ -210,8 +212,15 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// [GAPLESS] Capture successful prep for deduplication cache
 	streamPrep = prep
 
-	// [Safety] Add 10-minute timeout for stream operations to prevent indefinite hangs
-	streamCtx, streamCancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	// [Safety] Set streaming timeout based on track duration (or default 2 hours) to avoid premature termination of long tracks
+	timeoutDuration := 2 * time.Hour
+	if prep.Track != nil && prep.Track.Duration > 0 {
+		dur := time.Duration(prep.Track.Duration)*time.Second + 30*time.Minute
+		if dur > timeoutDuration {
+			timeoutDuration = dur
+		}
+	}
+	streamCtx, streamCancel := context.WithTimeout(r.Context(), timeoutDuration)
 	defer streamCancel()
 
 	// 1. Ingest metadata for virtual library
@@ -269,7 +278,8 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	isDataURL := strings.HasPrefix(streamURL, "data:")
 	needsStitch := prep.IsHLS || isDataURL
 	isYT := id.Provider() == "yt" || strings.Contains(streamURL, "googlevideo.com")
-	needsProxy := proxyStreams == "true" || isYT
+	isSupersonic := strings.ToLower(prep.ClientName) == "supersonic"
+	needsProxy := proxyStreams == "true" || isYT || isSupersonic
 	if !needsProxy && !needsStitch {
 		urlPreview := streamURL
 		if len(urlPreview) > 100 {
@@ -453,9 +463,9 @@ func (c *Controller) ServeHLS(w http.ResponseWriter, r *http.Request) *spec.Resp
 		return nil
 	}
 
-	// Progressive audio stream (YouTube Music, direct FLAC, MP3, etc.):
+	// Progressive audio stream (Qobuz Studio FLAC, YouTube Music, direct FLAC, MP3, etc.):
 	// Synthesize a valid RFC 8216 single-segment M3U8 playlist pointing to the server's /stream.
-	// This satisfies MPV (Supersonic) and other HLS-capable clients without error.
+	// This satisfies MPV (Supersonic) and other HLS-capable clients, enabling seamless gapless playback.
 	duration := 300.0
 	if prep.Track != nil && prep.Track.Duration > 0 {
 		duration = float64(prep.Track.Duration)
@@ -498,11 +508,12 @@ func (c *Controller) proxyDirectStream(ctx context.Context, w http.ResponseWrite
 		req.Header.Set("Range", rangeHdr)
 	}
 
-	// Set client IP for Tidal's geo-locking
-	if prep.ClientIP != "" {
+	// Set client IP for Tidal's geo-locking (never forward client IP to YouTube/googlevideo)
+	if prep.ClientIP != "" && !strings.Contains(prep.StreamURL, "googlevideo.com") {
 		req.Header.Set("X-Forwarded-For", prep.ClientIP)
 		req.Header.Set("X-Real-IP", prep.ClientIP)
 	}
+	req.Header.Set("User-Agent", defaultStreamUserAgent)
 
 	// Retry logic for transient failures
 	const maxRetries = 3
@@ -522,10 +533,11 @@ func (c *Controller) proxyDirectStream(ctx context.Context, w http.ResponseWrite
 			if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
 				req.Header.Set("Range", rangeHdr)
 			}
-			if prep.ClientIP != "" {
+			if prep.ClientIP != "" && !strings.Contains(prep.StreamURL, "googlevideo.com") {
 				req.Header.Set("X-Forwarded-For", prep.ClientIP)
 				req.Header.Set("X-Real-IP", prep.ClientIP)
 			}
+			req.Header.Set("User-Agent", defaultStreamUserAgent)
 		}
 
 		resp, err = c.streamClient.Do(req)
@@ -600,7 +612,7 @@ func (c *Controller) proxyDirectStream(ctx context.Context, w http.ResponseWrite
 	_, err = io.CopyBuffer(w, resp.Body, buf)
 	if err != nil {
 		// Client likely disconnected, don't treat as error
-		if ctx.Err() == context.Canceled {
+		if ctx.Err() == context.Canceled || isClientDisconnectError(err) {
 			return nil
 		}
 		return fmt.Errorf("copy stream: %w", err)
