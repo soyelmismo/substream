@@ -617,15 +617,13 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 
 	start := time.Now()
 
-	endpoint := m.URL + m.HealthEndpoint
-	if m.HealthEndpoint == "" {
-		endpoint = m.URL // Use base URL
-	}
+	// Probe /info/?id=27064570 instead of bare root to ensure upstream Tidal auth actually works
+	probePath := "/info/?id=27064570"
+	endpoint := m.URL + probePath
 
 	ctx, cancel := context.WithTimeout(mm.ctx, mm.probeTimeout)
 	defer cancel()
 
-	// [HACKER FIX] Cambiar HEAD por GET para leer el cuerpo de la respuesta
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return
@@ -641,11 +639,13 @@ func (mm *MirrorManager) checkMirror(client *http.Client, m *Mirror) {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
 
-		// 429 = Rate limited, 5xx = Server dead
-		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+		// 429 = Rate limited, 5xx = Server dead, 401 = Upstream Tidal token dead
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 401 {
 			isRealFailure = true
 		} else if len(body) > 0 && body[0] == '<' {
 			// Falso positivo: Nos devolvió un HTML de Cloudflare/Proxy en lugar de JSON
+			isRealFailure = true
+		} else if strings.Contains(string(body), "Token refresh failed") {
 			isRealFailure = true
 		}
 	}

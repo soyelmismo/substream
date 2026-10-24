@@ -170,24 +170,15 @@ func (p *Provider) GetTracksBatch(ctx context.Context, rawIDs []string) []*spec.
 		return results
 	}
 
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10)
-
-	for _, tid := range intIDs {
-		wg.Add(1)
-		go func(trackID int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			if t, err := p.proxy.GetTrackInfo(ctx, trackID); err == nil && t != nil {
-				idx := indexMap[trackID]
+	trackMap := p.proxy.GetTracksInfoBatch(ctx, intIDs)
+	if trackMap != nil {
+		for tid, t := range trackMap {
+			if idx, ok := indexMap[tid]; ok && t != nil {
 				results[idx] = p.trackToSpec(t)
 			}
-		}(tid)
+		}
 	}
 
-	wg.Wait()
 	return results
 }
 

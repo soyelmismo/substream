@@ -557,6 +557,99 @@ func (c *CachedProxy) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) ma
 	return result
 }
 
+// GetTracksInfoBatch fetches multiple tracks efficiently using batch SQLite query
+// Falls back to concurrent API calls for cache misses
+func (c *CachedProxy) GetTracksInfoBatch(ctx context.Context, trackIDs []int) map[int]*TidalTrack {
+	if len(trackIDs) == 0 {
+		return nil
+	}
+
+	ctx = WithPriority(ctx, PriorityNormal)
+	result := make(map[int]*TidalTrack, len(trackIDs))
+	missingIDs := make([]int, 0)
+
+	// 1. Check in-memory LRU cache first
+	for _, id := range trackIDs {
+		key := fmt.Sprintf("td:tr:%d", id)
+		if cached := c.tracks.Get(key); cached != nil {
+			var t TidalTrack
+			if err := json.Unmarshal(cached, &t); err == nil {
+				c.backfillTrackYear(&t)
+				result[id] = &t
+				continue
+			}
+		}
+		missingIDs = append(missingIDs, id)
+	}
+
+	if len(missingIDs) == 0 {
+		return result
+	}
+
+	// 2. Batch query SQLite for remaining IDs
+	if c.db != nil {
+		keys := make([]string, len(missingIDs))
+		for i, id := range missingIDs {
+			keys[i] = fmt.Sprintf("td:tr:%d", id)
+		}
+
+		batch := c.db.GetCachedMetadataBatch(keys)
+		if batch != nil {
+			foundIDs := make(map[int]struct{})
+			for key, data := range batch {
+				var t TidalTrack
+				if err := json.Unmarshal(data, &t); err == nil {
+					var id int
+					fmt.Sscanf(key, "td:tr:%d", &id)
+					if id > 0 {
+						c.backfillTrackYear(&t)
+						result[id] = &t
+						c.tracks.Set(key, data, 0) // Warm LRU
+						foundIDs[id] = struct{}{}
+					}
+				}
+			}
+
+			stillMissing := make([]int, 0, len(missingIDs))
+			for _, id := range missingIDs {
+				if _, found := foundIDs[id]; !found {
+					stillMissing = append(stillMissing, id)
+				}
+			}
+			missingIDs = stillMissing
+		}
+	}
+
+	if len(missingIDs) == 0 {
+		return result
+	}
+
+	// 3. Fetch missing tracks concurrently
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 15)
+
+	for _, id := range missingIDs {
+		wg.Add(1)
+		go func(trackID int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			t, err := c.TidalProxy.GetTrackInfo(ctx, trackID)
+			if err == nil && t != nil {
+				c.cacheTrackJSON(t)
+				mu.Lock()
+				result[trackID] = t
+				mu.Unlock()
+			}
+		}(id)
+	}
+
+	wg.Wait()
+	return result
+}
+
 func (c *CachedProxy) GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error) {
 	key := fmt.Sprintf("td:ar:%d", artistID)
 

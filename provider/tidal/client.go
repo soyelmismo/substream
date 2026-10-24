@@ -416,6 +416,13 @@ func classifyError(err error) ErrorCategory {
 		return ErrorTrackUnavailable
 	}
 
+	// 401 with "upstream ... returned 401" from a proxy means the proxy's Tidal token is dead
+	// This is an upstream authentication failure on the proxy side, NOT retryable across mirrors if all are down,
+	// and definitely not something that improves with immediate retry on the same proxy.
+	if strings.Contains(errStr, "401") {
+		return ErrorAuthExpired
+	}
+
 	// 400 with "upstream api error" usually means proxy's Tidal credentials expired
 	// Retry with another proxy instead of failing permanently
 	if strings.Contains(errStr, "400") && strings.Contains(lowerErr, "upstream api error") {
@@ -557,13 +564,17 @@ func (p *Pool) doFetchRawWithInstance(ctx context.Context, path string, query ur
 		resp.Body.Close()
 		err := fmt.Errorf("upstream %s returned %d: %s", path, resp.StatusCode, string(body))
 		if m != nil {
-			// [FIX] Only penalize mirror for server errors (5xx) or rate limits (429)
-			// 4xx errors mean content unavailable, not mirror failure
-			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			// Penalize mirror for server errors (5xx), rate limits (429), or auth failures (401)
+			if resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 401 {
 				p.mirrorMgr.ReportResult(m, latency, err)
 			} else {
 				p.mirrorMgr.ReportResult(m, latency, nil)
 			}
+		}
+		// If upstream proxy failed with 401 Unauthorized (Tidal auth expired on proxy),
+		// do NOT retry other proxies uselessly; fail immediately so direct api.tidal.com takes over.
+		if resp.StatusCode == http.StatusUnauthorized {
+			return nil, err
 		}
 		return nil, err
 	}
@@ -702,7 +713,10 @@ func (p *Pool) apiGetWithRetry(ctx context.Context, path string, query url.Value
 		if err != nil {
 			lastErr = err
 			errCat := classifyError(err)
-			if errCat == ErrorTransient || errCat == ErrorRateLimited || errCat == ErrorAuthExpired {
+			if errCat == ErrorAuthExpired {
+				return err
+			}
+			if errCat == ErrorTransient || errCat == ErrorRateLimited {
 				log.Printf("[TIDAL] apiGet retryable error on try %d/%d for %s: %v", try+1, maxRetries, path, err)
 				if try < maxRetries-1 {
 					backoff := calculateBackoff(try, baseDelay, errCat)
@@ -754,7 +768,10 @@ func (p *Pool) apiGetRawWithRetry(ctx context.Context, path string, query url.Va
 		if err != nil {
 			lastErr = err
 			errCat := classifyError(err)
-			if errCat == ErrorTransient || errCat == ErrorRateLimited || errCat == ErrorAuthExpired {
+			if errCat == ErrorAuthExpired {
+				return nil, err
+			}
+			if errCat == ErrorTransient || errCat == ErrorRateLimited {
 				log.Printf("[TIDAL] apiGetRaw retryable error on try %d/%d for %s: %v", try+1, maxRetries, path, err)
 				if try < maxRetries-1 {
 					backoff := calculateBackoff(try, baseDelay, errCat)
@@ -1020,6 +1037,38 @@ func (p *Pool) GetAlbumsInfoBatch(ctx context.Context, albumIDs []int) map[int]*
 			if err == nil && a != nil {
 				mu.Lock()
 				result[albumID] = a
+				mu.Unlock()
+			}
+		}(id)
+	}
+
+	wg.Wait()
+	return result
+}
+
+// GetTracksInfoBatch fetches multiple tracks concurrently
+func (p *Pool) GetTracksInfoBatch(ctx context.Context, trackIDs []int) map[int]*TidalTrack {
+	if len(trackIDs) == 0 {
+		return nil
+	}
+
+	result := make(map[int]*TidalTrack, len(trackIDs))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 15)
+
+	for _, id := range trackIDs {
+		wg.Add(1)
+		go func(trackID int) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			t, err := p.GetTrackInfo(ctx, trackID)
+			if err == nil && t != nil {
+				mu.Lock()
+				result[trackID] = t
 				mu.Unlock()
 			}
 		}(id)
