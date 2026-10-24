@@ -392,15 +392,15 @@ func classifyError(err error) ErrorCategory {
 	// 404 on trackManifests, track, or album endpoints - resource unavailable
 	// These indicate the resource doesn't exist (deleted, region-blocked, etc.)
 	if strings.Contains(errStr, "404") {
-		// Track endpoint: unavailable
-		if strings.Contains(lowerErr, "track") && strings.Contains(lowerErr, "manifest") {
+		// Track or info endpoint: unavailable
+		if strings.Contains(lowerErr, "track") || strings.Contains(lowerErr, "/info/") {
 			return ErrorTrackUnavailable
 		}
 		// Album endpoint: unavailable (album deleted or doesn't exist)
 		if strings.Contains(lowerErr, "/album/") {
 			return ErrorTrackUnavailable
 		}
-		return ErrorTransient
+		return ErrorTrackUnavailable
 	}
 
 	// 403 can be auth expired OR track unavailable - check context
