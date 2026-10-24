@@ -900,9 +900,33 @@ func (p *Pool) fetchDirectAlbumInfo(ctx context.Context, albumID int) (*TidalAlb
 		return nil, fmt.Errorf("direct api album status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var album TidalAlbum
-	if err := json.NewDecoder(resp.Body).Decode(&album); err != nil {
+	var rawAlbum struct {
+		ID             int           `json:"id"`
+		Title          string        `json:"title"`
+		Duration       int           `json:"duration"`
+		NumberOfTracks int           `json:"numberOfTracks"`
+		Cover          string        `json:"cover"`
+		ReleaseDate    string        `json:"releaseDate"`
+		Artist         TidalArtist   `json:"artist"`
+		Artists        []TidalArtist `json:"artists"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&rawAlbum); err != nil {
 		return nil, err
+	}
+
+	album := TidalAlbum{
+		ID:             rawAlbum.ID,
+		Title:          rawAlbum.Title,
+		Duration:       rawAlbum.Duration,
+		NumberOfTracks: rawAlbum.NumberOfTracks,
+		Cover:          rawAlbum.Cover,
+		ReleaseDate:    rawAlbum.ReleaseDate,
+		Artists:        rawAlbum.Artists,
+	}
+
+	if len(album.Artists) == 0 && rawAlbum.Artist.ID != 0 {
+		album.Artists = []TidalArtist{rawAlbum.Artist}
 	}
 
 	// Fetch items/tracks for album

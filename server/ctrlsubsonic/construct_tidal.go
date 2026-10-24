@@ -87,6 +87,9 @@ func NewTrackFromTidal(t *tidal.TidalTrack) *spec.TrackChild {
 
 // NewAlbumFromTidal converts a Tidal album to Subsonic Album
 func NewAlbumFromTidal(a *tidal.TidalAlbum) *spec.Album {
+	if a == nil {
+		return nil
+	}
 	albumID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
 	coverID := &specid.ID{URI: fmt.Sprintf("td:al:%d", a.ID)}
 
