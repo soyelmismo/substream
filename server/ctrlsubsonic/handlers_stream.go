@@ -2,6 +2,7 @@ package ctrlsubsonic
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -259,6 +260,23 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			log.Printf("[STREAM] HLS stitch mode for %s track=%s URL=%s", prep.ClientName, id.String(), urlPreview)
 			// Fall through to stitching logic below
 		}
+	}
+
+	// 2a. Intercepción para Cloudflare Worker Offload:
+	// Si la petición viene del Worker pidiendo solo resolución de URL upstream (X-Substream-Resolve-Only),
+	// devolvemos JSON con la URL resuelta para que el Worker bombee los datos y ahorre 100% de ancho de banda.
+	if r.Header.Get("X-Substream-Resolve-Only") == "1" || r.Header.Get("X-Worker-Proxy") == "1" {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"track_id":     id.String(),
+			"upstream_url": streamURL,
+			"is_hls":       prep.IsHLS,
+			"ext":          prep.Ext,
+			"quality":      prep.Quality,
+			"duration":     prep.Track.Duration,
+		})
+		return nil
 	}
 
 	// Subsonic /rest/stream clients expect a continuous audio stream (e.g. audio/flac).
