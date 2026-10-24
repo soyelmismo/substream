@@ -657,6 +657,38 @@ func (c *Controller) prepareStream(ctx context.Context, r *http.Request, id *spe
 		}
 	}
 
+	// 3b. Universal Fallback to Monochrome if stream still failed or missing (Lossless FLAC)
+	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("mc") && track != nil && id.Provider() != "mc" {
+		if mcProv, err := c.providers.Get("mc"); err == nil && mcProv != nil {
+			if matcher, ok := mcProv.(interface {
+				MatchTrackByMetadata(ctx context.Context, artist, title string, expectedDuration int) (*spec.TrackChild, error)
+			}); ok {
+				if matched, mErr := matcher.MatchTrackByMetadata(ctx, track.Artist.Name, track.Title, track.Duration); mErr == nil && matched != nil && matched.ID != nil {
+					log.Printf("[STREAM] 🚀 Universal fallback to Monochrome for %s (%s - %s) -> %s", id.String(), track.Artist.Name, track.Title, matched.ID.RawID())
+					if mcURL, mcErr := mcProv.GetStreamURL(ctx, matched.ID.RawID(), quality, clientIP); mcErr == nil && mcURL != "" {
+						url = mcURL
+						urlErr = nil
+						isSamplePreview = false
+
+						if matched.Duration > 0 && (track.Duration <= 35 || matched.Duration > track.Duration) {
+							track.Duration = matched.Duration
+						}
+
+						// Memorize cross-provider link in track_sources
+						if c.dbc != nil && track != nil {
+							clusterKey := db.MakeClusterKey(track.ISRC, track.Artist.Name, track.Title)
+							mcURI := fmt.Sprintf("mc:tr:%s", matched.ID.RawID())
+							_ = db.SaveTrackSources(c.dbc.DB, clusterKey,
+								db.TrackSource{ClusterKey: clusterKey, Provider: id.Provider(), URI: id.String(), QualityTier: db.EffectiveQualityTier(id.Provider(), db.QualityTierLossless), IsAvailable: true},
+								db.TrackSource{ClusterKey: clusterKey, Provider: "mc", URI: mcURI, QualityTier: db.EffectiveQualityTier("mc", db.QualityTierHiRes), IsAvailable: true},
+							)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// 4. Universal Fallback to Spotify if stream still failed or missing
 	if (urlErr != nil || url == "" || isSamplePreview) && c.providers != nil && c.providers.IsAudioEnabled("sp") && track != nil && id.Provider() != "sp" {
 		if spProv, err := c.providers.Get("sp"); err == nil && spProv != nil {
