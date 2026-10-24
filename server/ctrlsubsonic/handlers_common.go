@@ -61,6 +61,7 @@ func (c *Controller) ServeGetUser(r *http.Request) *spec.Response {
 		PlaylistRole: true,
 		CoverArtRole: true,
 		SettingsRole: true,
+		ShareRole:    true,
 		Folder:       []int{0},
 	}
 	return sub

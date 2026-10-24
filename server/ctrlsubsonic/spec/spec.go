@@ -96,6 +96,7 @@ type Response struct {
 	Podcasts              *Podcasts              `xml:"podcasts"              json:"podcasts,omitempty"`
 	NewestPodcasts        *NewestPodcasts        `xml:"newestPodcasts"        json:"newestPodcasts,omitempty"`
 	Bookmarks             *Bookmarks             `xml:"bookmarks"             json:"bookmarks,omitempty"`
+	Shares                *Shares                `xml:"shares"                json:"shares,omitempty"`
 	Starred               *Starred               `xml:"starred"               json:"starred,omitempty"`
 	StarredTwo            *StarredTwo            `xml:"starred2"              json:"starred2,omitempty"`
 	TopSongs              *TopSongs              `xml:"topSongs"              json:"topSongs,omitempty"`
@@ -581,6 +582,22 @@ type OpenSubsonicExtension struct {
 }
 
 type OpenSubsonicExtensions []OpenSubsonicExtension
+
+type Shares struct {
+	Share []*Share `xml:"share" json:"share"`
+}
+
+type Share struct {
+	ID          string        `xml:"id,attr"                    json:"id"`
+	Url         string        `xml:"url,attr"                   json:"url"`
+	Description string        `xml:"description,attr,omitempty" json:"description,omitempty"`
+	Username    string        `xml:"username,attr,omitempty"    json:"username,omitempty"`
+	Created     time.Time     `xml:"created,attr,omitempty"     json:"created,omitempty"`
+	Expires     time.Time     `xml:"expires,attr,omitempty"     json:"expires,omitempty"`
+	LastVisited time.Time     `xml:"lastVisited,attr,omitempty" json:"lastVisited,omitempty"`
+	VisitCount  int           `xml:"visitCount,attr,omitempty"  json:"visitCount,omitempty"`
+	Entry       []*TrackChild `xml:"entry,omitempty"            json:"entry,omitempty"`
+}
 
 var doublePuncExpr = regexp.MustCompile(`\.\s+\.\s+`)
 var licenceExpr = regexp.MustCompile(`(?i)\buser-contributed text.*`)

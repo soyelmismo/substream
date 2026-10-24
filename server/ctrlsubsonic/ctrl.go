@@ -279,6 +279,10 @@ func New(dbc *db.DB, proxy tidal.TidalProxy, providers *provider.Registry, scrob
 	c.Handle("/createBookmark", chain(resp(c.ServeCreateBookmark)))
 	c.Handle("/deleteBookmark", chain(resp(c.ServeDeleteBookmark)))
 
+	// Sharing
+	c.Handle("/createShare", chain(resp(c.ServeCreateShare)))
+	c.Handle("/getShares", chain(resp(c.ServeGetShares)))
+
 	// Play queue & Scrobble
 	c.Handle("/savePlayQueue", chain(resp(c.ServeSavePlayQueue)))
 	c.Handle("/getPlayQueue", chain(resp(c.ServeGetPlayQueue)))
