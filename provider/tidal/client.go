@@ -781,7 +781,50 @@ func (p *Pool) apiGetRawWithRetry(ctx context.Context, path string, query url.Va
 func (p *Pool) GetTrackInfo(ctx context.Context, trackID int) (*TidalTrack, error) {
 	var track TidalTrack
 	q := url.Values{"id": {fmt.Sprint(trackID)}}
-	if err := p.apiGet(ctx, "/info/", q, &track, ""); err != nil {
+	if err := p.apiGet(ctx, "/info/", q, &track, ""); err == nil {
+		return &track, nil
+	} else {
+		log.Printf("[TIDAL] /info/ failed for track %d: %v, attempting direct api.tidal.com fallback", trackID, err)
+	}
+
+	// Fallback directly to official Tidal API
+	if directTrack, err := p.fetchDirectTrackInfo(ctx, trackID); err == nil && directTrack != nil {
+		return directTrack, nil
+	} else if err != nil {
+		log.Printf("[TIDAL] direct api.tidal.com track fallback failed for %d: %v", trackID, err)
+	}
+
+	return nil, fmt.Errorf("unable to fetch track info for %d", trackID)
+}
+
+func (p *Pool) fetchDirectTrackInfo(ctx context.Context, trackID int) (*TidalTrack, error) {
+	tok := p.getUserToken()
+	endpoint := fmt.Sprintf("https://api.tidal.com/v1/tracks/%d?countryCode=ES", trackID)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "TIDAL_ANDROID/1110 CFNetwork/1410.0.3 Darwin/22.6.0")
+	req.Header.Set("Accept", "application/json")
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	} else {
+		req.Header.Set("x-tidal-token", OfficialHiFiClientID)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("direct api status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var track TidalTrack
+	if err := json.NewDecoder(resp.Body).Decode(&track); err != nil {
 		return nil, err
 	}
 	return &track, nil
@@ -796,35 +839,98 @@ func (p *Pool) GetCoverUUIDForAlbum(ctx context.Context, albumID int) string {
 
 func (p *Pool) GetAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error) {
 	body, err := p.apiGetRaw(ctx, "/album/", url.Values{"id": {fmt.Sprint(albumID)}}, "")
+	if err == nil {
+		var envelope struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &envelope); err == nil {
+			var album TidalAlbum
+			if err := json.Unmarshal(envelope.Data, &album); err == nil {
+				var raw struct {
+					Items []struct {
+						Item TidalTrack `json:"item"`
+					} `json:"items"`
+				}
+				if json.Unmarshal(envelope.Data, &raw) == nil && len(raw.Items) > 0 {
+					album.Items = make([]TidalTrack, len(raw.Items))
+					for i, it := range raw.Items {
+						album.Items[i] = it.Item
+					}
+				}
+				return &album, nil
+			}
+		}
+	} else {
+		log.Printf("[TIDAL] /album/ failed for %d: %v, attempting direct api.tidal.com fallback", albumID, err)
+	}
+
+	// Fallback directly to official Tidal API
+	if directAlbum, err := p.fetchDirectAlbumInfo(ctx, albumID); err == nil && directAlbum != nil {
+		return directAlbum, nil
+	} else if err != nil {
+		log.Printf("[TIDAL] direct api.tidal.com album fallback failed for %d: %v", albumID, err)
+	}
+
+	return nil, fmt.Errorf("unable to fetch album info for %d", albumID)
+}
+
+func (p *Pool) fetchDirectAlbumInfo(ctx context.Context, albumID int) (*TidalAlbum, error) {
+	tok := p.getUserToken()
+	endpoint := fmt.Sprintf("https://api.tidal.com/v1/albums/%d?countryCode=ES", albumID)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-
-	var envelope struct {
-		Data json.RawMessage `json:"data"`
+	req.Header.Set("User-Agent", "TIDAL_ANDROID/1110 CFNetwork/1410.0.3 Darwin/22.6.0")
+	req.Header.Set("Accept", "application/json")
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	} else {
+		req.Header.Set("x-tidal-token", OfficialHiFiClientID)
 	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, fmt.Errorf("decode album envelope: %w", err)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("direct api album status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var album TidalAlbum
-	if err := json.Unmarshal(envelope.Data, &album); err != nil {
-		// fallback to direct decode
-		if err2 := json.Unmarshal(body, &album); err2 != nil {
-			return nil, fmt.Errorf("decode album data: %w", err)
-		}
+	if err := json.NewDecoder(resp.Body).Decode(&album); err != nil {
+		return nil, err
 	}
 
-	// items wrapper
-	var raw struct {
-		Items []struct {
-			Item TidalTrack `json:"item"`
-		} `json:"items"`
-	}
-	if json.Unmarshal(envelope.Data, &raw) == nil && len(raw.Items) > 0 {
-		album.Items = make([]TidalTrack, len(raw.Items))
-		for i, it := range raw.Items {
-			album.Items[i] = it.Item
+	// Fetch items/tracks for album
+	itemsEndpoint := fmt.Sprintf("https://api.tidal.com/v1/albums/%d/items?countryCode=ES&limit=100", albumID)
+	reqItems, err := http.NewRequestWithContext(ctx, "GET", itemsEndpoint, nil)
+	if err == nil {
+		reqItems.Header.Set("User-Agent", "TIDAL_ANDROID/1110 CFNetwork/1410.0.3 Darwin/22.6.0")
+		reqItems.Header.Set("Accept", "application/json")
+		if tok != "" {
+			reqItems.Header.Set("Authorization", "Bearer "+tok)
+		} else {
+			reqItems.Header.Set("x-tidal-token", OfficialHiFiClientID)
+		}
+		if respItems, err := p.client.Do(reqItems); err == nil {
+			defer respItems.Body.Close()
+			if respItems.StatusCode == http.StatusOK {
+				var itemsResp struct {
+					Items []struct {
+						Item TidalTrack `json:"item"`
+					} `json:"items"`
+				}
+				if err := json.NewDecoder(respItems.Body).Decode(&itemsResp); err == nil && len(itemsResp.Items) > 0 {
+					album.Items = make([]TidalTrack, len(itemsResp.Items))
+					for i, it := range itemsResp.Items {
+						album.Items[i] = it.Item
+					}
+				}
+			}
 		}
 	}
 
@@ -871,24 +977,49 @@ func (p *Pool) GetAlbumMetadata(ctx context.Context, albumID int) (*TidalAlbum, 
 
 func (p *Pool) GetArtistInfo(ctx context.Context, artistID int) (*TidalArtistDetail, error) {
 	body, err := p.apiGetRaw(ctx, "/artist/", url.Values{"id": {fmt.Sprint(artistID)}}, "")
-	if err != nil {
-		return nil, err
+	if err == nil {
+		var resp struct {
+			Artist TidalArtist `json:"artist"`
+			Cover  *struct {
+				Size750 string `json:"750"`
+			} `json:"cover"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil && resp.Artist.ID != 0 {
+			return &TidalArtistDetail{
+				Artist: resp.Artist,
+				Cover:  resp.Cover,
+			}, nil
+		}
+	} else {
+		log.Printf("[TIDAL] /artist/ failed for %d: %v, attempting direct api.tidal.com fallback", artistID, err)
 	}
 
-	var resp struct {
-		Artist TidalArtist `json:"artist"`
-		Cover  *struct {
-			Size750 string `json:"750"`
-		} `json:"cover"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decode artist: %w", err)
+	// Fallback to official Tidal API
+	tok := p.getUserToken()
+	endpoint := fmt.Sprintf("https://api.tidal.com/v1/artists/%d?countryCode=ES", artistID)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "TIDAL_ANDROID/1110 CFNetwork/1410.0.3 Darwin/22.6.0")
+		req.Header.Set("Accept", "application/json")
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		} else {
+			req.Header.Set("x-tidal-token", OfficialHiFiClientID)
+		}
+		if resp, err := p.client.Do(req); err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var artist TidalArtist
+				if err := json.NewDecoder(resp.Body).Decode(&artist); err == nil {
+					return &TidalArtistDetail{
+						Artist: artist,
+					}, nil
+				}
+			}
+		}
 	}
 
-	return &TidalArtistDetail{
-		Artist: resp.Artist,
-		Cover:  resp.Cover,
-	}, nil
+	return nil, fmt.Errorf("unable to fetch artist info for %d", artistID)
 }
 
 func (p *Pool) GetArtistAlbums(ctx context.Context, artistID int, skipTracks bool) (*TidalArtistPage, error) {
@@ -898,37 +1029,73 @@ func (p *Pool) GetArtistAlbums(ctx context.Context, artistID int, skipTracks boo
 	}
 
 	body, err := p.apiGetRaw(ctx, "/artist/", q, "")
-	if err != nil {
-		return nil, err
+	if err == nil {
+		var resp struct {
+			Albums struct {
+				Items []TidalAlbum `json:"items"`
+			} `json:"albums"`
+			Tracks []TidalTrack `json:"tracks"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil && (len(resp.Albums.Items) > 0 || len(resp.Tracks) > 0) {
+			// Deduplicate albums natively at the proxy level
+			seenAlbums := make(map[string]bool)
+			var uniqueItems []TidalAlbum
+			for _, item := range resp.Albums.Items {
+				// Use lowercased title to catch slight casing differences
+				key := fmt.Sprintf("%s|%s", strings.ToLower(strings.TrimSpace(item.Title)), item.ReleaseDate)
+				if !seenAlbums[key] {
+					seenAlbums[key] = true
+					uniqueItems = append(uniqueItems, item)
+				}
+			}
+			resp.Albums.Items = uniqueItems
+
+			return &TidalArtistPage{
+				Albums: resp.Albums,
+				Tracks: resp.Tracks,
+			}, nil
+		}
+	} else {
+		log.Printf("[TIDAL] /artist/?f= failed for %d: %v, attempting direct api.tidal.com fallback", artistID, err)
 	}
 
-	var resp struct {
-		Albums struct {
-			Items []TidalAlbum `json:"items"`
-		} `json:"albums"`
-		Tracks []TidalTrack `json:"tracks"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decode artist albums: %w", err)
-	}
-
-	// Deduplicate albums natively at the proxy level
-	seenAlbums := make(map[string]bool)
-	var uniqueItems []TidalAlbum
-	for _, item := range resp.Albums.Items {
-		// Use lowercased title to catch slight casing differences
-		key := fmt.Sprintf("%s|%s", strings.ToLower(strings.TrimSpace(item.Title)), item.ReleaseDate)
-		if !seenAlbums[key] {
-			seenAlbums[key] = true
-			uniqueItems = append(uniqueItems, item)
+	// Fallback to official Tidal API
+	tok := p.getUserToken()
+	endpoint := fmt.Sprintf("https://api.tidal.com/v1/artists/%d/albums?countryCode=ES&limit=50", artistID)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", "TIDAL_ANDROID/1110 CFNetwork/1410.0.3 Darwin/22.6.0")
+		req.Header.Set("Accept", "application/json")
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		} else {
+			req.Header.Set("x-tidal-token", OfficialHiFiClientID)
+		}
+		if resp, err := p.client.Do(req); err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var albumsResp struct {
+					Items []TidalAlbum `json:"items"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&albumsResp); err == nil {
+					seenAlbums := make(map[string]bool)
+					var uniqueItems []TidalAlbum
+					for _, item := range albumsResp.Items {
+						key := fmt.Sprintf("%s|%s", strings.ToLower(strings.TrimSpace(item.Title)), item.ReleaseDate)
+						if !seenAlbums[key] {
+							seenAlbums[key] = true
+							uniqueItems = append(uniqueItems, item)
+						}
+					}
+					page := &TidalArtistPage{}
+					page.Albums.Items = uniqueItems
+					return page, nil
+				}
+			}
 		}
 	}
-	resp.Albums.Items = uniqueItems
 
-	return &TidalArtistPage{
-		Albums: resp.Albums,
-		Tracks: resp.Tracks,
-	}, nil
+	return nil, fmt.Errorf("unable to fetch artist albums for %d", artistID)
 }
 
 func (p *Pool) SearchTracks(ctx context.Context, query string, limit, offset int) ([]TidalTrack, error) {

@@ -1,6 +1,8 @@
 package ctrlsubsonic
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
@@ -1182,10 +1184,18 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	c.dbc.Where("user_id=?", user.ID).Order("star_date DESC").Limit(100).Find(&trackStars)
 
 	uris := make([]string, len(trackStars))
+	starTrackMap := make(map[string]db.TrackStar, len(trackStars))
 	for i, s := range trackStars {
 		uris[i] = s.URI
+		starTrackMap[s.URI] = s
 	}
-	tracks := c.batchFetchTracksByURIs(r, uris)
+
+	// Bound context timeout for starred fetching so the client never hits deadline exceeded
+	trackCtx, cancelTracks := context.WithTimeout(r.Context(), 6*time.Second)
+	defer cancelTracks()
+	rWithTrackTimeout := r.WithContext(trackCtx)
+
+	tracks := c.batchFetchTracksByURIs(rWithTrackTimeout, uris)
 
 	fetchedURIs := make(map[string]bool, len(tracks))
 	for _, tc := range tracks {
@@ -1198,14 +1208,22 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	// Fallback: If any starred tracks failed to fetch from upstream provider,
 	// synthesize a fallback track so user never loses their starred list
 	for _, s := range trackStars {
-		if !fetchedURIs[s.URI] && s.FallbackTitle != "" {
+		if !fetchedURIs[s.URI] {
 			trackID, err := specid.New(s.URI)
 			if err == nil {
 				date := s.StarDate
+				title := s.FallbackTitle
+				if title == "" {
+					title = fmt.Sprintf("Track %s", trackID.RawID())
+				}
+				artist := s.FallbackArtist
+				if artist == "" {
+					artist = "Unknown Artist"
+				}
 				results.Tracks = append(results.Tracks, &spec.TrackChild{
 					ID:      &trackID,
-					Title:   s.FallbackTitle,
-					Artist:  s.FallbackArtist,
+					Title:   title,
+					Artist:  artist,
 					Starred: &date,
 				})
 			}
@@ -1219,7 +1237,12 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	for i, s := range albumStars {
 		albumURIs[i] = s.URI
 	}
-	results.Albums = c.batchFetchAlbumsByURIs(r, albumURIs)
+
+	albumCtx, cancelAlbums := context.WithTimeout(r.Context(), 6*time.Second)
+	defer cancelAlbums()
+	rWithAlbumTimeout := r.WithContext(albumCtx)
+
+	results.Albums = c.batchFetchAlbumsByURIs(rWithAlbumTimeout, albumURIs)
 
 	// starred artists
 	var artistStars []db.ArtistStar
@@ -1228,7 +1251,12 @@ func (c *Controller) ServeGetStarredTwo(r *http.Request) *spec.Response {
 	for i, s := range artistStars {
 		artistURIs[i] = s.URI
 	}
-	results.Artists = c.batchFetchArtistsByURIs(r, artistURIs)
+
+	artistCtx, cancelArtists := context.WithTimeout(r.Context(), 6*time.Second)
+	defer cancelArtists()
+	rWithArtistTimeout := r.WithContext(artistCtx)
+
+	results.Artists = c.batchFetchArtistsByURIs(rWithArtistTimeout, artistURIs)
 
 	sub := spec.NewResponse()
 	sub.StarredTwo = results

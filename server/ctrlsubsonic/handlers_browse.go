@@ -288,7 +288,9 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 		}
 
 		// Fetch all album metadata to sort properly
-		allAlbums := c.batchFetchAlbumsByURIs(r, albumURIsList)
+		sortCtx, cancelSort := context.WithTimeout(r.Context(), 6*time.Second)
+		defer cancelSort()
+		allAlbums := c.batchFetchAlbumsByURIs(r.WithContext(sortCtx), albumURIsList)
 
 		// Sort by name or artist
 		if listType == "alphabeticalByName" {
@@ -489,7 +491,9 @@ func (c *Controller) ServeGetAlbumListTwo(r *http.Request) *spec.Response {
 	}
 
 	// batch fetch album metadata
-	albums := c.batchFetchAlbumsByURIs(r, albumURIs)
+	albumFetchCtx, cancelFetch := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancelFetch()
+	albums := c.batchFetchAlbumsByURIs(r.WithContext(albumFetchCtx), albumURIs)
 
 	sub := spec.NewResponse()
 	sub.AlbumsTwo = &spec.Albums{List: albums}
