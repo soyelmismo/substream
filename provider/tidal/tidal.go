@@ -539,9 +539,18 @@ func (p *Provider) MatchTrackByMetadata(ctx context.Context, artist, title strin
 // --- Spec Conversion Helpers ---
 
 func (p *Provider) trackToSpec(t *TidalTrack) *spec.TrackChild {
+	if t == nil {
+		return nil
+	}
 	artistName := t.Artist.Name
-	if len(t.Artists) > 0 {
+	if len(t.Artists) > 0 && t.Artists[0].Name != "" {
 		artistName = t.Artists[0].Name
+	}
+	if artistName == "" {
+		artistName = t.Artist.Name
+	}
+	if len(t.Artists) == 0 && t.Artist.ID != 0 {
+		t.Artists = []TidalArtist{t.Artist}
 	}
 
 	trackID := &specid.ID{URI: fmt.Sprintf("td:tr:%d", t.ID)}

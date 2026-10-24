@@ -823,10 +823,45 @@ func (p *Pool) fetchDirectTrackInfo(ctx context.Context, trackID int) (*TidalTra
 		return nil, fmt.Errorf("direct api status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var track TidalTrack
-	if err := json.NewDecoder(resp.Body).Decode(&track); err != nil {
+	var rawTrack struct {
+		ID           int           `json:"id"`
+		Title        string        `json:"title"`
+		Duration     int           `json:"duration"`
+		TrackNumber  int           `json:"trackNumber"`
+		VolumeNumber int           `json:"volumeNumber"`
+		Explicit     bool          `json:"explicit"`
+		ISRC         string        `json:"isrc"`
+		AudioQuality string        `json:"audioQuality"`
+		Artist       TidalArtist   `json:"artist"`
+		Artists      []TidalArtist `json:"artists"`
+		Album        TidalAlbumRef `json:"album"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&rawTrack); err != nil {
 		return nil, err
 	}
+
+	track := TidalTrack{
+		ID:           rawTrack.ID,
+		Title:        rawTrack.Title,
+		Duration:     rawTrack.Duration,
+		TrackNumber:  rawTrack.TrackNumber,
+		VolumeNumber: rawTrack.VolumeNumber,
+		Explicit:     rawTrack.Explicit,
+		ISRC:         rawTrack.ISRC,
+		AudioQuality: rawTrack.AudioQuality,
+		Artist:       rawTrack.Artist,
+		Artists:      rawTrack.Artists,
+		Album:        rawTrack.Album,
+	}
+
+	if len(track.Artists) == 0 && rawTrack.Artist.ID != 0 {
+		track.Artists = []TidalArtist{rawTrack.Artist}
+	}
+	if track.Artist.Name == "" && len(track.Artists) > 0 {
+		track.Artist = track.Artists[0]
+	}
+
 	return &track, nil
 }
 
