@@ -96,7 +96,7 @@ func (p *Provider) trackToSpec(t *SoundCloudTrack) *spec.TrackChild {
 
 	safeArtist := sanitizeFilename(artistName)
 	safeTitle := sanitizeFilename(title)
-	path := fmt.Sprintf("soundcloud/%s/%s.mp3", safeArtist, safeTitle)
+	path := fmt.Sprintf("soundcloud/%s/%s - %s.mp3", safeArtist, safeArtist, safeTitle)
 
 	year := parseYear(t.ReleaseDate)
 	if year == 0 {

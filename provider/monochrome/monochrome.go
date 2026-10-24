@@ -142,7 +142,7 @@ func (p *Provider) trackToSpec(t *MonochromeTrack) *spec.TrackChild {
 		Bitrate:       1411,
 		ContentType:   "audio/flac",
 		Suffix:        "flac",
-		Path:          fmt.Sprintf("audio/%s/%s.flac", artistName, t.Title),
+		Path:          fmt.Sprintf("audio/%s/%s - %s.flac", artistName, artistName, t.Title),
 		TrackNumber:   t.TrackNumber,
 		DiscNumber:    t.DiscNumber,
 		Year:          parseYear(t.ReleaseDate),
