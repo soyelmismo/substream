@@ -234,7 +234,7 @@ const (
 // 0 ms mapped-source fast path serve them forever, skipping Qobuz/Tidal/Deezer entirely.
 func MaxQualityTierForProvider(provider string) int {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "qb", "td", "dz", "am":
+	case "qb", "td", "dz", "am", "mc":
 		return QualityTierHiRes
 	case "sp":
 		return QualityTierHigh

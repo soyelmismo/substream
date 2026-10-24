@@ -79,6 +79,8 @@ func getProviderPriority(providerID string, isPrimary bool) int {
 		pri += 800 // Qobuz (Studio Hi-Res 24-bit FLAC)
 	case "dz":
 		pri += 700 // Deezer (16-bit Lossless FLAC)
+	case "mc":
+		pri += 650 // Monochrome (Lossless FLAC)
 	case "sp":
 		pri += 500 // Spotify (Standard AAC)
 	case "am":
@@ -200,7 +202,7 @@ func (c *Controller) ServeSearchThree(r *http.Request) *spec.Response {
 
 		var additionalProvs []provider.MusicProvider
 		if !hasPrefix && c.providers != nil {
-			for _, extraID := range []string{"qb", "dz", "sp", "yt", "sc"} {
+			for _, extraID := range []string{"mc", "qb", "dz", "sp", "yt", "sc"} {
 				if c.providers.IsMetadataEnabled(extraID) && (prov == nil || prov.ID() != extraID) {
 					if p, err := c.providers.Get(extraID); err == nil && p != nil {
 						additionalProvs = append(additionalProvs, p)

@@ -20,6 +20,7 @@ import (
 	"go.senan.xyz/gonic/provider"
 	"go.senan.xyz/gonic/provider/amazon"
 	"go.senan.xyz/gonic/provider/deezer"
+	"go.senan.xyz/gonic/provider/monochrome"
 	"go.senan.xyz/gonic/provider/qobuz"
 	"go.senan.xyz/gonic/provider/soundcloud"
 	"go.senan.xyz/gonic/provider/spotify"
@@ -96,6 +97,7 @@ func main() {
 	confDeezerARL := flag.String("deezer-arl", getEnv("SUBSTREAM_DEEZER_ARL", ""), "optional Deezer ARL cookie")
 	confDeezerStreamFilter := flag.String("deezer-stream-filter", getEnv("SUBSTREAM_DEEZER_STREAM_FILTER", getEnv("DEEZER_STREAM_FILTER", "")), "optional stream filter activation token/spec for direct native stream decryption")
 	confAmazonURL := flag.String("amazon-url", getEnv("SUBSTREAM_AMAZON_URL", "https://amz.geeked.wtf"), "Amazon Music proxy/mirror URL")
+	confMonochromeURL := flag.String("monochrome-url", getEnv("SUBSTREAM_MONOCHROME_URL", "https://tracks.monochrome.st"), "Monochrome tracks API URL")
 	confSpotifySPDC := flag.String("spotify-sp-dc", getEnv("SUBSTREAM_SPOTIFY_SP_DC", getEnv("SPOTIFY_SP_DC", "")), "optional Spotify sp_dc session cookie for Widevine audio playback")
 	confSpotifyWVD := flag.String("spotify-wvd-path", getEnv("SUBSTREAM_SPOTIFY_WVD_PATH", getEnv("SPOTIFY_WVD_PATH", "spotify.wvd")), "path to Widevine .wvd device file for Spotify audio decryption")
 
@@ -232,6 +234,13 @@ func main() {
 	scProvider := soundcloud.New()
 	providers.Register(scProvider)
 	log.Printf("[PROVIDER] Registered SoundCloud provider (sc)")
+
+	// 8. Monochrome Provider (Lossless FLAC, Catalog, Releases & Tracks)
+	monochromeProvider := monochrome.New(monochrome.ClientOptions{
+		BaseURL: *confMonochromeURL,
+	})
+	providers.Register(monochromeProvider)
+	log.Printf("[PROVIDER] Registered Monochrome provider (mc)")
 
 	// Load persistent provider toggle settings (metadata & audio)
 	providers.LoadDBSettings(dbc.GetSetting)
