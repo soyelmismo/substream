@@ -265,7 +265,12 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 	// 2a. Intercepción para Cloudflare Worker Offload:
 	// Si la petición viene del Worker pidiendo solo resolución de URL upstream (X-Substream-Resolve-Only),
 	// devolvemos JSON con la URL resuelta para que el Worker bombee los datos y ahorre 100% de ancho de banda.
-	if r.Header.Get("X-Substream-Resolve-Only") == "1" || r.Header.Get("X-Worker-Proxy") == "1" {
+	secret := strings.TrimSpace(os.Getenv("SUBSTREAM_WORKER_SECRET"))
+	workerAuthHeader := r.Header.Get("X-Substream-Worker-Secret")
+	isWorker := (secret == "" && (r.Header.Get("X-Substream-Resolve-Only") == "1" || r.Header.Get("X-Worker-Proxy") == "1")) ||
+		(secret != "" && workerAuthHeader == secret)
+
+	if isWorker {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":      true,

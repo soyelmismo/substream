@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 
@@ -253,7 +254,12 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 	// Intercepción para Cloudflare Worker Download Offload:
 	// Si la petición viene del Worker solicitando metadatos para descargar y empaquetar en el Edge,
 	// y NO es un stream segmentado HLS (requiere ffmpeg/remux), devolvemos JSON con la URL directa y metadatos.
-	if r.Header.Get("X-Substream-Resolve-Only") == "1" || r.Header.Get("X-Worker-Proxy") == "1" {
+	secret := strings.TrimSpace(os.Getenv("SUBSTREAM_WORKER_SECRET"))
+	workerAuthHeader := r.Header.Get("X-Substream-Worker-Secret")
+	isWorker := (secret == "" && (r.Header.Get("X-Substream-Resolve-Only") == "1" || r.Header.Get("X-Worker-Proxy") == "1")) ||
+		(secret != "" && workerAuthHeader == secret)
+
+	if isWorker {
 		isHLS := prep.IsHLS || strings.Contains(prep.StreamURL, ".m3u8") || strings.Contains(prep.StreamURL, "manifestType=HLS")
 		if !isHLS && !strings.HasPrefix(prep.StreamURL, "data:") {
 			w.Header().Set("Content-Type", "application/json")
