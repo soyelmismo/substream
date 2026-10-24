@@ -3,6 +3,7 @@ package ctrlsubsonic
 import (
 	"archive/zip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -248,6 +249,27 @@ func (c *Controller) serveTrackDownload(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	w.Header().Set("Cache-Control", "no-cache")
+
+	// Intercepción para Cloudflare Worker Download Offload:
+	// Si la petición viene del Worker solicitando metadatos para descargar y empaquetar en el Edge,
+	// y NO es un stream segmentado HLS (requiere ffmpeg/remux), devolvemos JSON con la URL directa y metadatos.
+	if r.Header.Get("X-Substream-Resolve-Only") == "1" || r.Header.Get("X-Worker-Proxy") == "1" {
+		isHLS := prep.IsHLS || strings.Contains(prep.StreamURL, ".m3u8") || strings.Contains(prep.StreamURL, "manifestType=HLS")
+		if !isHLS && !strings.HasPrefix(prep.StreamURL, "data:") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":      true,
+				"is_download":  true,
+				"track_id":     id.String(),
+				"upstream_url": prep.StreamURL,
+				"ext":          ext,
+				"content_type": contentType,
+				"filename":     filename,
+				"metadata":     meta,
+			})
+			return nil
+		}
+	}
 
 	log.Printf("[DOWNLOAD] Starting single track download: id=%s artist=%q title=%q quality=%s", id.String(), cleanArtist, cleanTitle, prep.Quality)
 
