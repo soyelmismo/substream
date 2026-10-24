@@ -96,7 +96,19 @@ func (p *Provider) trackToSpec(t *SoundCloudTrack) *spec.TrackChild {
 
 	safeArtist := sanitizeFilename(artistName)
 	safeTitle := sanitizeFilename(title)
-	path := fmt.Sprintf("soundcloud/%s/%s - %s.mp3", safeArtist, safeArtist, safeTitle)
+
+	// SoundCloud serves both AAC (m4a) and MP3 progressive/HLS streams.
+	// We detect the container from the transcoding mime_type / protocol if available.
+	ext := "m4a"
+	contentType := "audio/mp4"
+	for _, tc := range t.Media.Transcodings {
+		if tc.Format.Protocol == "progressive" && strings.Contains(tc.Format.MimeType, "mpeg") {
+			ext = "mp3"
+			contentType = "audio/mpeg"
+			break
+		}
+	}
+	path := fmt.Sprintf("soundcloud/%s/%s - %s.%s", safeArtist, safeArtist, safeTitle, ext)
 
 	year := parseYear(t.ReleaseDate)
 	if year == 0 {
@@ -121,8 +133,8 @@ func (p *Provider) trackToSpec(t *SoundCloudTrack) *spec.TrackChild {
 		DiscNumber:  1,
 		Duration:    durationSec,
 		Bitrate:     128,
-		ContentType: "audio/mpeg",
-		Suffix:      "mp3",
+		ContentType: contentType,
+		Suffix:      ext,
 		Size:        durationSec * 16000, // ~128kbps = 16kB/s
 		IsDir:       false,
 		Type:        "music",
