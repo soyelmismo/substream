@@ -277,9 +277,14 @@ func (c *Controller) ServeStream(w http.ResponseWriter, r *http.Request) *spec.R
 			"track_id":     id.String(),
 			"upstream_url": streamURL,
 			"is_hls":       prep.IsHLS,
-			"ext":          prep.Ext,
-			"quality":      prep.Quality,
-			"duration":     prep.Track.Duration,
+			// direct_playable=false means this client cannot consume upstream_url as-is
+			// (it is an HLS manifest for an ExoPlayer client that only does progressive).
+			// The edge worker must then re-request /stream without the resolve header so
+			// the origin performs the HLS->fMP4 stitch itself.
+			"direct_playable": !(clientNeedsHelp && prep.IsHLS),
+			"ext":             prep.Ext,
+			"quality":         prep.Quality,
+			"duration":        prep.Track.Duration,
 		})
 		return nil
 	}
