@@ -1,0 +1,8 @@
+name = "substream-media-proxy"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+[vars]
+ORIGIN_HOST = "sound.listo.click"
+WORKER_SECRET = "2541a09b5b6effe619883446e7f5d33a6ffc7b9f15908fa567f03c43a8077731"
